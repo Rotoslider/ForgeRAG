@@ -94,62 +94,111 @@ class PDFProcessor:
             if folder.exists():
                 shutil.rmtree(folder)
 
+    def count_existing_pages(self, doc_hash: str) -> int:
+        """Return the number of full-resolution PNGs already on disk for this doc."""
+        folder = self.doc_folder(doc_hash)
+        if not folder.exists():
+            return 0
+        return len(list(folder.glob("page_*.png")))
+
     def convert_pdf_sync(
         self,
         pdf_path: Path,
         doc_hash: str,
         *,
         progress_cb=None,
+        resume: bool = True,
     ) -> list[Path]:
         """Synchronous PDF-to-images conversion. Returns list of full-resolution PNG paths.
 
         Call from within asyncio.to_thread to avoid blocking.
 
         progress_cb: optional callable(pages_done: int, pages_total: int) for progress updates.
+        resume: if True (default), skips pages that already exist on disk (both PNG
+            and reduced JPG must be present). Set False to force full re-render.
         """
         pdf_path = Path(pdf_path)
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-        self.clear_doc(doc_hash)
+        if not resume:
+            self.clear_doc(doc_hash)
         self.doc_folder(doc_hash).mkdir(parents=True, exist_ok=True)
         self.reduced_doc_folder(doc_hash).mkdir(parents=True, exist_ok=True)
 
-        logger.info("Rasterizing %s at %d DPI", pdf_path.name, self.dpi)
-        images: list[Image.Image] = convert_from_path(
-            str(pdf_path),
-            dpi=self.dpi,
-            fmt="png",
-        )
-        total = len(images)
-        logger.info("Got %d pages from %s", total, pdf_path.name)
+        # Determine total page count cheaply without rasterizing all pages
+        import fitz
 
+        with fitz.open(str(pdf_path)) as doc:
+            total = doc.page_count
+
+        # Collect the set of page numbers still to render
+        to_render: list[int] = []
         saved_paths: list[Path] = []
-        for idx, img in enumerate(images, start=1):
+        for idx in range(1, total + 1):
             full_path = self.page_image_path(doc_hash, idx)
             reduced_path = self.reduced_image_path(doc_hash, idx)
+            if resume and full_path.exists() and reduced_path.exists():
+                saved_paths.append(full_path)
+                if progress_cb is not None:
+                    try:
+                        progress_cb(idx, total)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("progress_cb raised: %s", exc)
+                continue
+            to_render.append(idx)
 
-            # Save full-resolution PNG for ColPali / display
-            img.save(full_path, "PNG", optimize=True)
+        if not to_render:
+            logger.info("All %d pages of %s already rendered — skipping rasterization", total, pdf_path.name)
+            return saved_paths
 
-            # Save reduced JPG for thumbnails / VLM OCR
-            reduced_img = _resize_for_reduced(
-                img, self.reduction_pct, self.reduction_min_dimension
+        logger.info(
+            "Rasterizing %s at %d DPI (%d of %d pages needed, %d already on disk)",
+            pdf_path.name, self.dpi, len(to_render), total, total - len(to_render),
+        )
+
+        # Render in chunks so we don't load the entire PDF into memory at once.
+        # pdf2image uses first_page/last_page (1-indexed).
+        chunk_size = 50
+        i = 0
+        while i < len(to_render):
+            chunk = to_render[i:i + chunk_size]
+            first = chunk[0]
+            last = chunk[-1]
+            # Render a contiguous range, then pick out pages we actually need
+            # (in case the chunk spans a discontinuous gap).
+            images: list[Image.Image] = convert_from_path(
+                str(pdf_path),
+                dpi=self.dpi,
+                fmt="png",
+                first_page=first,
+                last_page=last,
             )
-            if reduced_img.mode == "RGBA":
-                reduced_img = reduced_img.convert("RGB")
-            reduced_img.save(reduced_path, "JPEG", quality=85, optimize=True)
+            for offset, img in enumerate(images):
+                page_num = first + offset
+                if page_num not in chunk:
+                    continue
+                full_path = self.page_image_path(doc_hash, page_num)
+                reduced_path = self.reduced_image_path(doc_hash, page_num)
 
-            saved_paths.append(full_path)
+                img.save(full_path, "PNG", optimize=True)
+                reduced_img = _resize_for_reduced(
+                    img, self.reduction_pct, self.reduction_min_dimension
+                )
+                if reduced_img.mode == "RGBA":
+                    reduced_img = reduced_img.convert("RGB")
+                reduced_img.save(reduced_path, "JPEG", quality=85, optimize=True)
+                saved_paths.append(full_path)
 
-            if progress_cb is not None:
-                try:
-                    progress_cb(idx, total)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("progress_cb raised: %s", exc)
+                if progress_cb is not None:
+                    try:
+                        progress_cb(page_num, total)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("progress_cb raised: %s", exc)
 
-            if idx % 25 == 0 or idx == total:
-                logger.info("Rasterized %d/%d pages of %s", idx, total, pdf_path.name)
+                if page_num % 25 == 0 or page_num == total:
+                    logger.info("Rasterized %d/%d pages of %s", page_num, total, pdf_path.name)
+            i += chunk_size
 
         return saved_paths
 

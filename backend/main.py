@@ -19,8 +19,11 @@ from fastapi.staticfiles import StaticFiles
 from backend.config import DEFAULT_CONFIG_PATH, get_settings
 from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pipeline import IngestionPipeline
-from backend.routers import documents, health, images, ingestion
+from backend.routers import documents, health, images, ingestion, search, system
+from backend.services.colpali_service import create_colpali_service
+from backend.services.gpu_manager import GPUManager
 from backend.services.neo4j_service import Neo4jService
+from backend.services.text_embedding_service import create_text_embedding_service
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +62,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await job_manager.init()
     app.state.job_manager = job_manager
 
+    # GPU manager + ML services (created regardless, actual model loading is lazy)
+    gpu = GPUManager(idle_unload_seconds=settings.gpu.model_idle_unload_seconds)
+    await gpu.start()
+    app.state.gpu = gpu
+    try:
+        text_embedding = create_text_embedding_service(settings, gpu)
+        app.state.text_embedding = text_embedding
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Text embedding service not wired: %s", exc)
+        app.state.text_embedding = None
+
+    try:
+        colpali = create_colpali_service(settings, gpu)
+        app.state.colpali = colpali
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ColPali service not wired: %s", exc)
+        app.state.colpali = None
+
     # Ingestion pipeline (one instance, processes one job at a time via asyncio)
     pipeline = IngestionPipeline(
-        settings=settings, neo4j=neo4j, job_manager=job_manager
+        settings=settings,
+        neo4j=neo4j,
+        job_manager=job_manager,
+        gpu=gpu,
+        text_embedding=app.state.text_embedding,
+        colpali=app.state.colpali,
     )
     app.state.pipeline = pipeline
 
@@ -69,6 +95,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        try:
+            await gpu.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("gpu.stop failed: %s", exc)
         await neo4j.close()
         logger.info("ForgeRAG shutdown complete")
 
@@ -96,6 +126,8 @@ def create_app() -> FastAPI:
     app.include_router(documents.router)
     app.include_router(ingestion.router)
     app.include_router(images.router)
+    app.include_router(search.router)
+    app.include_router(system.router)
 
     # Frontend static mount (production build). Skipped if not built yet.
     frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"

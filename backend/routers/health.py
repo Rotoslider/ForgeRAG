@@ -44,14 +44,27 @@ async def health(request: Request) -> ForgeResult:
             logger.warning("Neo4j health check failed: %s", exc)
             payload.details["neo4j_error"] = str(exc)
 
-    # GPU availability check — optional import so Phase 1 doesn't require torch
-    try:
-        import torch  # type: ignore
-
-        payload.gpu_available = torch.cuda.is_available()
+    # GPU availability — prefer the GPU manager which also reports VRAM + models
+    gpu = getattr(request.app.state, "gpu", None)
+    if gpu is not None:
+        info = gpu.gpu_info()
+        payload.gpu_available = bool(info.get("available", False))
         if payload.gpu_available:
-            payload.details["gpu_name"] = torch.cuda.get_device_name(0)
-    except ImportError:
-        payload.details["gpu_available_note"] = "torch not installed yet"
+            payload.details["gpu_name"] = info.get("device_name")
+            total = info.get("vram_total_bytes", 0) or 0
+            free = info.get("vram_free_bytes", 0) or 0
+            if total:
+                payload.details["vram_total_gb"] = round(total / 1e9, 1)
+                payload.details["vram_free_gb"] = round(free / 1e9, 1)
+            payload.details["models"] = info.get("models", [])
+    else:
+        try:
+            import torch  # type: ignore
+
+            payload.gpu_available = torch.cuda.is_available()
+            if payload.gpu_available:
+                payload.details["gpu_name"] = torch.cuda.get_device_name(0)
+        except ImportError:
+            payload.details["gpu_available_note"] = "torch not installed yet"
 
     return ForgeResult(success=True, data=payload.model_dump())

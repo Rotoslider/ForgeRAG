@@ -29,3 +29,13 @@ PyMuPDF>=1.24
 pdf2image>=1.17
 Pillow>=10.3
 
+# Phase 3: ML (install with --index-url https://download.pytorch.org/whl/cu128
+# to get CUDA 12.8 wheels — matches the RTX PRO 6000 Blackwell driver)
+torch==2.10.0
+torchvision==0.25.0
+transformers>=4.41
+sentence-transformers>=2.7
+colpali-engine>=0.3.0
+accelerate>=0.30
+numpy>=1.26
+

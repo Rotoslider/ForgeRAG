@@ -26,7 +26,10 @@ from backend.config import Settings
 from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pdf_processor import PDFProcessor
 from backend.ingestion.text_extractor import TextExtractor
+from backend.services.colpali_service import ColPaliService, serialize_colpali
+from backend.services.gpu_manager import GPUManager
 from backend.services.neo4j_service import Neo4jService
+from backend.services.text_embedding_service import TextEmbeddingService
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +54,16 @@ class IngestionPipeline:
         settings: Settings,
         neo4j: Neo4jService,
         job_manager: JobManager,
+        gpu: GPUManager | None = None,
+        text_embedding: TextEmbeddingService | None = None,
+        colpali: ColPaliService | None = None,
     ):
         self.settings = settings
         self.neo4j = neo4j
         self.jobs = job_manager
+        self.gpu = gpu
+        self.text_embedding = text_embedding
+        self.colpali = colpali
         self.pdf_processor = PDFProcessor(
             data_dir=Path(settings.server.data_dir),
             dpi=settings.ingestion.pdf_dpi,
@@ -79,7 +88,7 @@ class IngestionPipeline:
             await self.jobs.update(
                 job_id,
                 current_step="rendering_pages",
-                progress_pct=10.0,
+                progress_pct=5.0,
                 doc_id=doc_id,
                 file_hash=file_hash,
                 pages_total=page_count,
@@ -87,15 +96,64 @@ class IngestionPipeline:
             await self._rasterize(job_id, job.source_path, file_hash, page_count)
 
             await self.jobs.update(
-                job_id, current_step="extracting_text", progress_pct=60.0
+                job_id, current_step="extracting_text", progress_pct=40.0
             )
             await self._extract_text(job_id, job.source_path, doc_id, file_hash)
+
+            # Phase 3 steps — only run if services are wired up
+            if self.text_embedding is not None:
+                await self.jobs.update(
+                    job_id, current_step="embedding_text", progress_pct=60.0
+                )
+                await self._embed_text(job_id, doc_id)
+
+            if self.colpali is not None:
+                await self.jobs.update(
+                    job_id, current_step="embedding_visual", progress_pct=75.0
+                )
+                await self._embed_visual(job_id, doc_id, file_hash)
 
             await self.jobs.complete(job_id)
             logger.info("Job %s completed successfully", job_id)
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Job %s failed", job_id)
+            await self.jobs.fail(job_id, str(exc))
+
+    async def run_embeddings_only(self, job_id: str, doc_id: str) -> None:
+        """Re-run only the embedding steps for an already-ingested document.
+
+        Used by POST /documents/{doc_id}/reembed to backfill Phase 3 embeddings
+        on documents ingested during Phase 2.
+        """
+        try:
+            # Look up file_hash from Neo4j
+            rows = await self.neo4j.run_query(
+                "MATCH (d:Document {doc_id: $id}) RETURN d.file_hash AS h",
+                {"id": doc_id},
+            )
+            if not rows:
+                raise ValueError(f"Document {doc_id} not found")
+            file_hash = rows[0]["h"]
+
+            await self.jobs.update(job_id, status="processing", doc_id=doc_id, file_hash=file_hash)
+
+            if self.text_embedding is not None:
+                await self.jobs.update(
+                    job_id, current_step="embedding_text", progress_pct=10.0
+                )
+                await self._embed_text(job_id, doc_id)
+
+            if self.colpali is not None:
+                await self.jobs.update(
+                    job_id, current_step="embedding_visual", progress_pct=50.0
+                )
+                await self._embed_visual(job_id, doc_id, file_hash)
+
+            await self.jobs.complete(job_id)
+            logger.info("Reembed job %s completed for doc %s", job_id, doc_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Reembed job %s failed", job_id)
             await self.jobs.fail(job_id, str(exc))
 
     # ------------------------------------------------------------------ step 1
@@ -275,10 +333,129 @@ class IngestionPipeline:
 
         await self.jobs.update(
             job_id,
-            progress_pct=95.0,
+            progress_pct=55.0,
             pages_processed=extraction.page_count,
         )
         logger.info(
             "Created %d :Page nodes for doc %s (source=%s)",
             extraction.page_count, doc_id, extraction.document_source_type,
         )
+
+    # ------------------------------------------------------------------ step 4
+
+    async def _embed_text(self, job_id: str, doc_id: str) -> None:
+        """Embed page texts and store on Page.text_embedding (Neo4j vector index)."""
+        assert self.text_embedding is not None
+        assert self.gpu is not None
+
+        # Pull pages that have text and no embedding yet
+        pages = await self.neo4j.run_query(
+            """
+            MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
+            WHERE p.text_char_count > 0 AND p.text_embedding IS NULL
+            RETURN p.page_id AS page_id, p.extracted_text AS text
+            ORDER BY p.page_number
+            """,
+            {"doc_id": doc_id},
+        )
+        if not pages:
+            logger.info("No pages need text embedding for doc %s", doc_id)
+            return
+
+        total = len(pages)
+        batch_size = self.settings.ingestion.text_embedding_batch_size
+
+        # Embed in batches under the GPU semaphore
+        async with self.gpu.load_scope("text_embedding"):
+            for start in range(0, total, batch_size):
+                batch = pages[start:start + batch_size]
+                texts = [row["text"] for row in batch]
+                ids = [row["page_id"] for row in batch]
+
+                # Embedding is CPU/GPU-bound — run in a worker thread
+                embeddings = await asyncio.to_thread(
+                    self.text_embedding.embed_documents, texts, batch_size=batch_size
+                )
+
+                # Write back in one UNWIND query
+                payload = [
+                    {"page_id": pid, "vec": emb.tolist()}
+                    for pid, emb in zip(ids, embeddings, strict=True)
+                ]
+                await self.neo4j.run_write(
+                    """
+                    UNWIND $rows AS row
+                    MATCH (p:Page {page_id: row.page_id})
+                    SET p.text_embedding = row.vec
+                    """,
+                    {"rows": payload},
+                )
+
+                done = min(start + batch_size, total)
+                # Text embedding spans 60% -> 75% in full runs, 10% -> 50% in reembed runs
+                await self.jobs.update(
+                    job_id, pages_processed=done
+                )
+
+        logger.info("Embedded text for %d pages of doc %s", total, doc_id)
+
+    # ------------------------------------------------------------------ step 5
+
+    async def _embed_visual(self, job_id: str, doc_id: str, file_hash: str) -> None:
+        """Generate ColPali embeddings for every page and store as bytes on Page."""
+        assert self.colpali is not None
+        assert self.gpu is not None
+
+        # Find all pages that don't yet have a ColPali embedding
+        rows = await self.neo4j.run_query(
+            """
+            MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
+            WHERE p.colpali_vector_count IS NULL OR p.colpali_vector_count = 0
+            RETURN p.page_id AS page_id, p.page_number AS page_number
+            ORDER BY p.page_number
+            """,
+            {"doc_id": doc_id},
+        )
+        if not rows:
+            logger.info("No pages need ColPali embedding for doc %s", doc_id)
+            return
+
+        total = len(rows)
+        batch_size = self.settings.ingestion.colpali_batch_size
+
+        async with self.gpu.load_scope("colpali"):
+            for start in range(0, total, batch_size):
+                batch = rows[start:start + batch_size]
+                image_paths = [
+                    self.pdf_processor.page_image_path(file_hash, r["page_number"])
+                    for r in batch
+                ]
+                page_ids = [r["page_id"] for r in batch]
+
+                # ColPali returns a list of (K, D) float32 arrays
+                embeddings = await asyncio.to_thread(
+                    self.colpali.embed_images, image_paths
+                )
+
+                payload = []
+                for pid, arr in zip(page_ids, embeddings, strict=True):
+                    blob, k = serialize_colpali(arr)
+                    payload.append(
+                        {"page_id": pid, "blob": blob, "count": k, "dim": int(arr.shape[1]) if arr.size else 128}
+                    )
+
+                await self.neo4j.run_write(
+                    """
+                    UNWIND $rows AS row
+                    MATCH (p:Page {page_id: row.page_id})
+                    SET p.colpali_vectors = row.blob,
+                        p.colpali_vector_count = row.count,
+                        p.colpali_vector_dim = row.dim
+                    """,
+                    {"rows": payload},
+                )
+
+                done = min(start + batch_size, total)
+                await self.jobs.update(job_id, pages_processed=done)
+
+        logger.info("Embedded ColPali for %d pages of doc %s", total, doc_id)

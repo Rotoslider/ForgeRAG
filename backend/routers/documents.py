@@ -89,6 +89,39 @@ async def get_document(doc_id: str, request: Request) -> ForgeResult:
     return ForgeResult(success=True, data=rows[0])
 
 
+@router.post("/documents/{doc_id}/reembed")
+async def reembed_document(doc_id: str, request: Request) -> ForgeResult:
+    """Re-run only the embedding steps (text + ColPali) for an existing document.
+
+    Useful for documents ingested under earlier phases that don't yet have
+    embeddings. Creates a new job for progress tracking.
+    """
+    import asyncio
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    rows = await neo4j.run_query(
+        "MATCH (d:Document {doc_id: $id}) RETURN d.filename AS f",
+        {"id": doc_id},
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+
+    filename = rows[0]["f"]
+    job = await jobs.create(
+        source_path=f"(reembed of {doc_id})",
+        filename=filename,
+        categories=[],
+        tags=[],
+    )
+    asyncio.create_task(pipeline.run_embeddings_only(job.job_id, doc_id))
+    return ForgeResult(
+        success=True,
+        data={"job_id": job.job_id, "doc_id": doc_id, "status": "queued"},
+    )
+
+
 @router.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str, request: Request) -> ForgeResult:
     """Delete a document and all its pages. Also removes page images from disk."""
