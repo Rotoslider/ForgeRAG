@@ -339,7 +339,31 @@ class IngestionPipeline:
     async def _extract_text(
         self, job_id: str, source_path: str, doc_id: str, file_hash: str
     ) -> None:
-        """Extract text per page and create :Page nodes linked to :Document."""
+        """Extract text per page and create :Page nodes linked to :Document.
+
+        Skips extraction entirely if the document already has :Page nodes
+        (the previous ingestion run already created them). Avoids creating
+        duplicate Pages on resume after a failed ColPali / entity-extraction
+        step.
+        """
+        existing = await self.neo4j.run_query(
+            """
+            MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
+            RETURN count(p) AS n
+            """,
+            {"doc_id": doc_id},
+        )
+        existing_count = existing[0]["n"] if existing else 0
+        if existing_count > 0:
+            logger.info(
+                "Document %s already has %d :Page nodes — skipping text extraction",
+                doc_id, existing_count,
+            )
+            await self.jobs.update(
+                job_id, progress_pct=55.0, pages_processed=existing_count
+            )
+            return
+
         extraction = await asyncio.to_thread(
             self.text_extractor.extract_sync, Path(source_path)
         )
