@@ -65,6 +65,10 @@ class LLMSettings(BaseModel):
     max_tokens: int = 4096
     temperature: float = 0.1
     timeout_seconds: int = 120
+    # Some models (Gemma 4 MoE) break under strict JSON schema grammar
+    # enforcement and produce repetitive junk. Others (GLM reasoning
+    # variants) work great with it. Toggle per model.
+    use_json_schema: bool = True
 
 
 class IngestionSettings(BaseModel):

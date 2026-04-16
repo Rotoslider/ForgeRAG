@@ -30,13 +30,19 @@ text_embedding_dim = 768
 vlm_name = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 [llm]
-# Entity extraction LLM — runs on RTX 6000 via local llama.cpp or vLLM server.
-# Only started during ingestion batches (consumes ~40GB VRAM).
-endpoint = "http://localhost:8300/v1"
-model = "qwen2.5-72b-instruct-q4_k_m"
-max_tokens = 4096
+# Entity-extraction LLM. Point at any OpenAI-compatible endpoint
+# (LM Studio, llama.cpp server, vLLM, etc.).
+#
+# Recommended: Gemma 4 26B MoE (a4b) — non-reasoning, ~85 tok/s on
+# Blackwell, much faster than reasoning models like GLM 4.7 Flash or
+# Qwen 3.5 122B on this task. Set use_json_schema=false: Gemma 4 MoE
+# breaks under LM Studio's strict json_schema grammar.
+endpoint = "http://localhost:1234/v1"
+model = "google/gemma-4-26b-a4b"
+max_tokens = 6144
 temperature = 0.1
-timeout_seconds = 120
+timeout_seconds = 180
+use_json_schema = false
 
 [ingestion]
 pdf_dpi = 300

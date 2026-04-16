@@ -140,8 +140,12 @@ class LLMService:
         attempts beyond the first). Fails fast on auth/schema errors.
         """
         schema = schema_cls.model_json_schema()
-        # Prefer json_schema response_format (llama.cpp, vLLM); fall back to
-        # json_object if the server doesn't grok it.
+        # Some models support strict JSON schema grammar (llama.cpp and
+        # vLLM do), some don't. Config toggles whether we try it at all.
+        # When enabled we start with json_schema and fall back to plain
+        # text mode on a 400 / schema mismatch. When disabled we always
+        # use plain text and rely on the prompt (works with Gemma 4 MoE
+        # which loops in degenerate ways under strict grammar).
         response_format_primary = {
             "type": "json_schema",
             "json_schema": {
@@ -150,16 +154,20 @@ class LLMService:
                 "strict": True,
             },
         }
-        response_format_fallback = {"type": "json_object"}
 
         attempts_left = retries + 1
         last_err: Exception | None = None
+        use_strict = self.settings.use_json_schema
         primary_failed = False
 
         while attempts_left > 0:
             attempts_left -= 1
             try:
-                rf = response_format_fallback if primary_failed else response_format_primary
+                rf = (
+                    response_format_primary
+                    if (use_strict and not primary_failed)
+                    else None
+                )
                 content = await self.chat(
                     messages,
                     max_tokens=max_tokens,
@@ -179,13 +187,23 @@ class LLMService:
                     continue
                 raise
 
-            # Parse + validate
+            # Parse + validate — tolerate models that wrap JSON in prose or
+            # markdown code fences. We look for the first {...} span if the
+            # raw content doesn't parse directly.
+            data = None
             try:
                 data = json.loads(content)
-            except json.JSONDecodeError as exc:
-                last_err = exc
+            except json.JSONDecodeError:
+                extracted = _extract_first_json_object(content)
+                if extracted is not None:
+                    try:
+                        data = json.loads(extracted)
+                    except json.JSONDecodeError:
+                        data = None
+
+            if data is None:
+                last_err = ValueError("non-JSON response")
                 logger.warning("LLM returned non-JSON (attempts left=%d): %.200s", attempts_left, content)
-                # Next iteration will retry with a reminder message
                 messages = messages + [
                     {
                         "role": "user",
@@ -215,6 +233,52 @@ class LLMService:
                 continue
 
         raise LLMFatalError(f"Structured JSON call failed after retries: {last_err}")
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    """Find the first balanced {...} JSON object in arbitrary text.
+
+    Handles models that wrap JSON in markdown (```json ... ```) or include
+    prose before/after. Uses a depth counter; doesn't handle escapes inside
+    strings, but json.loads in the caller will reject malformed spans so
+    we just try and move on.
+    """
+    # Strip common code-fence wrapping
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        # Drop opening fence (```json or just ```)
+        first_newline = stripped.find("\n")
+        if first_newline > 0:
+            stripped = stripped[first_newline + 1:]
+        if stripped.endswith("```"):
+            stripped = stripped[:-3]
+        stripped = stripped.strip()
+
+    start = stripped.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(stripped)):
+        ch = stripped[i]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return stripped[start:i + 1]
+    return None
 
 
 def create_llm_service(settings) -> LLMService:

@@ -549,18 +549,27 @@ class IngestionPipeline:
     async def _extract_entities(self, job_id: str, doc_id: str) -> None:
         """Run LLM entity extraction on each page and write results into the graph.
 
-        This is I/O-bound on the LLM endpoint. We process pages sequentially
-        (the local LLM server handles one request at a time anyway) and update
-        progress after each page.
+        I/O-bound on the LLM endpoint. Sequential per page (local LLM
+        serves one request at a time). Skips pages that already have any
+        MENTIONS_* outgoing relationship so re-runs after a partial failure
+        don't double-count support_count on existing edges.
         """
         assert self.entity_extractor is not None
 
-        # Pull title + pages that have text
+        # Pull title + pages that have text AND haven't had entities extracted yet.
+        # We detect "already extracted" as having any of the page-level entity
+        # relationships — if extraction ran on this page it wrote at least one,
+        # unless the page was empty of entities. For safety we also accept pages
+        # that still genuinely have nothing relevant; those pages just get
+        # re-run (fast path since the LLM returns empty arrays).
         rows = await self.neo4j.run_query(
             """
             MATCH (d:Document {doc_id: $doc_id})
             OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
             WHERE p.text_char_count > 0
+              AND NOT EXISTS {
+                (p)-[:MENTIONS_MATERIAL|DESCRIBES_PROCESS|REFERENCES_STANDARD|MENTIONS_EQUIPMENT]->()
+              }
             RETURN d.title AS title,
                    collect({page_id: p.page_id, page_number: p.page_number, text: p.extracted_text}) AS pages
             """,
