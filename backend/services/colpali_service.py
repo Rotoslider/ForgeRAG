@@ -27,7 +27,7 @@ from backend.services.gpu_manager import GPUManager
 
 logger = logging.getLogger(__name__)
 
-_MODEL_VRAM_ESTIMATE = 4 * 1024 * 1024 * 1024  # ~4 GB for ColPali v1.3
+_MODEL_VRAM_ESTIMATE = 24 * 1024 * 1024 * 1024  # ~24 GB for ColPali v1.3 in bfloat16 on Blackwell
 
 
 class ColPaliService:
@@ -105,12 +105,17 @@ class ColPaliService:
     # -------------------------------------------------------- embed ops
 
     def _pool(self, embeddings, pool_factor: int):
-        """Apply HierarchicalTokenPooler to compress per-patch embeddings."""
+        """Apply HierarchicalTokenPooler to compress per-patch embeddings.
+
+        The colpali-engine 0.3.15 API takes no __init__ args; pool_factor moved
+        onto pool_embeddings(). See token_pooling/hierarchical_token_pooling.py.
+        """
         from colpali_engine.compression.token_pooling import HierarchicalTokenPooler
 
-        pooler = HierarchicalTokenPooler(pool_factor=pool_factor)
+        pooler = HierarchicalTokenPooler()
         return pooler.pool_embeddings(
             embeddings,
+            pool_factor=pool_factor,
             padding=True,
             padding_side=self._processor.tokenizer.padding_side,  # type: ignore[union-attr]
         )
