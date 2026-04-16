@@ -23,11 +23,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.config import Settings
+from backend.ingestion.entity_extractor import EntityExtractor
+from backend.ingestion.graph_builder import GraphBuilder
 from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pdf_processor import PDFProcessor
 from backend.ingestion.text_extractor import TextExtractor
 from backend.services.colpali_service import ColPaliService, serialize_colpali
 from backend.services.gpu_manager import GPUManager
+from backend.services.llm_service import LLMService
 from backend.services.neo4j_service import Neo4jService
 from backend.services.text_embedding_service import TextEmbeddingService
 
@@ -57,6 +60,7 @@ class IngestionPipeline:
         gpu: GPUManager | None = None,
         text_embedding: TextEmbeddingService | None = None,
         colpali: ColPaliService | None = None,
+        llm: LLMService | None = None,
     ):
         self.settings = settings
         self.neo4j = neo4j
@@ -64,6 +68,9 @@ class IngestionPipeline:
         self.gpu = gpu
         self.text_embedding = text_embedding
         self.colpali = colpali
+        self.llm = llm
+        self.entity_extractor = EntityExtractor(llm) if llm is not None else None
+        self.graph_builder = GraphBuilder(neo4j)
         self.pdf_processor = PDFProcessor(
             data_dir=Path(settings.server.data_dir),
             dpi=settings.ingestion.pdf_dpi,
@@ -113,11 +120,36 @@ class IngestionPipeline:
                 )
                 await self._embed_visual(job_id, doc_id, file_hash)
 
+            if self.entity_extractor is not None:
+                await self.jobs.update(
+                    job_id, current_step="extracting_entities", progress_pct=88.0
+                )
+                await self._extract_entities(job_id, doc_id)
+
             await self.jobs.complete(job_id)
             logger.info("Job %s completed successfully", job_id)
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Job %s failed", job_id)
+            await self.jobs.fail(job_id, str(exc))
+
+    async def run_extraction_only(self, job_id: str, doc_id: str) -> None:
+        """Re-run only entity extraction for an already-ingested document.
+
+        Used by POST /documents/{doc_id}/extract-entities.
+        """
+        try:
+            await self.jobs.update(job_id, status="processing", doc_id=doc_id)
+            if self.entity_extractor is None:
+                raise ValueError("LLM service not configured — cannot extract entities")
+            await self.jobs.update(
+                job_id, current_step="extracting_entities", progress_pct=10.0
+            )
+            await self._extract_entities(job_id, doc_id)
+            await self.jobs.complete(job_id)
+            logger.info("Extraction-only job %s completed for doc %s", job_id, doc_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Extraction-only job %s failed", job_id)
             await self.jobs.fail(job_id, str(exc))
 
     async def run_embeddings_only(self, job_id: str, doc_id: str) -> None:
@@ -459,3 +491,70 @@ class IngestionPipeline:
                 await self.jobs.update(job_id, pages_processed=done)
 
         logger.info("Embedded ColPali for %d pages of doc %s", total, doc_id)
+
+    # ------------------------------------------------------------------ step 6
+
+    async def _extract_entities(self, job_id: str, doc_id: str) -> None:
+        """Run LLM entity extraction on each page and write results into the graph.
+
+        This is I/O-bound on the LLM endpoint. We process pages sequentially
+        (the local LLM server handles one request at a time anyway) and update
+        progress after each page.
+        """
+        assert self.entity_extractor is not None
+
+        # Pull title + pages that have text
+        rows = await self.neo4j.run_query(
+            """
+            MATCH (d:Document {doc_id: $doc_id})
+            OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
+            WHERE p.text_char_count > 0
+            RETURN d.title AS title,
+                   collect({page_id: p.page_id, page_number: p.page_number, text: p.extracted_text}) AS pages
+            """,
+            {"doc_id": doc_id},
+        )
+        if not rows:
+            logger.warning("No document %s found for entity extraction", doc_id)
+            return
+        title = rows[0]["title"] or "(untitled)"
+        pages = [p for p in rows[0]["pages"] if p["page_id"] is not None]
+
+        if not pages:
+            logger.info("Document %s has no pages with text — skipping extraction", doc_id)
+            return
+
+        total = len(pages)
+        logger.info(
+            "Extracting entities for %d pages of %s via LLM %s",
+            total, title, self.llm.settings.endpoint if self.llm else "?",
+        )
+
+        done = 0
+        aggregate = {"materials": 0, "processes": 0, "standards": 0,
+                     "clauses": 0, "equipment": 0,
+                     "page_rels": 0, "entity_rels": 0}
+        for page in pages:
+            try:
+                extraction = await self.entity_extractor.extract_page(
+                    document_title=title,
+                    page_number=page["page_number"],
+                    page_text=page["text"],
+                )
+                counts = await self.graph_builder.write_page(
+                    page_id=page["page_id"], extraction=extraction
+                )
+                for k, v in counts.items():
+                    aggregate[k] = aggregate.get(k, 0) + v
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Entity extraction failed for page %d: %s",
+                               page["page_number"], exc)
+
+            done += 1
+            # Extraction spans 88% -> 99% in full runs, 10% -> 95% in extract-only
+            progress = min(99.0, 88.0 + 11.0 * done / total)
+            await self.jobs.update(
+                job_id, progress_pct=progress, pages_processed=done
+            )
+
+        logger.info("Entity extraction complete for doc %s: %s", doc_id, aggregate)

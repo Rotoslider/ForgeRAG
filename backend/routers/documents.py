@@ -89,6 +89,45 @@ async def get_document(doc_id: str, request: Request) -> ForgeResult:
     return ForgeResult(success=True, data=rows[0])
 
 
+@router.post("/documents/{doc_id}/extract-entities")
+async def extract_entities(doc_id: str, request: Request) -> ForgeResult:
+    """Run only the LLM entity-extraction step for an existing document.
+
+    Useful for documents ingested before Phase 4 or after changing the
+    extraction prompt. Requires the LLM service to be configured and reachable.
+    """
+    import asyncio
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    rows = await neo4j.run_query(
+        "MATCH (d:Document {doc_id: $id}) RETURN d.filename AS f",
+        {"id": doc_id},
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+
+    if pipeline.entity_extractor is None:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM service not configured or unreachable — cannot extract entities",
+        )
+
+    filename = rows[0]["f"]
+    job = await jobs.create(
+        source_path=f"(extract-entities of {doc_id})",
+        filename=filename,
+        categories=[],
+        tags=[],
+    )
+    asyncio.create_task(pipeline.run_extraction_only(job.job_id, doc_id))
+    return ForgeResult(
+        success=True,
+        data={"job_id": job.job_id, "doc_id": doc_id, "status": "queued"},
+    )
+
+
 @router.post("/documents/{doc_id}/reembed")
 async def reembed_document(doc_id: str, request: Request) -> ForgeResult:
     """Re-run only the embedding steps (text + ColPali) for an existing document.

@@ -19,9 +19,10 @@ from fastapi.staticfiles import StaticFiles
 from backend.config import DEFAULT_CONFIG_PATH, get_settings
 from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pipeline import IngestionPipeline
-from backend.routers import documents, health, images, ingestion, search, system
+from backend.routers import documents, graph, health, images, ingestion, search, system
 from backend.services.colpali_service import create_colpali_service
 from backend.services.gpu_manager import GPUManager
+from backend.services.llm_service import create_llm_service
 from backend.services.neo4j_service import Neo4jService
 from backend.services.text_embedding_service import create_text_embedding_service
 
@@ -80,6 +81,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.warning("ColPali service not wired: %s", exc)
         app.state.colpali = None
 
+    # LLM service (for Phase 4 entity extraction). Lazy connection check —
+    # the pipeline disables extraction if the endpoint isn't reachable at
+    # step time, but we start the client so it's ready when it is.
+    llm_service = create_llm_service(settings)
+    await llm_service.start()
+    app.state.llm = llm_service
+    try:
+        llm_ok = await llm_service.health()
+        if llm_ok:
+            logger.info("LLM endpoint reachable at %s", settings.llm.endpoint)
+        else:
+            logger.warning(
+                "LLM endpoint %s not reachable — entity extraction will be skipped "
+                "until the server is running.",
+                settings.llm.endpoint,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("LLM health check raised: %s", exc)
+
     # Ingestion pipeline (one instance, processes one job at a time via asyncio)
     pipeline = IngestionPipeline(
         settings=settings,
@@ -88,6 +108,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         gpu=gpu,
         text_embedding=app.state.text_embedding,
         colpali=app.state.colpali,
+        llm=llm_service,
     )
     app.state.pipeline = pipeline
 
@@ -95,6 +116,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        try:
+            await llm_service.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("llm.stop failed: %s", exc)
         try:
             await gpu.stop()
         except Exception as exc:  # noqa: BLE001
@@ -128,6 +153,7 @@ def create_app() -> FastAPI:
     app.include_router(images.router)
     app.include_router(search.router)
     app.include_router(system.router)
+    app.include_router(graph.router)
 
     # Frontend static mount (production build). Skipped if not built yet.
     frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
