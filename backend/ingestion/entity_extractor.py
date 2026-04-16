@@ -199,7 +199,14 @@ Page: {page_number}
 --- BEGIN PAGE TEXT ---
 {page_text}
 --- END PAGE TEXT ---
+
+/no_think
 """
+# The /no_think trailer is a Qwen3-family directive that disables the
+# model's chain-of-thought deliberation. Without it, Qwen3.5 spends
+# hundreds of tokens thinking before emitting JSON and takes 30+ s per
+# page instead of ~8 s. Models that don't recognize the directive
+# (Gemma 4, GLM Flash, Llama, etc.) ignore it as plain text — harmless.
 
 
 # ----------------------------------------------------------------- extractor

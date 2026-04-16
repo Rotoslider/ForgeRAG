@@ -33,16 +33,20 @@ vlm_name = "Qwen/Qwen2.5-VL-7B-Instruct"
 # Entity-extraction LLM. Point at any OpenAI-compatible endpoint
 # (LM Studio, llama.cpp server, vLLM, etc.).
 #
-# Recommended: Gemma 4 26B MoE (a4b) — non-reasoning, ~85 tok/s on
-# Blackwell, much faster than reasoning models like GLM 4.7 Flash or
-# Qwen 3.5 122B on this task. Set use_json_schema=false: Gemma 4 MoE
-# breaks under LM Studio's strict json_schema grammar.
+# Recommended: Qwen3.5 35B MoE (3B active) — ~135 tok/s on Blackwell,
+# ~8-10s per dense page. Needs use_json_schema=true and the prompt's
+# /no_think trailer to avoid reasoning mode.
+#
+# Alternatives tested:
+#   google/gemma-4-26b-a4b  — 85 tok/s, needs use_json_schema=false
+#                             (breaks under strict schema grammar).
+#   zai-org/glm-4.7-flash   — too slow due to mandatory reasoning.
 endpoint = "http://localhost:1234/v1"
-model = "google/gemma-4-26b-a4b"
-max_tokens = 6144
+model = "qwen/qwen3.5-35b-a3b"
+max_tokens = 4096
 temperature = 0.1
 timeout_seconds = 180
-use_json_schema = false
+use_json_schema = true
 
 [ingestion]
 pdf_dpi = 300
