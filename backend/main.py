@@ -21,6 +21,7 @@ from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pipeline import IngestionPipeline
 from backend.routers import documents, graph, health, images, ingestion, search, system
 from backend.services.colpali_service import create_colpali_service
+from backend.services.image_service import ImageHighlighter
 from backend.services.gpu_manager import GPUManager
 from backend.services.llm_service import create_llm_service
 from backend.services.neo4j_service import Neo4jService
@@ -80,6 +81,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("ColPali service not wired: %s", exc)
         app.state.colpali = None
+
+    if app.state.colpali is not None:
+        app.state.highlighter = ImageHighlighter(
+            data_dir=data_dir, colpali=app.state.colpali, gpu=gpu
+        )
+    else:
+        app.state.highlighter = None
 
     # LLM service (for Phase 4 entity extraction). Lazy connection check —
     # the pipeline disables extraction if the endpoint isn't reachable at

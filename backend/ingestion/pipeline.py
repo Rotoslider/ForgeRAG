@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.config import Settings
+from backend.ingestion.community_detector import CommunityDetector
 from backend.ingestion.entity_extractor import EntityExtractor
 from backend.ingestion.graph_builder import GraphBuilder
 from backend.ingestion.job_manager import JobManager
@@ -71,6 +72,11 @@ class IngestionPipeline:
         self.llm = llm
         self.entity_extractor = EntityExtractor(llm) if llm is not None else None
         self.graph_builder = GraphBuilder(neo4j)
+        self.community_detector = (
+            CommunityDetector(neo4j=neo4j, llm=llm, text_embedding=text_embedding)
+            if (llm is not None and text_embedding is not None)
+            else None
+        )
         self.pdf_processor = PDFProcessor(
             data_dir=Path(settings.server.data_dir),
             dpi=settings.ingestion.pdf_dpi,
@@ -131,6 +137,28 @@ class IngestionPipeline:
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Job %s failed", job_id)
+            await self.jobs.fail(job_id, str(exc))
+
+    async def run_communities_only(self, job_id: str) -> None:
+        """Rebuild all :Community nodes globally from the current graph.
+
+        Not per-document — community detection spans all ingested pages
+        because engineering topics connect across handbooks. The job is
+        scoped to tracking the long operation, not to a specific doc.
+        """
+        try:
+            if self.community_detector is None:
+                raise ValueError("LLM or text embedding unavailable — cannot detect communities")
+            await self.jobs.update(
+                job_id, status="processing", current_step="building_graph", progress_pct=5.0
+            )
+            assert self.gpu is not None
+            async with self.gpu.load_scope("text_embedding"):
+                counts = await self.community_detector.build()
+            logger.info("Community detection complete: %s", counts)
+            await self.jobs.complete(job_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Community job %s failed", job_id)
             await self.jobs.fail(job_id, str(exc))
 
     async def run_extraction_only(self, job_id: str, doc_id: str) -> None:

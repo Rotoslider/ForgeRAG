@@ -215,6 +215,68 @@ async def list_entities(
     return ForgeResult(success=True, data=rows)
 
 
+@router.post("/build-communities")
+async def build_communities(request: Request) -> ForgeResult:
+    """Rebuild the hierarchical community layer (GraphRAG summaries).
+
+    Global operation — scans all ingested pages with extracted entities,
+    runs Leiden community detection at three resolution levels, generates
+    LLM summaries for each community, and embeds them. Existing Community
+    nodes are wiped and recreated.
+    """
+    import asyncio
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    if pipeline.community_detector is None:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM or text embedding service not available — cannot detect communities",
+        )
+
+    job = await jobs.create(
+        source_path="(build-communities global)",
+        filename="(all documents)",
+        categories=[],
+        tags=[],
+    )
+    asyncio.create_task(pipeline.run_communities_only(job.job_id))
+    return ForgeResult(
+        success=True,
+        data={"job_id": job.job_id, "status": "queued"},
+    )
+
+
+@router.get("/communities")
+async def list_communities(
+    request: Request,
+    level: int | None = Query(None, ge=0, le=3, description="Filter by hierarchy level"),
+    limit: int = Query(50, ge=1, le=500),
+) -> ForgeResult:
+    """List communities with their summaries and page counts."""
+    neo4j = request.app.state.neo4j
+    where = "WHERE c.level = $level" if level is not None else ""
+    params: dict = {"limit": limit}
+    if level is not None:
+        params["level"] = level
+    rows = await neo4j.run_query(
+        f"""
+        MATCH (c:Community) {where}
+        OPTIONAL MATCH (p:Page)-[:IN_COMMUNITY]->(c)
+        RETURN c.community_id AS community_id,
+               c.level AS level,
+               c.resolution AS resolution,
+               c.summary AS summary,
+               c.member_count AS member_count,
+               count(DISTINCT p) AS actual_page_count
+        ORDER BY c.level DESC, c.member_count DESC
+        LIMIT $limit
+        """,
+        params,
+    )
+    return ForgeResult(success=True, data=rows)
+
+
 @router.get("/stats")
 async def graph_stats(request: Request) -> ForgeResult:
     """Summary of the knowledge graph — total counts per label."""
@@ -229,8 +291,9 @@ async def graph_stats(request: Request) -> ForgeResult:
         OPTIONAL MATCH (c:Clause) WITH documents, pages, materials, processes, standards, count(c) AS clauses
         OPTIONAL MATCH (e:Equipment) WITH documents, pages, materials, processes, standards, clauses, count(e) AS equipment
         OPTIONAL MATCH (cat:Category) WITH documents, pages, materials, processes, standards, clauses, equipment, count(cat) AS categories
-        OPTIONAL MATCH (t:Tag)
-        RETURN documents, pages, materials, processes, standards, clauses, equipment, categories, count(t) AS tags
+        OPTIONAL MATCH (t:Tag) WITH documents, pages, materials, processes, standards, clauses, equipment, categories, count(t) AS tags
+        OPTIONAL MATCH (com:Community)
+        RETURN documents, pages, materials, processes, standards, clauses, equipment, categories, tags, count(com) AS communities
         """
     )
     return ForgeResult(success=True, data=rows[0] if rows else {})

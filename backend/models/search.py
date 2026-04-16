@@ -32,6 +32,29 @@ class VisualSearchRequest(BaseModel):
     filters: SearchFilters | None = None
 
 
+HybridStrategy = Literal["graph_boosted", "vector_first", "graph_first", "community"]
+
+
+class HybridSearchRequest(BaseModel):
+    query: str
+    strategy: HybridStrategy = "graph_boosted"
+    limit: int = Field(default=10, ge=1, le=100)
+    filters: SearchFilters | None = None
+    # Strategy-specific tunables
+    boost_weight: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Score bonus per graph-linked entity match (graph_boosted)",
+    )
+    candidate_pool: int = Field(
+        default=50,
+        ge=5,
+        le=500,
+        description="Initial vector candidates before graph re-ranking / enrichment",
+    )
+
+
 class SearchHit(BaseModel):
     """One result row."""
 
