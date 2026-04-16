@@ -1,0 +1,92 @@
+"""FastAPI application entry point for ForgeRAG.
+
+Wires together config, Neo4j service, routers, and CORS. Additional routers
+(documents, ingestion, search, graph, etc.) are added in later phases.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import AsyncIterator
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+
+from backend.config import DEFAULT_CONFIG_PATH, get_settings
+from backend.routers import health
+from backend.services.neo4j_service import Neo4jService
+
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Initialize shared resources on startup, clean up on shutdown."""
+    settings = get_settings()
+    app.state.settings = settings
+    app.state.config_path = os.environ.get("FORGERAG_CONFIG", str(DEFAULT_CONFIG_PATH))
+
+    # Ensure data directories exist
+    data_dir = Path(settings.server.data_dir)
+    (data_dir / "page_images").mkdir(parents=True, exist_ok=True)
+    (data_dir / "reduced_images").mkdir(parents=True, exist_ok=True)
+
+    # Neo4j — connect but don't fail if unreachable (service can serve health)
+    neo4j = Neo4jService(settings.neo4j)
+    await neo4j.connect()
+    app.state.neo4j = neo4j
+    try:
+        connected = await neo4j.verify_connectivity()
+        if connected:
+            logger.info("Neo4j reachable at %s", settings.neo4j.uri)
+        else:
+            logger.warning(
+                "Neo4j unreachable at %s — service will start but DB operations will fail.",
+                settings.neo4j.uri,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Neo4j connectivity check raised: %s", exc)
+
+    logger.info("ForgeRAG startup complete on %s:%d", settings.server.host, settings.server.port)
+    try:
+        yield
+    finally:
+        await neo4j.close()
+        logger.info("ForgeRAG shutdown complete")
+
+
+def create_app() -> FastAPI:
+    settings = get_settings()
+
+    app = FastAPI(
+        title="ForgeRAG",
+        description="Local engineering knowledge graph (ColPali + Neo4j + GraphRAG)",
+        version="0.1.0",
+        lifespan=lifespan,
+    )
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.server.cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    # Routers
+    app.include_router(health.router)
+
+    # Frontend static mount (production build). Skipped if not built yet.
+    frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+    if frontend_dist.exists():
+        app.mount("/app", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
+        logger.info("Frontend mounted from %s", frontend_dist)
+
+    return app
+
+
+app = create_app()

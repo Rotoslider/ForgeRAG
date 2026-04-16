@@ -1,0 +1,59 @@
+# ForgeRAG configuration
+# Copy to forgerag.toml and adjust as needed.
+
+[server]
+host = "0.0.0.0"
+port = 8200
+data_dir = "/home/nuc1/projects/ForgeRAG/data"
+# CORS origins for the web GUI (add others if accessed remotely)
+cors_origins = ["http://localhost:5173", "http://localhost:8200"]
+
+[neo4j]
+uri = "bolt://localhost:7687"
+user = "neo4j"
+# Password is read from the env var named here (never stored in the TOML)
+password_env = "NEO4J_PASSWORD"
+database = "neo4j"  # Community Edition only supports 'neo4j' and 'system'
+# Connection pool settings
+max_connection_pool_size = 50
+connection_acquisition_timeout = 60
+
+[models]
+# Visual retrieval model
+colpali_name = "vidore/colpali-v1.3"
+colpali_pool_factor_storage = 3
+colpali_pool_factor_search = 24
+# Text embedding model (kept resident for low VRAM use)
+text_embedding_model = "nomic-ai/nomic-embed-text-v1.5"
+text_embedding_dim = 768
+# Vision LLM for OCR fallback on scanned PDFs
+vlm_name = "Qwen/Qwen2.5-VL-7B-Instruct"
+
+[llm]
+# Entity extraction LLM — runs on RTX 6000 via local llama.cpp or vLLM server.
+# Only started during ingestion batches (consumes ~40GB VRAM).
+endpoint = "http://localhost:8300/v1"
+model = "qwen2.5-72b-instruct-q4_k_m"
+max_tokens = 4096
+temperature = 0.1
+timeout_seconds = 120
+
+[ingestion]
+pdf_dpi = 300
+# Reduce page images to this percentage of original for thumbnails/processing
+reduction_percentage = 50
+reduction_min_dimension = 768
+# Batch sizes
+colpali_batch_size = 10
+text_embedding_batch_size = 32
+# Parallel PDF conversion threads
+max_concurrent_pdf_conversions = 4
+# Text extraction heuristic: pages with fewer than this many chars are OCR candidates
+scanned_text_threshold_chars = 50
+
+[gpu]
+device = "cuda"
+# Seconds a model can be idle before auto-unloaded to free VRAM
+model_idle_unload_seconds = 300
+# Max percentage of VRAM this service may consume
+max_vram_usage_pct = 80

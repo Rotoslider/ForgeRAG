@@ -1,0 +1,34 @@
+[Unit]
+Description=ForgeRAG Engineering Knowledge Graph API
+Documentation=file:///home/nuc1/projects/ForgeRAG/README.md
+After=network.target neo4j.service
+Wants=neo4j.service
+
+[Service]
+Type=simple
+User=nuc1
+Group=nuc1
+WorkingDirectory=/home/nuc1/projects/ForgeRAG
+# Load the password (and any other secrets) from a protected env file
+# Create it with: sudo touch /etc/forgerag/env && sudo chmod 600 /etc/forgerag/env
+# Contents (one per line): NEO4J_PASSWORD=...
+EnvironmentFile=-/etc/forgerag/env
+Environment=FORGERAG_CONFIG=/home/nuc1/projects/ForgeRAG/config/forgerag.toml
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ExecStart=/home/nuc1/projects/ForgeRAG/venv/bin/python backend/run.py
+Restart=on-failure
+RestartSec=10
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forgerag-api
+
+# Harden a bit
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=false
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

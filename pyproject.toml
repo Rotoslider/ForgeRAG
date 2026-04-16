@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forgerag"
+version = "0.1.0"
+description = "Local engineering knowledge graph with ColPali visual retrieval and Neo4j GraphRAG"
+authors = [{ name = "nuc1" }]
+requires-python = ">=3.10"
+readme = "README.md"
+license = { text = "MIT" }
+
+dependencies = [
+    # Web framework
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "pydantic>=2.6",
+    "pydantic-settings>=2.2",
+    "python-multipart>=0.0.9",
+
+    # Config
+    "tomli>=2.0; python_version < '3.11'",
+
+    # Neo4j
+    "neo4j>=5.19",
+
+    # HTTP
+    "httpx>=0.27",
+
+    # Storage
+    "aiosqlite>=0.20",
+]
+
+[project.optional-dependencies]
+# Heavy ML dependencies — installed separately in Phase 3 to keep Phase 1 light
+ml = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+    "transformers>=4.41",
+    "sentence-transformers>=2.7",
+    "colpali-engine>=0.3.0",
+    "accelerate>=0.30",
+    "Pillow>=10.3",
+    "numpy>=1.26",
+]
+
+ingestion = [
+    "PyMuPDF>=1.24",
+    "pdf2image>=1.17",
+    "python-igraph>=0.11",  # community detection
+]
+
+dev = [
+    "pytest>=8.1",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["backend*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

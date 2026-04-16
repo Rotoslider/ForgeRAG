@@ -1,0 +1,25 @@
+# Phase 1 base requirements — web framework, config, Neo4j, HTTP
+# Install with: pip install -r requirements.txt
+#
+# Additional dependency groups (install in later phases):
+#   ML:        pip install -e '.[ml]'
+#   Ingestion: pip install -e '.[ingestion]'
+#   Dev:       pip install -e '.[dev]'
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.6
+pydantic-settings>=2.2
+python-multipart>=0.0.9
+
+# Config parsing (tomllib is stdlib on 3.11+)
+tomli>=2.0; python_version < "3.11"
+
+# Neo4j driver
+neo4j>=5.19
+
+# HTTP clients
+httpx>=0.27
+
+# Local job queue storage
+aiosqlite>=0.20
