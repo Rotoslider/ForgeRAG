@@ -58,14 +58,34 @@ class JobManager:
         self._ready = False
 
     async def init(self) -> None:
-        """Create the database file and schema if they don't exist."""
+        """Create the database file and schema if they don't exist, and mark
+        any 'processing' or 'queued' jobs from the previous process as failed
+        (their background tasks died when the service restarted)."""
         if self._ready:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.executescript(_SCHEMA)
+            # Mark in-flight jobs from the previous run as failed. Any
+            # background task they were running was killed at shutdown;
+            # without this cleanup the Ingest UI would show them stuck.
+            cursor = await db.execute(
+                """UPDATE jobs
+                   SET status = 'failed',
+                       current_step = 'error',
+                       error_message = coalesce(error_message,
+                           'Service restarted while job was running'),
+                       updated_at = ?
+                   WHERE status IN ('processing', 'queued')""",
+                (_utcnow_iso(),),
+            )
             await db.commit()
+            restarted = cursor.rowcount
+            if restarted > 0:
+                logger.info(
+                    "Marked %d stale in-flight job(s) as failed", restarted
+                )
         self._ready = True
         logger.info("JobManager initialized at %s", self.db_path)
 
