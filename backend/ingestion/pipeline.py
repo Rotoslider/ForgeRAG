@@ -587,9 +587,14 @@ class IngestionPipeline:
 
         total = len(pages)
         logger.info(
-            "Extracting entities for %d pages of %s via LLM %s",
+            "Extracting entities for %d pages of %s via LLM %s "
+            "(skipping any already extracted)",
             total, title, self.llm.settings.endpoint if self.llm else "?",
         )
+        # Reflect the actual work queue in pages_total so the UI progress
+        # counter is 'N/queue_size' not 'N/document_size'. Pages already
+        # extracted in a prior run are outside this queue.
+        await self.jobs.update(job_id, pages_total=total)
 
         done = 0
         aggregate = {"materials": 0, "processes": 0, "standards": 0,
