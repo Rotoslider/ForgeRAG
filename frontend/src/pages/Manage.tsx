@@ -51,11 +51,11 @@ function StatsCard() {
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg p-4">
       <h2 className="font-semibold mb-3">Graph Stats</h2>
-      <div className="grid grid-cols-2 gap-y-1 text-sm">
+      <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
         {rows.map(([k, v]) => (
-          <div key={k} className="flex justify-between">
-            <span className="text-slate-400">{k}</span>
-            <span className="font-mono">{v}</span>
+          <div key={k} className="flex items-baseline justify-between gap-3">
+            <span className="text-forge-muted/80">{k}</span>
+            <span className="font-mono tabular-nums">{v}</span>
           </div>
         ))}
       </div>
@@ -85,10 +85,10 @@ function GpuCard() {
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg p-4">
       <h2 className="font-semibold mb-3">GPU</h2>
-      {!g?.available && <div className="text-slate-500 text-sm">GPU not available.</div>}
+      {!g?.available && <div className="text-forge-muted text-sm">GPU not available.</div>}
       {g?.available && (
         <>
-          <div className="text-xs text-slate-400 mb-1">{g.device_name}</div>
+          <div className="text-xs text-forge-muted mb-1">{g.device_name}</div>
           <div className="text-sm mb-2">
             VRAM {(g.vram_free_bytes / 1e9).toFixed(1)} /{" "}
             {(g.vram_total_bytes / 1e9).toFixed(1)} GB free
@@ -105,14 +105,14 @@ function GpuCard() {
           </div>
           {g.models.map((m) => (
             <div key={m.name} className="flex items-center gap-2 text-xs mb-1">
-              <span className={`h-2 w-2 rounded-full ${m.loaded ? "bg-emerald-500" : "bg-slate-600"}`} />
+              <span className={`h-2 w-2 rounded-full ${m.loaded ? "bg-emerald-500" : "bg-forge-edge"}`} />
               <span className="font-mono">{m.name}</span>
-              <span className="text-slate-500">
+              <span className="text-forge-muted">
                 {m.loaded ? `loaded · idle ${m.last_used_s_ago}s` : "unloaded"}
               </span>
               {m.loaded && (
                 <button
-                  className="ml-auto text-xs text-slate-400 hover:text-forge-accent"
+                  className="ml-auto text-xs text-forge-muted hover:text-forge-accent"
                   onClick={() => unload.mutate(m.name)}
                   disabled={unload.isPending}
                 >
@@ -124,7 +124,7 @@ function GpuCard() {
         </>
       )}
       {h?.neo4j_connected ? (
-        <div className="mt-3 pt-3 border-t border-forge-edge text-xs text-slate-400">
+        <div className="mt-3 pt-3 border-t border-forge-edge text-xs text-forge-muted">
           Neo4j: <span className="text-emerald-400">connected</span>
         </div>
       ) : (
@@ -167,7 +167,7 @@ function CommunitiesCard() {
         </div>
       )}
       {comms.length === 0 && (
-        <div className="text-sm text-slate-500">
+        <div className="text-sm text-forge-muted">
           No communities yet. Run "rebuild" after you have extracted entities
           for enough documents.
         </div>
@@ -175,10 +175,10 @@ function CommunitiesCard() {
       <ol className="space-y-2">
         {comms.map((c) => (
           <li key={c.community_id} className="text-xs">
-            <div className="font-mono text-slate-500">
+            <div className="font-mono text-forge-muted">
               L{c.level} · {c.actual_page_count} pages
             </div>
-            <div className="text-slate-300 line-clamp-2">{c.summary}</div>
+            <div className="text-forge-fg line-clamp-2">{c.summary}</div>
           </li>
         ))}
       </ol>
@@ -218,7 +218,7 @@ function DocumentsTable() {
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
-          <thead className="bg-forge-bg text-slate-400 text-xs uppercase">
+          <thead className="bg-forge-bg text-forge-muted text-xs uppercase">
             <tr>
               <th className="text-left px-4 py-2">Title</th>
               <th className="text-right px-4 py-2">Pages</th>
@@ -235,11 +235,11 @@ function DocumentsTable() {
                   {d.title}
                 </td>
                 <td className="px-4 py-2 text-right font-mono">{d.page_count}</td>
-                <td className="px-4 py-2 text-xs text-slate-400">{d.source_type}</td>
-                <td className="px-4 py-2 text-xs text-slate-400">
+                <td className="px-4 py-2 text-xs text-forge-muted">{d.source_type}</td>
+                <td className="px-4 py-2 text-xs text-forge-muted">
                   {d.categories.join(", ") || "-"}
                 </td>
-                <td className="px-4 py-2 text-xs text-slate-400">
+                <td className="px-4 py-2 text-xs text-forge-muted">
                   {d.tags.map((t) => `#${t}`).join(" ") || "-"}
                 </td>
                 <td className="px-4 py-2 text-right">
@@ -266,7 +266,7 @@ function DocumentsTable() {
             ))}
             {docs.length === 0 && (
               <tr>
-                <td colSpan={6} className="px-4 py-6 text-center text-slate-500">
+                <td colSpan={6} className="px-4 py-6 text-center text-forge-muted">
                   No documents. Use the Ingest tab to upload PDFs.
                 </td>
               </tr>
@@ -331,7 +331,7 @@ function EntitiesPanel() {
             className={`px-4 py-2 text-sm ${
               tab === t.key
                 ? "bg-forge-edge text-forge-accent"
-                : "text-slate-400 hover:text-slate-200"
+                : "text-forge-muted hover:text-forge-fg"
             }`}
           >
             {t.label} ({tab === t.key ? rows.length : ""})
@@ -340,7 +340,7 @@ function EntitiesPanel() {
       </div>
       <div className="overflow-x-auto max-h-96">
         <table className="w-full text-sm">
-          <thead className="bg-forge-bg text-slate-400 text-xs uppercase sticky top-0">
+          <thead className="bg-forge-bg text-forge-muted text-xs uppercase sticky top-0">
             <tr>
               <th className="text-left px-4 py-2">Name</th>
               <th className="text-left px-4 py-2">Details</th>
@@ -351,7 +351,7 @@ function EntitiesPanel() {
             {rows.map((r) => (
               <tr key={r.key}>
                 <td className="px-4 py-2 font-medium">{r.key}</td>
-                <td className="px-4 py-2 text-xs text-slate-400">
+                <td className="px-4 py-2 text-xs text-forge-muted">
                   {renderEntityProps(r.properties)}
                 </td>
                 <td className="px-4 py-2 text-right font-mono">{r.page_mentions}</td>
@@ -359,7 +359,7 @@ function EntitiesPanel() {
             ))}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={3} className="px-4 py-4 text-center text-slate-500">
+                <td colSpan={3} className="px-4 py-4 text-center text-forge-muted">
                   No {tab} entities extracted yet.
                 </td>
               </tr>

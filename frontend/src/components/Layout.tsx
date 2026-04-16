@@ -18,11 +18,11 @@ export default function Layout({ children }: PropsWithChildren) {
   const h = health?.data;
 
   return (
-    <div className="flex min-h-screen bg-forge-bg text-slate-200">
+    <div className="flex min-h-screen bg-forge-bg text-forge-fg">
       <aside className="w-56 bg-forge-panel border-r border-forge-edge flex flex-col">
         <div className="px-5 py-4 border-b border-forge-edge">
           <div className="text-lg font-bold text-forge-accent">ForgeRAG</div>
-          <div className="text-xs text-slate-400">
+          <div className="text-xs text-forge-muted">
             Engineering knowledge graph
           </div>
         </div>
@@ -45,11 +45,11 @@ export default function Layout({ children }: PropsWithChildren) {
           <StatusDot label="Neo4j" ok={!!h?.neo4j_connected} />
           <StatusDot label="GPU" ok={!!h?.gpu_available} />
           {h?.details?.vram_free_gb != null && (
-            <div className="text-slate-500">
+            <div className="text-forge-muted">
               VRAM {h.details.vram_free_gb}/{h.details.vram_total_gb} GB free
             </div>
           )}
-          <div className="text-slate-500">
+          <div className="text-forge-muted">
             {h?.document_count ?? 0} docs · {h?.page_count ?? 0} pages
           </div>
         </div>

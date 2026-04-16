@@ -12,7 +12,7 @@ export default function Ingest() {
   return (
     <div className="p-6 max-w-6xl">
       <h1 className="text-2xl font-bold mb-1">Ingest</h1>
-      <p className="text-sm text-slate-400 mb-6">
+      <p className="text-sm text-forge-muted mb-6">
         Upload engineering PDFs. The pipeline runs PDF → pages →
         text extraction → embeddings → entity extraction → graph.
         Progress is tracked per job. Re-uploading a PDF resumes where the
@@ -57,7 +57,7 @@ function UploadForm() {
       <h2 className="font-semibold mb-3">Upload PDF</h2>
 
       <div className="mb-4">
-        <label className="block text-xs text-slate-400 mb-1">File</label>
+        <label className="block text-xs text-forge-muted mb-1">File</label>
         <input
           type="file"
           accept="application/pdf"
@@ -68,7 +68,7 @@ function UploadForm() {
 
       <div className="grid md:grid-cols-2 gap-4 mb-4">
         <div>
-          <label className="block text-xs text-slate-400 mb-1">
+          <label className="block text-xs text-forge-muted mb-1">
             Categories ({selectedCats.length} selected)
           </label>
           <select
@@ -88,7 +88,7 @@ function UploadForm() {
         </div>
 
         <div>
-          <label className="block text-xs text-slate-400 mb-1">
+          <label className="block text-xs text-forge-muted mb-1">
             Tags ({selectedTags.length} selected)
           </label>
           <div className="flex gap-2 mb-2">
@@ -133,7 +133,7 @@ function UploadForm() {
             ))}
           </div>
           {tags.length > 0 && (
-            <details className="text-xs text-slate-400">
+            <details className="text-xs text-forge-muted">
               <summary className="cursor-pointer">Existing tags ({tags.length})</summary>
               <div className="flex flex-wrap gap-1 mt-2">
                 {tags.map((t) => (
@@ -178,18 +178,31 @@ function UploadForm() {
 }
 
 function JobsList() {
-  const { data } = useQuery({
+  const { data, dataUpdatedAt, isFetching } = useQuery({
     queryKey: ["jobs"],
     queryFn: () => listJobs(undefined, 30),
     refetchInterval: 3000,
   });
   const jobs = data?.data || [];
+  const updatedSec = dataUpdatedAt ? Math.round((Date.now() - dataUpdatedAt) / 1000) : null;
 
   return (
     <div>
-      <h2 className="font-semibold mb-3">Recent Jobs</h2>
+      <div className="flex items-center mb-3 gap-3">
+        <h2 className="font-semibold">Recent Jobs</h2>
+        <span className="text-xs text-forge-muted">
+          polling every 3s
+          {updatedSec !== null ? ` · updated ${updatedSec}s ago` : ""}
+        </span>
+        {isFetching && (
+          <span
+            className="h-2 w-2 rounded-full bg-forge-primary animate-pulse"
+            title="refetching"
+          />
+        )}
+      </div>
       {jobs.length === 0 && (
-        <div className="text-slate-500 text-sm">No jobs yet.</div>
+        <div className="text-forge-muted text-sm">No jobs yet.</div>
       )}
       <div className="space-y-2">
         {jobs.map((j) => (
@@ -202,13 +215,13 @@ function JobsList() {
 
 function JobRowCard({ job }: { job: JobRow }) {
   const colorMap: Record<string, string> = {
-    queued: "bg-slate-500",
-    processing: "bg-blue-500",
+    queued: "bg-forge-muted/60",
+    processing: "bg-forge-secondary",
     completed: "bg-emerald-500",
-    failed: "bg-rose-500",
+    failed: "bg-forge-danger",
     cancelled: "bg-amber-500",
   };
-  const color = colorMap[job.status] || "bg-slate-500";
+  const color = colorMap[job.status] || "bg-forge-muted/60";
   const pct = Math.min(100, Math.max(0, job.progress_pct));
 
   return (
@@ -216,10 +229,10 @@ function JobRowCard({ job }: { job: JobRow }) {
       <div className="flex items-center gap-3 mb-1">
         <span className={`h-2 w-2 rounded-full ${color}`} />
         <span className="font-semibold truncate flex-1">{job.filename}</span>
-        <span className="font-mono text-xs text-slate-400">
+        <span className="font-mono text-xs text-forge-muted">
           {job.status} · {job.current_step}
         </span>
-        <span className="font-mono text-xs text-slate-500">
+        <span className="font-mono text-xs text-forge-muted">
           {job.pages_processed}
           {job.pages_total ? ` / ${job.pages_total}` : ""}
         </span>

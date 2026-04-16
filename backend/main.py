@@ -12,8 +12,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.config import DEFAULT_CONFIG_PATH, get_settings
@@ -164,10 +165,33 @@ def create_app() -> FastAPI:
     app.include_router(graph.router)
 
     # Frontend static mount (production build). Skipped if not built yet.
+    # We register a SPA fallback route that returns index.html for any /app/*
+    # path that isn't a real file, so React Router deep-links survive a
+    # browser refresh. The literal /app/assets/... paths are served by the
+    # nested StaticFiles mount, which takes precedence over the fallback.
     frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
     if frontend_dist.exists():
-        app.mount("/app", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
-        logger.info("Frontend mounted from %s", frontend_dist)
+        index_html = frontend_dist / "index.html"
+        app.mount(
+            "/app/assets",
+            StaticFiles(directory=str(frontend_dist / "assets")),
+            name="frontend-assets",
+        )
+
+        @app.get("/app", include_in_schema=False)
+        async def _app_root() -> FileResponse:
+            return FileResponse(index_html)
+
+        @app.get("/app/{path:path}", include_in_schema=False)
+        async def _spa_fallback(path: str, request: Request) -> FileResponse:
+            # Serve static files from dist root if they exist; otherwise fall
+            # back to index.html so react-router can handle client-side routing.
+            candidate = frontend_dist / path
+            if candidate.is_file():
+                return FileResponse(candidate)
+            return FileResponse(index_html)
+
+        logger.info("Frontend mounted from %s (SPA fallback enabled)", frontend_dist)
 
     return app
 

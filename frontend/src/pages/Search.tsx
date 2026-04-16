@@ -47,14 +47,14 @@ export default function Search() {
   return (
     <div className="p-6 max-w-7xl">
       <h1 className="text-2xl font-bold mb-1">Search</h1>
-      <p className="text-sm text-slate-400 mb-4">
+      <p className="text-sm text-forge-muted mb-4">
         Query the engineering knowledge base — semantic text, visual (ColPali),
         or hybrid graph-aware strategies.
       </p>
 
       <form onSubmit={onSubmit} className="flex flex-wrap gap-3 items-end mb-6">
         <div className="flex-1 min-w-[300px]">
-          <label className="block text-xs text-slate-400 mb-1">Query</label>
+          <label className="block text-xs text-forge-muted mb-1">Query</label>
           <input
             className="w-full bg-forge-panel border border-forge-edge rounded px-3 py-2"
             placeholder="e.g. preheat requirements for P-1 materials"
@@ -63,7 +63,7 @@ export default function Search() {
           />
         </div>
         <div>
-          <label className="block text-xs text-slate-400 mb-1">Mode</label>
+          <label className="block text-xs text-forge-muted mb-1">Mode</label>
           <select
             value={mode}
             onChange={(e) => setMode(e.target.value as Mode)}
@@ -76,7 +76,7 @@ export default function Search() {
         </div>
         {mode === "hybrid" && (
           <div>
-            <label className="block text-xs text-slate-400 mb-1">Strategy</label>
+            <label className="block text-xs text-forge-muted mb-1">Strategy</label>
             <select
               value={strategy}
               onChange={(e) => setStrategy(e.target.value as HybridStrategy)}
@@ -90,7 +90,7 @@ export default function Search() {
           </div>
         )}
         <div>
-          <label className="block text-xs text-slate-400 mb-1">Limit</label>
+          <label className="block text-xs text-forge-muted mb-1">Limit</label>
           <input
             type="number"
             value={limit}
@@ -116,7 +116,7 @@ export default function Search() {
       )}
 
       {!searchMutation.isPending && hits.length === 0 && searchMutation.isSuccess && (
-        <div className="text-slate-500 text-sm">No results.</div>
+        <div className="text-forge-muted text-sm">No results.</div>
       )}
 
       {isCommunity ? (
@@ -179,10 +179,10 @@ function HitCard({
         />
         <div className="flex-1 min-w-0">
           <div className="flex items-baseline gap-3 flex-wrap">
-            <div className="font-semibold text-slate-100 truncate">
+            <div className="font-semibold text-forge-fg truncate">
               {hit.document_title}
             </div>
-            <div className="text-sm text-slate-400">
+            <div className="text-sm text-forge-muted">
               page {hit.page_number}
             </div>
             <div className="ml-auto font-mono text-sm text-forge-accent">
@@ -191,7 +191,7 @@ function HitCard({
           </div>
           {renderScoreDetails(hit, mode, strategy)}
           {hit.text_snippet && (
-            <div className="text-sm text-slate-300 mt-2 line-clamp-3">
+            <div className="text-sm text-forge-fg mt-2 line-clamp-3">
               {hit.text_snippet}
             </div>
           )}
@@ -205,7 +205,7 @@ function HitCard({
                 </span>
               ))}
               {hit.tags?.map((t) => (
-                <span key={t} className="text-xs bg-slate-800 text-slate-300 px-2 py-0.5 rounded">
+                <span key={t} className="text-xs bg-forge-edge text-forge-fg px-2 py-0.5 rounded">
                   #{t}
                 </span>
               ))}
@@ -215,7 +215,7 @@ function HitCard({
       </div>
       {expanded && (
         <div className="px-4 pb-4 border-t border-forge-edge pt-3">
-          <label className="flex items-center gap-2 text-sm text-slate-400">
+          <label className="flex items-center gap-2 text-sm text-forge-muted">
             <input
               type="checkbox"
               checked={showHighlight}
@@ -224,7 +224,7 @@ function HitCard({
             />
             Show ColPali heatmap for "{query || "<no query>"}"
             {showHighlight && query && (
-              <span className="text-xs text-slate-500">
+              <span className="text-xs text-forge-muted">
                 (first click may take 2-4s)
               </span>
             )}
@@ -244,7 +244,7 @@ function renderScoreDetails(hit: SearchHit, mode: string, strategy: string) {
   if (hit.vector_similarity != null) bits.push(`sim ${hit.vector_similarity.toFixed(3)}`);
   if (!bits.length) return null;
   return (
-    <div className="font-mono text-xs text-slate-500 mt-1">
+    <div className="font-mono text-xs text-forge-muted mt-1">
       [{mode}{strategy ? `/${strategy}` : ""}] {bits.join(" · ")}
       {hit.matched_entities?.length ? (
         <span> · matched: {hit.matched_entities.slice(0, 5).join(", ")}</span>
@@ -258,12 +258,12 @@ function renderEntities(hit: SearchHit) {
   const valid = hit.entities.filter((e) => e.name);
   if (!valid.length) return null;
   return (
-    <div className="mt-2 text-xs text-slate-400">
-      <span className="text-slate-500">entities:</span>{" "}
+    <div className="mt-2 text-xs text-forge-muted">
+      <span className="text-forge-muted">entities:</span>{" "}
       {valid.slice(0, 8).map((e, i) => (
         <span key={i} className="mr-2">
-          <span className="text-slate-500">{(e.kind || "").replace("MENTIONS_", "").replace("DESCRIBES_", "")}:</span>{" "}
-          <span className="text-slate-300">{e.name}</span>
+          <span className="text-forge-muted">{(e.kind || "").replace("MENTIONS_", "").replace("DESCRIBES_", "")}:</span>{" "}
+          <span className="text-forge-fg">{e.name}</span>
         </span>
       ))}
     </div>
@@ -275,7 +275,7 @@ function renderCommunities(hit: SearchHit) {
   const valid = hit.communities.filter((c) => c.summary);
   if (!valid.length) return null;
   return (
-    <div className="mt-2 text-xs text-slate-400 italic border-l-2 border-forge-edge pl-2">
+    <div className="mt-2 text-xs text-forge-muted italic border-l-2 border-forge-edge pl-2">
       {valid[0].summary?.slice(0, 200)}
       {valid[0].summary && valid[0].summary.length > 200 ? "…" : ""}
     </div>
@@ -289,16 +289,16 @@ function CommunityResults({ hits }: { hits: CommunityHit[] }) {
         <div key={c.community_id} className="bg-forge-panel border border-forge-edge rounded-lg p-4">
           <div className="flex items-baseline gap-3 mb-2">
             <div className="font-semibold">Community #{c.community_id.slice(0, 8)}</div>
-            <div className="text-xs text-slate-400">
+            <div className="text-xs text-forge-muted">
               level {c.level} · {c.member_count} pages
             </div>
             <div className="ml-auto font-mono text-sm text-forge-accent">
               {c.score.toFixed(4)}
             </div>
           </div>
-          <div className="text-sm text-slate-200 whitespace-pre-wrap">{c.summary}</div>
+          <div className="text-sm text-forge-fg whitespace-pre-wrap">{c.summary}</div>
           {c.sample_pages && c.sample_pages.length > 0 && (
-            <div className="mt-3 text-xs text-slate-500">
+            <div className="mt-3 text-xs text-forge-muted">
               sample pages: {c.sample_pages.slice(0, 5).map((p) =>
                 `${p.title} p.${p.page_number}`
               ).join(" · ")}
