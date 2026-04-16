@@ -17,7 +17,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from backend.config import DEFAULT_CONFIG_PATH, get_settings
-from backend.routers import health
+from backend.ingestion.job_manager import JobManager
+from backend.ingestion.pipeline import IngestionPipeline
+from backend.routers import documents, health, images, ingestion
 from backend.services.neo4j_service import Neo4jService
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     data_dir = Path(settings.server.data_dir)
     (data_dir / "page_images").mkdir(parents=True, exist_ok=True)
     (data_dir / "reduced_images").mkdir(parents=True, exist_ok=True)
+    (data_dir / "uploads").mkdir(parents=True, exist_ok=True)
 
     # Neo4j — connect but don't fail if unreachable (service can serve health)
     neo4j = Neo4jService(settings.neo4j)
@@ -50,6 +53,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Neo4j connectivity check raised: %s", exc)
+
+    # Job manager (SQLite-backed) for tracking ingestion progress
+    job_manager = JobManager(data_dir / "jobs.sqlite")
+    await job_manager.init()
+    app.state.job_manager = job_manager
+
+    # Ingestion pipeline (one instance, processes one job at a time via asyncio)
+    pipeline = IngestionPipeline(
+        settings=settings, neo4j=neo4j, job_manager=job_manager
+    )
+    app.state.pipeline = pipeline
 
     logger.info("ForgeRAG startup complete on %s:%d", settings.server.host, settings.server.port)
     try:
@@ -79,6 +93,9 @@ def create_app() -> FastAPI:
 
     # Routers
     app.include_router(health.router)
+    app.include_router(documents.router)
+    app.include_router(ingestion.router)
+    app.include_router(images.router)
 
     # Frontend static mount (production build). Skipped if not built yet.
     frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"

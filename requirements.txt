@@ -23,3 +23,9 @@ httpx>=0.27
 
 # Local job queue storage
 aiosqlite>=0.20
+
+# Phase 2: PDF ingestion
+PyMuPDF>=1.24
+pdf2image>=1.17
+Pillow>=10.3
+
