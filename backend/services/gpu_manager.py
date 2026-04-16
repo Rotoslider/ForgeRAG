@@ -37,6 +37,11 @@ class ModelEntry:
     handle: _Loadable
     last_used: float = field(default_factory=time.time)
     est_vram_bytes: int = 0
+    # Active-user counter: > 0 means at least one load_scope is currently
+    # yielded for this model. The idle watcher never unloads while a model
+    # has active users, even if last_used is stale (long batch inside a
+    # single scope won't touch last_used until the scope exits).
+    active_users: int = 0
 
 
 class GPUManager:
@@ -97,27 +102,41 @@ class GPUManager:
 
     @asynccontextmanager
     async def load_scope(self, name: str) -> AsyncIterator[None]:
-        """Acquire the GPU semaphore for model `name`. Refreshes last_used."""
+        """Acquire the GPU semaphore for model `name`.
+
+        Increments the model's active_users counter while yielded so the
+        idle watcher can't pull the model out from under an in-flight
+        batch. Refreshes last_used on enter and exit.
+        """
         async with self._semaphore:
             entry = self._models.get(name)
             if entry is not None:
+                entry.active_users += 1
                 entry.last_used = time.time()
             try:
                 yield
             finally:
                 if entry is not None:
+                    entry.active_users = max(0, entry.active_users - 1)
                     entry.last_used = time.time()
 
     # -------------------------------------------------------------- watcher
 
     async def _idle_watcher(self) -> None:
-        """Background task: unload models idle longer than threshold."""
+        """Background task: unload models idle longer than threshold.
+
+        Skips any model with active_users > 0. A long batch running inside
+        a single load_scope doesn't refresh last_used between model calls,
+        so we rely on active_users instead of just the timestamp.
+        """
         try:
             while True:
                 await asyncio.sleep(30)
                 now = time.time()
                 for entry in list(self._models.values()):
                     try:
+                        if entry.active_users > 0:
+                            continue  # in active use — leave it alone
                         if (
                             entry.handle.is_loaded()
                             and (now - entry.last_used) > self.idle_unload_seconds

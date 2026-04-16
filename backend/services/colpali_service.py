@@ -144,6 +144,12 @@ class ColPaliService:
 
         results: list[np.ndarray] = []
         for i, path in enumerate(paths, start=1):
+            # Defensive reload: if something unloaded us between iterations
+            # (e.g. an explicit /system/models/colpali/unload), we re-load
+            # rather than crash.
+            if self._model is None or self._processor is None:
+                self._ensure_loaded()
+
             try:
                 img = Image.open(path).convert("RGB")
             except Exception as exc:  # noqa: BLE001
