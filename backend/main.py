@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from backend.config import DEFAULT_CONFIG_PATH, get_settings
 from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pipeline import IngestionPipeline
-from backend.routers import documents, graph, health, images, ingestion, search, system
+from backend.routers import admin, documents, graph, health, images, ingestion, search, system
 from backend.services.colpali_service import create_colpali_service
 from backend.services.image_service import ImageHighlighter
 from backend.services.gpu_manager import GPUManager
@@ -163,6 +163,7 @@ def create_app() -> FastAPI:
     app.include_router(search.router)
     app.include_router(system.router)
     app.include_router(graph.router)
+    app.include_router(admin.router)
 
     # Frontend static mount (production build). Skipped if not built yet.
     # We register a SPA fallback route that returns index.html for any /app/*
