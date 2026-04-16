@@ -100,24 +100,25 @@ class ImageHighlighter:
 
         img = Image.open(source_image_path).convert("RGB")
 
-        # Image: process + embed WITHOUT pooling so we get per-patch tokens
-        image_inputs = processor.process_images([img])
-        image_inputs = {k: v.to(model.device) for k, v in image_inputs.items()}
+        # Image: process + embed WITHOUT pooling so we get per-patch tokens.
+        # Keep the BatchFeature object around for get_image_mask(), which
+        # expects the original encoding (not a dict).
+        image_inputs_bf = processor.process_images([img])
+        image_inputs_dev = {k: v.to(model.device) for k, v in image_inputs_bf.items()}
 
-        # Query: embed
-        query_inputs = processor.process_queries([query])
-        query_inputs = {k: v.to(model.device) for k, v in query_inputs.items()}
+        query_inputs_bf = processor.process_queries([query])
+        query_inputs_dev = {k: v.to(model.device) for k, v in query_inputs_bf.items()}
 
         with torch.no_grad():
-            image_embeddings = model(**image_inputs)  # (1, N_img_tokens, D)
-            query_embeddings = model(**query_inputs)  # (1, N_q_tokens, D)
+            image_embeddings = model(**image_inputs_dev)  # (1, N_img_tokens, D)
+            query_embeddings = model(**query_inputs_dev)  # (1, N_q_tokens, D)
             image_embeddings = F.normalize(image_embeddings.to(torch.float32), p=2, dim=-1)
             query_embeddings = F.normalize(query_embeddings.to(torch.float32), p=2, dim=-1)
 
             # Patch grid shape — use processor helpers when available, else
             # compute from the image processor's patch size.
             n_patches = _compute_n_patches(processor, img)
-            image_mask = processor.get_image_mask(image_inputs)  # type: ignore[attr-defined]
+            image_mask = processor.get_image_mask(image_inputs_bf)  # type: ignore[attr-defined]
 
             sim_maps = get_similarity_maps_from_embeddings(
                 image_embeddings=image_embeddings,

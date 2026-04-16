@@ -272,20 +272,31 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
 
     if body.strategy == "graph_boosted":
         # Text vector candidates, then boost score by number of entity
-        # names from the query appearing on the page's graph edges.
+        # names (or common_names / aliases) from the query appearing on the
+        # page's graph edges.
         query_terms = [t.lower() for t in body.query.split() if len(t) >= 3]
 
         cypher = f"""
             CALL db.index.vector.queryNodes('page_text_embedding', $pool, $vec)
             YIELD node AS p, score AS base_score
             MATCH (d:Document)-[:HAS_PAGE]->(p){where}
+            // Gather linked entity keys plus their aliases in a single list
             OPTIONAL MATCH (p)-[r]->(e)
             WHERE type(r) IN ['MENTIONS_MATERIAL','DESCRIBES_PROCESS',
                               'REFERENCES_STANDARD','MENTIONS_EQUIPMENT']
             WITH p, d, base_score,
-                 collect(DISTINCT toLower(coalesce(e.name, e.code))) AS ent_names
+                 collect(DISTINCT toLower(coalesce(e.name, e.code))) AS ent_names,
+                 collect(coalesce(e.common_names, [])) AS nested_aliases
             WITH p, d, base_score, ent_names,
-                 size([t IN $terms WHERE any(n IN ent_names WHERE n CONTAINS t)]) AS entity_hits
+                 // flatten list-of-lists to a single list of lowercased aliases
+                 reduce(acc = [], sub IN nested_aliases |
+                        acc + [x IN sub | toLower(x)]) AS ent_aliases
+            WITH p, d, base_score, ent_names, ent_aliases,
+                 ent_names + ent_aliases AS all_names
+            WITH p, d, base_score, all_names,
+                 size([t IN $terms WHERE
+                       any(n IN all_names WHERE n CONTAINS t)
+                 ]) AS entity_hits
             RETURN p.page_id AS page_id,
                    p.page_number AS page_number,
                    p.extracted_text AS extracted_text,
@@ -296,7 +307,7 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
                    base_score,
                    entity_hits,
                    base_score + $boost * entity_hits AS final_score,
-                   ent_names[..10] AS matched_entities,
+                   all_names[..10] AS matched_entities,
                    [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
                    [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
             ORDER BY final_score DESC
@@ -314,21 +325,12 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
 
     if body.strategy == "vector_first":
         # Pure vector search, enriched with entities and community membership.
+        # Entity/community collects use list comprehensions so null results
+        # from OPTIONAL MATCH become empty lists, not [{name: null}] sentinels.
         cypher = f"""
             CALL db.index.vector.queryNodes('page_text_embedding', $pool, $vec)
             YIELD node AS p, score
             MATCH (d:Document)-[:HAS_PAGE]->(p){where}
-            OPTIONAL MATCH (p)-[r]->(e)
-            WHERE type(r) IN ['MENTIONS_MATERIAL','DESCRIBES_PROCESS',
-                              'REFERENCES_STANDARD','MENTIONS_EQUIPMENT']
-            WITH p, d, score, collect(DISTINCT {{
-                kind: type(r),
-                name: coalesce(e.name, e.code)
-            }}) AS entities
-            OPTIONAL MATCH (p)-[:IN_COMMUNITY]->(c:Community)
-            WITH p, d, score, entities,
-                 collect(DISTINCT {{level: c.level, community_id: c.community_id,
-                                    summary: c.summary}}) AS communities
             RETURN p.page_id AS page_id,
                    p.page_number AS page_number,
                    p.extracted_text AS extracted_text,
@@ -337,8 +339,15 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
                    d.filename AS filename,
                    d.file_hash AS file_hash,
                    score,
-                   entities,
-                   communities,
+                   [(p)-[r]->(e) WHERE type(r) IN
+                    ['MENTIONS_MATERIAL','DESCRIBES_PROCESS',
+                     'REFERENCES_STANDARD','MENTIONS_EQUIPMENT']
+                    | {{kind: type(r), name: coalesce(e.name, e.code)}}
+                   ] AS entities,
+                   [(p)-[:IN_COMMUNITY]->(c:Community) |
+                    {{level: c.level, community_id: c.community_id,
+                      summary: c.summary}}
+                   ] AS communities,
                    [(d)-[:IN_CATEGORY]->(c2) | c2.name] AS categories,
                    [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
             ORDER BY score DESC
@@ -367,11 +376,17 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
         return ForgeResult(success=True, data=hits)
 
     if body.strategy == "graph_first":
-        # Find entity nodes whose names appear in the query, then pages that mention them.
+        # Find entity nodes whose names or common_names contain any query
+        # term, then pages that mention them.
         query_terms = [t.lower() for t in body.query.split() if len(t) >= 3]
         cypher = f"""
-            MATCH (e) WHERE any(t IN $terms WHERE toLower(coalesce(e.name, e.code, '')) CONTAINS t)
-              AND any(l IN labels(e) WHERE l IN ['Material','Process','Standard','Equipment'])
+            MATCH (e)
+            WHERE any(l IN labels(e) WHERE l IN ['Material','Process','Standard','Equipment'])
+              AND (
+                any(t IN $terms WHERE toLower(coalesce(e.name, e.code, '')) CONTAINS t)
+                OR any(alias IN coalesce(e.common_names, []) WHERE
+                       any(t IN $terms WHERE toLower(alias) CONTAINS t))
+              )
             MATCH (p:Page)-[r]->(e)
             WHERE type(r) IN ['MENTIONS_MATERIAL','DESCRIBES_PROCESS',
                               'REFERENCES_STANDARD','MENTIONS_EQUIPMENT']
