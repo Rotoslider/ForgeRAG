@@ -110,7 +110,17 @@ class LLMService:
 
         try:
             body = r.json()
-            return body["choices"][0]["message"]["content"]
+            message = body["choices"][0]["message"]
+            content = message.get("content") or ""
+            # Reasoning models (GLM-4.7-Flash, DeepSeek-R1, etc.) sometimes
+            # route their entire output — including structured JSON — into
+            # reasoning_content and leave content empty. Fall back to that
+            # when content is blank so we don't lose the actual response.
+            if not content.strip():
+                reasoning = message.get("reasoning_content") or ""
+                if reasoning.strip():
+                    content = reasoning
+            return content
         except (KeyError, ValueError, TypeError) as exc:
             raise LLMFatalError(f"Malformed response: {r.text[:400]}") from exc
 
