@@ -13,6 +13,7 @@ import {
   reembedDocument,
   unloadModel,
 } from "../api/client";
+import type { DocumentRow } from "../api/types";
 
 export default function Manage() {
   return (
@@ -195,13 +196,33 @@ function DocumentsTable() {
   });
   const docs = data?.data || [];
 
+  // Track which actions were just triggered so we can show feedback
+  const [actionFeedback, setActionFeedback] = useState<Record<string, string>>({});
+
+  const showFeedback = (docId: string, msg: string) => {
+    setActionFeedback((prev) => ({ ...prev, [docId]: msg }));
+    setTimeout(() => setActionFeedback((prev) => {
+      const next = { ...prev };
+      delete next[docId];
+      return next;
+    }), 4000);
+  };
+
   const reembed = useMutation({
     mutationFn: (id: string) => reembedDocument(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["jobs"] }),
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      showFeedback(id, "Re-embed queued — check Ingest tab for progress");
+    },
+    onError: (_err, id) => showFeedback(id, "Re-embed failed"),
   });
   const extract = useMutation({
     mutationFn: (id: string) => extractEntities(id),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["jobs"] }),
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      showFeedback(id, "Entity extraction queued — check Ingest tab");
+    },
+    onError: (_err, id) => showFeedback(id, "Extraction failed"),
   });
   const del = useMutation({
     mutationFn: (id: string) => deleteDocument(id),
@@ -230,39 +251,19 @@ function DocumentsTable() {
           </thead>
           <tbody className="divide-y divide-forge-edge">
             {docs.map((d) => (
-              <tr key={d.doc_id}>
-                <td className="px-4 py-2 max-w-md truncate" title={d.filename}>
-                  {d.title}
-                </td>
-                <td className="px-4 py-2 text-right font-mono">{d.page_count}</td>
-                <td className="px-4 py-2 text-xs text-forge-muted">{d.source_type}</td>
-                <td className="px-4 py-2 text-xs text-forge-muted">
-                  {d.categories.join(", ") || "-"}
-                </td>
-                <td className="px-4 py-2 text-xs text-forge-muted">
-                  {d.tags.map((t) => `#${t}`).join(" ") || "-"}
-                </td>
-                <td className="px-4 py-2 text-right">
-                  <div className="flex gap-1 justify-end">
-                    <ActionBtn onClick={() => reembed.mutate(d.doc_id)} title="Re-embed">
-                      re-embed
-                    </ActionBtn>
-                    <ActionBtn onClick={() => extract.mutate(d.doc_id)} title="Re-run entity extraction">
-                      extract
-                    </ActionBtn>
-                    <ActionBtn
-                      onClick={() => {
-                        if (confirm(`Delete "${d.title}" and all pages?`))
-                          del.mutate(d.doc_id);
-                      }}
-                      title="Delete document"
-                      danger
-                    >
-                      delete
-                    </ActionBtn>
-                  </div>
-                </td>
-              </tr>
+              <DocRow
+                key={d.doc_id}
+                doc={d}
+                feedback={actionFeedback[d.doc_id]}
+                onReembed={() => reembed.mutate(d.doc_id)}
+                onExtract={() => extract.mutate(d.doc_id)}
+                onDelete={() => {
+                  if (confirm(`Delete "${d.title}" and all pages?`))
+                    del.mutate(d.doc_id);
+                }}
+                reembedPending={reembed.isPending}
+                extractPending={extract.isPending}
+              />
             ))}
             {docs.length === 0 && (
               <tr>
@@ -278,22 +279,93 @@ function DocumentsTable() {
   );
 }
 
+function DocRow({
+  doc: d,
+  feedback,
+  onReembed,
+  onExtract,
+  onDelete,
+  reembedPending,
+  extractPending,
+}: {
+  doc: DocumentRow;
+  feedback?: string;
+  onReembed: () => void;
+  onExtract: () => void;
+  onDelete: () => void;
+  reembedPending: boolean;
+  extractPending: boolean;
+}) {
+  return (
+    <>
+      <tr>
+        <td className="px-4 py-2 max-w-md truncate" title={d.filename}>
+          {d.title}
+        </td>
+        <td className="px-4 py-2 text-right font-mono">{d.page_count}</td>
+        <td className="px-4 py-2 text-xs text-forge-muted">{d.source_type}</td>
+        <td className="px-4 py-2 text-xs text-forge-muted">
+          {d.categories.join(", ") || <span className="text-forge-muted/50 italic">none</span>}
+        </td>
+        <td className="px-4 py-2 text-xs text-forge-muted">
+          {d.tags.length > 0
+            ? d.tags.map((t) => `#${t}`).join(" ")
+            : <span className="text-forge-muted/50 italic">none</span>}
+        </td>
+        <td className="px-4 py-2 text-right">
+          <div className="flex gap-1 justify-end">
+            <ActionBtn
+              onClick={onReembed}
+              title="Re-generate visual embeddings (Nemotron). Check Ingest tab for progress."
+              disabled={reembedPending}
+            >
+              {reembedPending ? "queuing…" : "re-embed"}
+            </ActionBtn>
+            <ActionBtn
+              onClick={onExtract}
+              title="Re-run LLM entity extraction. Check Ingest tab for progress."
+              disabled={extractPending}
+            >
+              {extractPending ? "queuing…" : "extract"}
+            </ActionBtn>
+            <ActionBtn onClick={onDelete} title="Delete document and all pages" danger>
+              delete
+            </ActionBtn>
+          </div>
+        </td>
+      </tr>
+      {feedback && (
+        <tr>
+          <td colSpan={6} className="px-4 py-1">
+            <div className="text-xs text-emerald-400 bg-emerald-950/30 rounded px-3 py-1.5 inline-block">
+              {feedback}
+            </div>
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
 function ActionBtn({
   children,
   onClick,
   title,
   danger,
+  disabled,
 }: {
   children: React.ReactNode;
   onClick: () => void;
   title: string;
   danger?: boolean;
+  disabled?: boolean;
 }) {
   return (
     <button
       onClick={onClick}
       title={title}
-      className={`text-xs border rounded px-2 py-1 ${
+      disabled={disabled}
+      className={`text-xs border rounded px-2 py-1 disabled:opacity-40 disabled:cursor-not-allowed ${
         danger
           ? "border-rose-800 hover:bg-rose-900/40 text-rose-300"
           : "border-forge-edge hover:bg-forge-edge"

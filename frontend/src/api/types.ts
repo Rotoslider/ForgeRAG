@@ -44,6 +44,7 @@ export interface JobRow {
   created_at: string;
   updated_at: string;
   error_message: string | null;
+  source_path: string;
   filename: string;
   pages_processed: number;
   pages_total: number;

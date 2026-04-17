@@ -224,10 +224,29 @@ function JobRowCard({ job }: { job: JobRow }) {
   const color = colorMap[job.status] || "bg-forge-muted/60";
   const pct = Math.min(100, Math.max(0, job.progress_pct));
 
+  // Derive job type from source_path pattern
+  const jobType = job.source_path?.startsWith("(reembed")
+    ? "re-embed"
+    : job.source_path?.startsWith("(extract")
+    ? "extract-entities"
+    : job.source_path?.startsWith("(build-communities")
+    ? "build-communities"
+    : "ingest";
+
+  const typeColors: Record<string, string> = {
+    "ingest": "text-forge-secondary",
+    "re-embed": "text-forge-primary",
+    "extract-entities": "text-forge-accent",
+    "build-communities": "text-emerald-400",
+  };
+
   return (
     <div className="bg-forge-panel border border-forge-edge rounded p-3">
       <div className="flex items-center gap-3 mb-1">
         <span className={`h-2 w-2 rounded-full ${color}`} />
+        <span className={`text-xs font-semibold uppercase ${typeColors[jobType] || ""}`}>
+          {jobType}
+        </span>
         <span className="font-semibold truncate flex-1">{job.filename}</span>
         <span className="font-mono text-xs text-forge-muted">
           {job.status} · {job.current_step}

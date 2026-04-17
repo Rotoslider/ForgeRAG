@@ -201,6 +201,77 @@ async def delete_document(doc_id: str, request: Request) -> ForgeResult:
     )
 
 
+@router.post("/documents/{doc_id}/tags")
+async def add_document_tag(doc_id: str, body: TagCreate, request: Request) -> ForgeResult:
+    """Add a tag to an existing document. Creates the tag if it doesn't exist."""
+    neo4j = request.app.state.neo4j
+    rows = await neo4j.run_query(
+        "MATCH (d:Document {doc_id: $id}) RETURN d.doc_id", {"id": doc_id}
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+    await neo4j.run_write(
+        """
+        MERGE (t:Tag {name: $tag})
+        WITH t
+        MATCH (d:Document {doc_id: $doc_id})
+        MERGE (d)-[:TAGGED_WITH]->(t)
+        """,
+        {"tag": body.name, "doc_id": doc_id},
+    )
+    return ForgeResult(success=True, data={"doc_id": doc_id, "tag": body.name})
+
+
+@router.delete("/documents/{doc_id}/tags/{tag_name}")
+async def remove_document_tag(doc_id: str, tag_name: str, request: Request) -> ForgeResult:
+    """Remove a tag from a document (doesn't delete the tag node itself)."""
+    neo4j = request.app.state.neo4j
+    await neo4j.run_write(
+        """
+        MATCH (d:Document {doc_id: $doc_id})-[r:TAGGED_WITH]->(t:Tag {name: $tag})
+        DELETE r
+        """,
+        {"doc_id": doc_id, "tag": tag_name},
+    )
+    return ForgeResult(success=True, data={"doc_id": doc_id, "removed_tag": tag_name})
+
+
+@router.post("/documents/{doc_id}/categories")
+async def add_document_category(doc_id: str, body: CategoryCreate, request: Request) -> ForgeResult:
+    """Add a category to an existing document. Creates the category if it doesn't exist."""
+    neo4j = request.app.state.neo4j
+    rows = await neo4j.run_query(
+        "MATCH (d:Document {doc_id: $id}) RETURN d.doc_id", {"id": doc_id}
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+    await neo4j.run_write(
+        """
+        MERGE (c:Category {name: $cat})
+        ON CREATE SET c.description = $desc
+        WITH c
+        MATCH (d:Document {doc_id: $doc_id})
+        MERGE (d)-[:IN_CATEGORY]->(c)
+        """,
+        {"cat": body.name, "doc_id": doc_id, "desc": body.description},
+    )
+    return ForgeResult(success=True, data={"doc_id": doc_id, "category": body.name})
+
+
+@router.delete("/documents/{doc_id}/categories/{cat_name}")
+async def remove_document_category(doc_id: str, cat_name: str, request: Request) -> ForgeResult:
+    """Remove a category from a document."""
+    neo4j = request.app.state.neo4j
+    await neo4j.run_write(
+        """
+        MATCH (d:Document {doc_id: $doc_id})-[r:IN_CATEGORY]->(c:Category {name: $cat})
+        DELETE r
+        """,
+        {"doc_id": doc_id, "cat": cat_name},
+    )
+    return ForgeResult(success=True, data={"doc_id": doc_id, "removed_category": cat_name})
+
+
 @router.get("/documents/{doc_id}/pages")
 async def list_document_pages(
     doc_id: str,
