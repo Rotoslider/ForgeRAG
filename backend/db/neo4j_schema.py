@@ -107,7 +107,7 @@ async def apply_schema(svc: Neo4jService, embedding_dim: int = 768) -> dict[str,
 
     Idempotent — safe to run multiple times.
     """
-    counts = {"constraints": 0, "indexes": 0, "vector_indexes": 0}
+    counts = {"constraints": 0, "indexes": 0, "vector_indexes": 0, "fulltext_indexes": 0}
 
     async def _run_all(statements: Iterable[str], counter_key: str) -> None:
         for stmt in statements:
@@ -129,7 +129,6 @@ async def apply_schema(svc: Neo4jService, embedding_dim: int = 768) -> dict[str,
 
     logger.info("Applying Neo4j full-text indexes...")
     await _run_all(FULLTEXT_INDEXES, "fulltext_indexes")
-    counts["fulltext_indexes"] = len(FULLTEXT_INDEXES)
 
     logger.info(
         "Schema applied: %d constraints, %d indexes, %d vector indexes",
