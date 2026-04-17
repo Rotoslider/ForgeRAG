@@ -138,6 +138,15 @@ export interface AnswerResult {
   sources: Array<{ document_title: string; page_number: number; image_url: string; score: number }>;
   query: string;
   search_mode: string;
+  used_vision?: boolean;
+  used_graph?: boolean;
+  graph_context?: {
+    materials_found: number;
+    processes_found: number;
+    standards_found: number;
+    reasoning_chains: string[];
+    pages_from_graph: number;
+  } | null;
 }
 
 export const searchAnswer = (query: string, limit = 5, search_mode = "semantic") =>

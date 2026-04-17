@@ -16,6 +16,8 @@ from backend.models.search import (
 )
 from pydantic import BaseModel, Field
 
+from backend.services.graph_reasoning import GraphContext, explore_from_query
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/search", tags=["search"])
@@ -156,12 +158,18 @@ class AnswerRequest(BaseModel):
     limit: int = Field(default=5, ge=1, le=20, description="Pages to retrieve and read")
     search_mode: str = Field(
         default="auto",
-        description="auto (keyword+visual), keyword, visual, semantic, or hybrid",
+        description="auto (keyword+visual+graph), keyword, visual, semantic, or hybrid",
     )
     use_vision: bool = Field(
         default=True,
-        description="If true, send page IMAGES to the LLM instead of extracted text. "
+        description="Send page IMAGES to the LLM instead of extracted text. "
         "Much more accurate (LLM reads the actual page) but slower.",
+    )
+    use_graph: bool = Field(
+        default=True,
+        description="Traverse the knowledge graph from query-matched entities to "
+        "find related pages the user didn't ask about. Enables cross-document "
+        "reasoning (material→process→standard chains).",
     )
 
 
@@ -252,6 +260,46 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         )
         pages = result.data or []
 
+    # Step 1b: Graph exploration — traverse the knowledge graph for related pages
+    graph_ctx = GraphContext()
+    if body.use_graph:
+        try:
+            graph_ctx = await explore_from_query(
+                body.query, neo4j, max_pages=body.limit * 2
+            )
+            # Add graph-discovered pages (that aren't already in search results)
+            search_page_ids = {p["page_id"] for p in pages}
+            for pid, reason in graph_ctx.page_ids.items():
+                if pid not in search_page_ids:
+                    # Create a minimal hit dict for this page
+                    page_row = await neo4j.run_query(
+                        """
+                        MATCH (d:Document)-[:HAS_PAGE]->(p:Page {page_id: $pid})
+                        RETURN p.page_id AS page_id, p.page_number AS page_number,
+                               d.doc_id AS doc_id, d.title AS document_title,
+                               d.filename AS filename, d.file_hash AS file_hash
+                        """,
+                        {"pid": pid},
+                    )
+                    if page_row:
+                        r = page_row[0]
+                        pages.append({
+                            "page_id": r["page_id"],
+                            "doc_id": r["doc_id"],
+                            "document_title": r["document_title"],
+                            "filename": r["filename"],
+                            "page_number": r["page_number"],
+                            "score": 0.5,  # graph-discovered
+                            "text_snippet": f"[Graph: {reason}]",
+                            "image_url": f"/images/{r['file_hash']}/{r['page_number']}",
+                            "reduced_image_url": f"/images/{r['file_hash']}/{r['page_number']}/reduced",
+                        })
+                        search_page_ids.add(pid)
+        except Exception as exc:
+            logger.warning("Graph exploration failed (continuing without): %s", exc)
+
+    pages = pages[: body.limit]
+
     if not pages:
         return ForgeResult(
             success=True,
@@ -322,27 +370,65 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
             }
         )
 
-    # Step 3: Ask the LLM
-    messages_content.append(
-        {
-            "type": "text",
-            "text": (
-                f"\nQuestion: {body.query}\n\n"
-                "Answer the question based on the source pages above. "
-                "Cite page numbers inline as [Page N]. Be precise with "
-                "numbers, codes, and specifications. If the answer isn't "
-                "in the sources, say so.\n\n/no_think"
-            ),
-        }
+    # Step 3: Build graph context summary for the LLM
+    graph_summary = ""
+    if body.use_graph and (
+        graph_ctx.reasoning_chains
+        or graph_ctx.materials
+        or graph_ctx.processes
+        or graph_ctx.standards
+    ):
+        parts = ["KNOWLEDGE GRAPH CONTEXT (relationships discovered from the engineering database):"]
+        if graph_ctx.reasoning_chains:
+            parts.append("Relationship chains:")
+            for chain in graph_ctx.reasoning_chains[:15]:
+                parts.append(f"  • {chain}")
+        if graph_ctx.materials:
+            mat_names = [m["name"] for m in graph_ctx.materials[:10]]
+            parts.append(f"Related materials: {', '.join(mat_names)}")
+        if graph_ctx.processes:
+            proc_names = [p["name"] for p in graph_ctx.processes[:10]]
+            parts.append(f"Related processes: {', '.join(proc_names)}")
+        if graph_ctx.standards:
+            std_names = [s["name"] for s in graph_ctx.standards[:10]]
+            parts.append(f"Related standards: {', '.join(std_names)}")
+        if graph_ctx.community_summaries:
+            parts.append("Topic summaries:")
+            for cs in graph_ctx.community_summaries[:2]:
+                parts.append(f"  {cs[:300]}")
+        graph_summary = "\n".join(parts)
+
+    # Build the question with graph context
+    question_text = f"Question: {body.query}\n\n"
+    if graph_summary:
+        question_text += (
+            f"{graph_summary}\n\n"
+            "Use the knowledge graph context above to inform your answer. "
+            "The graph shows how materials, processes, and standards relate "
+            "to each other — mention relevant connections even if the user "
+            "didn't specifically ask about them.\n\n"
+        )
+    question_text += (
+        "Answer the question based on the source pages and graph context. "
+        "Cite page numbers inline as [Page N]. Be precise with numbers, "
+        "codes, and specifications. If you notice relevant cross-references "
+        "or related considerations (e.g., applicable standards, compatible "
+        "processes, known limitations), mention them proactively.\n\n/no_think"
     )
+
+    messages_content.append({"type": "text", "text": question_text})
 
     messages = [
         {
             "role": "system",
-            "content": "You are an engineering reference assistant. You can see "
-            "page images from engineering handbooks. Read the pages carefully "
-            "including tables, diagrams, and figure captions. Answer questions "
-            "based ONLY on what you see in the provided pages.",
+            "content": "You are an engineering reference assistant with access to "
+            "a knowledge graph of materials, processes, standards, and equipment. "
+            "You can see page images from engineering handbooks. Read the pages "
+            "carefully including tables, diagrams, and figure captions. "
+            "Answer questions based on the source pages AND the knowledge graph "
+            "context. When you see a relationship chain (e.g., Material → "
+            "GOVERNED_BY → Standard), use it to provide comprehensive answers "
+            "that connect information across different sections of the handbook.",
         },
         {"role": "user", "content": messages_content},
     ]
@@ -360,6 +446,18 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
             "query": body.query,
             "search_mode": mode,
             "used_vision": body.use_vision,
+            "used_graph": body.use_graph,
+            "graph_context": {
+                "materials_found": len(graph_ctx.materials),
+                "processes_found": len(graph_ctx.processes),
+                "standards_found": len(graph_ctx.standards),
+                "reasoning_chains": graph_ctx.reasoning_chains[:10],
+                "pages_from_graph": len([
+                    p for p in pages
+                    if isinstance(p.get("text_snippet"), str)
+                    and p["text_snippet"].startswith("[Graph:")
+                ]),
+            } if body.use_graph else None,
         },
     )
 

@@ -146,10 +146,28 @@ export default function Search() {
           <div className="text-forge-fg whitespace-pre-wrap leading-relaxed">
             {answerData.answer}
           </div>
-          {answerData.sources.length > 0 && (
+          {answerData.graph_context && answerData.graph_context.reasoning_chains.length > 0 && (
             <div className="mt-4 pt-3 border-t border-forge-edge">
               <div className="text-xs text-forge-muted mb-2">
-                Sources ({answerData.sources.length} pages):
+                Knowledge graph reasoning ({answerData.graph_context.materials_found} materials,{" "}
+                {answerData.graph_context.processes_found} processes,{" "}
+                {answerData.graph_context.standards_found} standards found):
+              </div>
+              <div className="text-xs text-forge-muted/80 space-y-0.5 mb-3 font-mono">
+                {answerData.graph_context.reasoning_chains.slice(0, 8).map((chain, i) => (
+                  <div key={i}>→ {chain}</div>
+                ))}
+              </div>
+            </div>
+          )}
+          {answerData.sources.length > 0 && (
+            <div className={answerData.graph_context?.reasoning_chains.length ? "" : "mt-4 pt-3 border-t border-forge-edge"}>
+              <div className="text-xs text-forge-muted mb-2">
+                Sources ({answerData.sources.length} pages
+                {answerData.graph_context?.pages_from_graph
+                  ? `, ${answerData.graph_context.pages_from_graph} via graph traversal`
+                  : ""}
+                ):
               </div>
               <div className="flex flex-wrap gap-2">
                 {answerData.sources.map((s, i) => (
@@ -159,7 +177,7 @@ export default function Search() {
                     target="_blank"
                     rel="noopener"
                     className="text-xs bg-forge-edge rounded px-2 py-1 hover:text-forge-primary"
-                    title="Open source page image"
+                    title="Open source page image (right-click → new tab for full size)"
                   >
                     {s.document_title.slice(0, 30)}… p.{s.page_number}
                   </a>
