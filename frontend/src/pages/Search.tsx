@@ -169,14 +169,15 @@ function HitCard({
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg overflow-hidden">
       <div className="p-4 flex gap-4">
-        <img
-          src={imgSrc}
-          alt={`page ${hit.page_number}`}
-          className={`border border-forge-edge bg-white cursor-pointer transition-all ${
-            expanded ? "w-64" : "w-24"
-          }`}
-          onClick={onToggleExpand}
-        />
+        {!expanded && (
+          <img
+            src={reducedImageUrl(hash, hit.page_number)}
+            alt={`page ${hit.page_number}`}
+            className="border border-forge-edge bg-white cursor-pointer w-24 shrink-0 self-start hover:opacity-80"
+            onClick={onToggleExpand}
+            title="Click to expand page image"
+          />
+        )}
         <div className="flex-1 min-w-0">
           <div className="flex items-baseline gap-3 flex-wrap">
             <div className="font-semibold text-forge-fg truncate">
@@ -214,21 +215,40 @@ function HitCard({
         </div>
       </div>
       {expanded && (
-        <div className="px-4 pb-4 border-t border-forge-edge pt-3">
-          <label className="flex items-center gap-2 text-sm text-forge-muted">
-            <input
-              type="checkbox"
-              checked={showHighlight}
-              onChange={(e) => setShowHighlight(e.target.checked)}
-              disabled={!query}
+        <div className="border-t border-forge-edge">
+          <div className="px-4 pt-3 pb-2 flex items-center gap-4">
+            <label className="flex items-center gap-2 text-sm text-forge-muted">
+              <input
+                type="checkbox"
+                checked={showHighlight}
+                onChange={(e) => setShowHighlight(e.target.checked)}
+                disabled={!query}
+              />
+              ColPali heatmap
+            </label>
+            <button
+              className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge"
+              onClick={onToggleExpand}
+            >
+              close
+            </button>
+            <a
+              href={pageImageUrl(hash, hit.page_number)}
+              target="_blank"
+              rel="noopener"
+              className="text-xs text-forge-secondary hover:underline ml-auto"
+            >
+              open full image in new tab
+            </a>
+          </div>
+          <div className="px-4 pb-4">
+            <img
+              src={imgSrc}
+              alt={`page ${hit.page_number} full view`}
+              className="max-w-full max-h-[80vh] mx-auto border border-forge-edge bg-white"
+              loading="lazy"
             />
-            Show ColPali heatmap for "{query || "<no query>"}"
-            {showHighlight && query && (
-              <span className="text-xs text-forge-muted">
-                (first click may take 2-4s)
-              </span>
-            )}
-          </label>
+          </div>
         </div>
       )}
     </div>
