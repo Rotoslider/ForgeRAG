@@ -171,18 +171,24 @@ export default function Search() {
                 ):
               </div>
               <div className="flex flex-wrap gap-2">
-                {answerData.sources.map((s, i) => (
-                  <a
-                    key={i}
-                    href={s.image_url}
-                    target="_blank"
-                    rel="noopener"
-                    className="text-xs bg-forge-edge rounded px-2 py-1 hover:text-forge-primary"
-                    title="Open source page image (right-click → new tab for full size)"
-                  >
-                    {s.document_title.slice(0, 30)}… p.{s.page_number}
-                  </a>
-                ))}
+                {answerData.sources.map((s, i) => {
+                  // Extract hash from image_url: /images/{hash}/{page}
+                  const parts = (s.image_url || "").split("/");
+                  const srcHash = parts[2] || "";
+                  const viewerUrl = `/app/view/${srcHash}/${s.page_number}?from=/search`;
+                  return (
+                    <a
+                      key={i}
+                      href={viewerUrl}
+                      target="_blank"
+                      rel="noopener"
+                      className="text-xs bg-forge-edge rounded px-2 py-1 hover:text-forge-primary"
+                      title="Open in page viewer with navigation"
+                    >
+                      {s.document_title.slice(0, 30)}… p.{s.page_number}
+                    </a>
+                  );
+                })}
               </div>
             </div>
           )}
