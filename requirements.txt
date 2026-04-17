@@ -1,19 +1,16 @@
-# Phase 1 base requirements — web framework, config, Neo4j, HTTP
-# Install with: pip install -r requirements.txt
+# ForgeRAG requirements
 #
-# Additional dependency groups (install in later phases):
-#   ML:        pip install -e '.[ml]'
-#   Ingestion: pip install -e '.[ingestion]'
-#   Dev:       pip install -e '.[dev]'
+# Install torch FIRST with the CUDA 12.8 index:
+#   pip install torch==2.10.0 torchvision==0.25.0 --index-url https://download.pytorch.org/whl/cu128
+# Then install the rest:
+#   pip install -r requirements.txt
 
+# Web framework
 fastapi>=0.110
 uvicorn[standard]>=0.27
 pydantic>=2.6
 pydantic-settings>=2.2
 python-multipart>=0.0.9
-
-# Config parsing (tomllib is stdlib on 3.11+)
-tomli>=2.0; python_version < "3.11"
 
 # Neo4j driver
 neo4j>=5.19
@@ -24,21 +21,29 @@ httpx>=0.27
 # Local job queue storage
 aiosqlite>=0.20
 
-# Phase 2: PDF ingestion
+# PDF ingestion
 PyMuPDF>=1.24
 pdf2image>=1.17
 Pillow>=10.3
 
-# Phase 3: ML (install torch with --index-url https://download.pytorch.org/whl/cu128
-# to get CUDA 12.8 wheels — required for RTX PRO 6000 Blackwell sm_120 support)
+# ML — torch must be installed separately with cu128 index (see above)
 torch==2.10.0
 torchvision==0.25.0
-# transformers pinned to 5.3.0 — 5.5.4 has a bug in _convert_peft_config_moe
-# that raises KeyError('llava') when loading ColPali v1.3's PEFT adapter
+# transformers pinned: 5.5.4 has a PEFT bug (KeyError 'llava') loading ColPali
 transformers==5.3.0
 sentence-transformers>=2.7
 colpali-engine==0.3.15
 accelerate>=1.0
 numpy>=1.26
-einops>=0.8        # required by nomic-embed-text-v1.5's custom model code
+einops>=0.8
 
+# Nemotron ColEmbed 4B (visual retrieval model)
+datasets>=4.0
+flash-attn>=2.6            # optional but ~2x faster; compiles from source (~20 min)
+
+# Community detection
+python-igraph>=0.11
+
+# Visualization (pulled by colpali-engine interpretability)
+matplotlib>=3.8
+seaborn>=0.13
