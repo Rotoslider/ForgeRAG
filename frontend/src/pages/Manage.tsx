@@ -1,8 +1,12 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  addDocumentTag,
   buildCommunities,
   deleteDocument,
+  listCollections,
+  moveDocument,
+  removeDocumentTag,
   extractEntities,
   fetchHealth,
   getGpu,
@@ -243,7 +247,7 @@ function DocumentsTable() {
             <tr>
               <th className="text-left px-4 py-2">Title</th>
               <th className="text-right px-4 py-2">Pages</th>
-              <th className="text-left px-4 py-2">Source</th>
+              <th className="text-left px-4 py-2">Collection</th>
               <th className="text-left px-4 py-2">Categories</th>
               <th className="text-left px-4 py-2">Tags</th>
               <th className="text-right px-4 py-2">Actions</th>
@@ -296,6 +300,9 @@ function DocRow({
   reembedPending: boolean;
   extractPending: boolean;
 }) {
+  const [editing, setEditing] = useState(false);
+  const qc = useQueryClient();
+
   return (
     <>
       <tr>
@@ -303,9 +310,13 @@ function DocRow({
           {d.title}
         </td>
         <td className="px-4 py-2 text-right font-mono">{d.page_count}</td>
-        <td className="px-4 py-2 text-xs text-forge-muted">{d.source_type}</td>
         <td className="px-4 py-2 text-xs text-forge-muted">
-          {d.categories.join(", ") || <span className="text-forge-muted/50 italic">none</span>}
+          {d.collection || "default"}
+        </td>
+        <td className="px-4 py-2 text-xs text-forge-muted">
+          {d.categories.length > 0
+            ? d.categories.join(", ")
+            : <span className="text-forge-muted/50 italic">none</span>}
         </td>
         <td className="px-4 py-2 text-xs text-forge-muted">
           {d.tags.length > 0
@@ -314,23 +325,16 @@ function DocRow({
         </td>
         <td className="px-4 py-2 text-right">
           <div className="flex gap-1 justify-end">
-            <ActionBtn
-              onClick={onReembed}
-              title="Re-generate visual embeddings (Nemotron). Check Ingest tab for progress."
-              disabled={reembedPending}
-            >
-              {reembedPending ? "queuing…" : "re-embed"}
+            <ActionBtn onClick={() => setEditing(!editing)} title="Edit collection, tags, and categories">
+              {editing ? "close" : "edit"}
             </ActionBtn>
-            <ActionBtn
-              onClick={onExtract}
-              title="Re-run LLM entity extraction. Check Ingest tab for progress."
-              disabled={extractPending}
-            >
-              {extractPending ? "queuing…" : "extract"}
+            <ActionBtn onClick={onReembed} title="Re-embed" disabled={reembedPending}>
+              {reembedPending ? "…" : "re-embed"}
             </ActionBtn>
-            <ActionBtn onClick={onDelete} title="Delete document and all pages" danger>
-              delete
+            <ActionBtn onClick={onExtract} title="Extract entities" disabled={extractPending}>
+              {extractPending ? "…" : "extract"}
             </ActionBtn>
+            <ActionBtn onClick={onDelete} title="Delete" danger>delete</ActionBtn>
           </div>
         </td>
       </tr>
@@ -343,7 +347,190 @@ function DocRow({
           </td>
         </tr>
       )}
+      {editing && (
+        <tr>
+          <td colSpan={6} className="px-4 py-3 bg-forge-bg/50">
+            <DocEditPanel doc={d} onDone={() => { setEditing(false); qc.invalidateQueries({ queryKey: ["documents"] }); }} />
+          </td>
+        </tr>
+      )}
     </>
+  );
+}
+
+function DocEditPanel({ doc }: { doc: DocumentRow; onDone: () => void }) {
+  const qc = useQueryClient();
+  const { data: collectionsResp } = useQuery({ queryKey: ["collections"], queryFn: listCollections });
+  const collections = collectionsResp?.data || [];
+  const currentCol = doc.collection || "default";
+
+  const [col, setCol] = useState(currentCol);
+  const [newCol, setNewCol] = useState("");
+  const [newTag, setNewTag] = useState("");
+  const [newCat, setNewCat] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ["documents"] });
+    qc.invalidateQueries({ queryKey: ["collections"] });
+    qc.invalidateQueries({ queryKey: ["tags"] });
+    qc.invalidateQueries({ queryKey: ["categories"] });
+  };
+
+  const doMove = async () => {
+    const target = newCol.trim() || col;
+    if (target === currentCol) return;
+    setBusy(true);
+    await moveDocument(doc.doc_id, target);
+    refresh();
+    setBusy(false);
+  };
+
+  const doAddTag = async () => {
+    if (!newTag.trim()) return;
+    setBusy(true);
+    await addDocumentTag(doc.doc_id, newTag.trim());
+    setNewTag("");
+    refresh();
+    setBusy(false);
+  };
+
+  const doRemoveTag = async (tag: string) => {
+    setBusy(true);
+    await removeDocumentTag(doc.doc_id, tag);
+    refresh();
+    setBusy(false);
+  };
+
+  const doAddCat = async () => {
+    if (!newCat.trim()) return;
+    setBusy(true);
+    // Use the documents/{id}/categories endpoint
+    await fetch(`/documents/${doc.doc_id}/categories`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: newCat.trim() }),
+    });
+    setNewCat("");
+    refresh();
+    setBusy(false);
+  };
+
+  const doRemoveCat = async (cat: string) => {
+    setBusy(true);
+    await fetch(`/documents/${doc.doc_id}/categories/${encodeURIComponent(cat)}`, {
+      method: "DELETE",
+    });
+    refresh();
+    setBusy(false);
+  };
+
+  return (
+    <div className="grid md:grid-cols-3 gap-4 text-sm">
+      {/* Collection */}
+      <div>
+        <div className="text-xs text-forge-muted mb-1 font-semibold">Collection</div>
+        <div className="flex gap-1">
+          <select
+            value={newCol ? "__new__" : col}
+            onChange={(e) => {
+              if (e.target.value === "__new__") setNewCol("");
+              else { setCol(e.target.value); setNewCol(""); }
+            }}
+            className="bg-forge-panel border border-forge-edge rounded px-2 py-1 text-xs flex-1"
+          >
+            {collections.map((c) => (
+              <option key={c.collection} value={c.collection}>{c.collection}</option>
+            ))}
+            <option value="__new__">+ New...</option>
+          </select>
+          {newCol !== "" && (
+            <input
+              value={newCol}
+              onChange={(e) => setNewCol(e.target.value.replace(/\s+/g, "_").toLowerCase())}
+              placeholder="name"
+              className="bg-forge-panel border border-forge-edge rounded px-2 py-1 text-xs w-28"
+            />
+          )}
+          <button
+            onClick={doMove}
+            disabled={busy || ((newCol.trim() || col) === currentCol)}
+            className="text-xs bg-forge-primary/20 text-forge-primary border border-forge-primary/30 rounded px-2 py-1 hover:bg-forge-primary/30 disabled:opacity-30"
+          >
+            move
+          </button>
+        </div>
+        <div className="text-xs text-forge-muted/60 mt-1">Current: {currentCol}</div>
+      </div>
+
+      {/* Tags */}
+      <div>
+        <div className="text-xs text-forge-muted mb-1 font-semibold">Tags</div>
+        <div className="flex flex-wrap gap-1 mb-1">
+          {doc.tags.map((t) => (
+            <span
+              key={t}
+              className="text-xs bg-forge-edge rounded px-2 py-0.5 cursor-pointer hover:bg-forge-danger/20 group"
+              onClick={() => doRemoveTag(t)}
+              title="Click to remove"
+            >
+              #{t} <span className="text-forge-danger opacity-0 group-hover:opacity-100">×</span>
+            </span>
+          ))}
+          {doc.tags.length === 0 && <span className="text-xs text-forge-muted/50 italic">none</span>}
+        </div>
+        <div className="flex gap-1">
+          <input
+            value={newTag}
+            onChange={(e) => setNewTag(e.target.value)}
+            placeholder="add tag"
+            className="bg-forge-panel border border-forge-edge rounded px-2 py-1 text-xs flex-1"
+            onKeyDown={(e) => { if (e.key === "Enter") doAddTag(); }}
+          />
+          <button
+            onClick={doAddTag}
+            disabled={busy || !newTag.trim()}
+            className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge disabled:opacity-30"
+          >
+            add
+          </button>
+        </div>
+      </div>
+
+      {/* Categories */}
+      <div>
+        <div className="text-xs text-forge-muted mb-1 font-semibold">Categories</div>
+        <div className="flex flex-wrap gap-1 mb-1">
+          {doc.categories.map((c) => (
+            <span
+              key={c}
+              className="text-xs bg-forge-edge rounded px-2 py-0.5 cursor-pointer hover:bg-forge-danger/20 group"
+              onClick={() => doRemoveCat(c)}
+              title="Click to remove"
+            >
+              {c} <span className="text-forge-danger opacity-0 group-hover:opacity-100">×</span>
+            </span>
+          ))}
+          {doc.categories.length === 0 && <span className="text-xs text-forge-muted/50 italic">none</span>}
+        </div>
+        <div className="flex gap-1">
+          <input
+            value={newCat}
+            onChange={(e) => setNewCat(e.target.value)}
+            placeholder="add category"
+            className="bg-forge-panel border border-forge-edge rounded px-2 py-1 text-xs flex-1"
+            onKeyDown={(e) => { if (e.key === "Enter") doAddCat(); }}
+          />
+          <button
+            onClick={doAddCat}
+            disabled={busy || !newCat.trim()}
+            className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge disabled:opacity-30"
+          >
+            add
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

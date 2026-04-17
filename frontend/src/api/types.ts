@@ -16,6 +16,7 @@ export interface DocumentRow {
   page_count: number;
   file_size_bytes: number;
   source_type: SourceType;
+  collection: string;
   ingested_at: string;
   categories: string[];
   tags: string[];
