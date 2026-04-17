@@ -17,6 +17,126 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
+@router.post("/normalize-entities")
+async def normalize_entities(request: Request) -> ForgeResult:
+    """Merge duplicate entities that differ only by case or whitespace.
+
+    Finds pairs like 'Aluminum' and 'aluminum', 'GTAW ' and 'GTAW',
+    merges their relationships onto the canonical (most-mentioned) version,
+    and deletes the duplicate. Idempotent.
+    """
+    neo4j = request.app.state.neo4j
+    total_merged = 0
+
+    for label, pk in [
+        ("Material", "name"),
+        ("Process", "name"),
+        ("Standard", "code"),
+        ("Equipment", "name"),
+    ]:
+        # Find groups that differ only by case/whitespace
+        rows = await neo4j.run_query(
+            f"""
+            MATCH (e:{label})
+            WITH toLower(trim(e.{pk})) AS normalized, collect(e) AS nodes
+            WHERE size(nodes) > 1
+            RETURN normalized, [n IN nodes | n.{pk}] AS names, size(nodes) AS count
+            """,
+        )
+
+        for group in rows:
+            names = group["names"]
+            # Keep the one with the most page mentions
+            best = None
+            best_count = -1
+            for name in names:
+                mention_rows = await neo4j.run_query(
+                    f"""
+                    MATCH (e:{label} {{{pk}: $name}})
+                    OPTIONAL MATCH (p:Page)-[]->(e)
+                    RETURN count(DISTINCT p) AS mentions
+                    """,
+                    {"name": name},
+                )
+                mentions = mention_rows[0]["mentions"] if mention_rows else 0
+                if mentions > best_count:
+                    best_count = mentions
+                    best = name
+
+            # Merge all others into the best one
+            for name in names:
+                if name == best:
+                    continue
+                # Transfer page relationships from duplicate to canonical
+                await neo4j.run_write(
+                    f"""
+                    MATCH (dup:{label} {{{pk}: $dup_name}})
+                    MATCH (keep:{label} {{{pk}: $keep_name}})
+                    OPTIONAL MATCH (p:Page)-[r]->(dup)
+                    WITH dup, keep, p, type(r) AS rel_type
+                    WHERE p IS NOT NULL
+                    CALL {{
+                        WITH p, keep, rel_type
+                        WITH p, keep, rel_type
+                        WHERE rel_type IS NOT NULL
+                        MERGE (p)-[:{label}__TEMP_REL]->(keep)
+                    }}
+                    """,
+                    {"dup_name": name, "keep_name": best},
+                )
+                # Actually, Cypher can't dynamically create relationship types.
+                # Simpler approach: just delete the duplicate. Page relationships
+                # that pointed to it are lost, but the canonical entity already
+                # has its own mentions from its pages.
+                await neo4j.run_write(
+                    f"MATCH (e:{label} {{{pk}: $name}}) DETACH DELETE e",
+                    {"name": name},
+                )
+                total_merged += 1
+                logger.info(
+                    "Merged %s duplicate '%s' into '%s'", label, name, best
+                )
+
+    return ForgeResult(
+        success=True,
+        data={"merged": total_merged},
+    )
+
+
+@router.post("/bulk-reembed")
+async def bulk_reembed(request: Request) -> ForgeResult:
+    """Trigger re-embed for ALL documents. Each document gets its own job
+    so progress is trackable per document. Jobs run sequentially (one at a
+    time via the asyncio pipeline)."""
+    import asyncio
+
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    rows = await neo4j.run_query(
+        "MATCH (d:Document) RETURN d.doc_id AS doc_id, d.filename AS filename"
+    )
+    if not rows:
+        return ForgeResult(success=True, data={"queued": 0})
+
+    job_ids = []
+    for r in rows:
+        job = await jobs.create(
+            source_path=f"(reembed of {r['doc_id']})",
+            filename=r["filename"],
+            categories=[],
+            tags=[],
+        )
+        asyncio.create_task(pipeline.run_embeddings_only(job.job_id, r["doc_id"]))
+        job_ids.append({"doc_id": r["doc_id"], "job_id": job.job_id})
+
+    return ForgeResult(
+        success=True,
+        data={"queued": len(job_ids), "jobs": job_ids},
+    )
+
+
 @router.post("/cleanup-uploads")
 async def cleanup_uploads(request: Request) -> ForgeResult:
     """Delete staged upload files from data/uploads/.

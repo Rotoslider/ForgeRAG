@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.config import Settings
+from backend.ingestion.auto_tagger import AutoTagger
 from backend.ingestion.community_detector import CommunityDetector
 from backend.ingestion.entity_extractor import EntityExtractor
 from backend.ingestion.graph_builder import GraphBuilder
@@ -72,6 +73,7 @@ class IngestionPipeline:
         self.colpali = colpali
         self.llm = llm
         self.entity_extractor = EntityExtractor(llm) if llm is not None else None
+        self.auto_tagger = AutoTagger(llm) if llm is not None else None
         self.graph_builder = GraphBuilder(neo4j)
         self.community_detector = (
             CommunityDetector(neo4j=neo4j, llm=llm, text_embedding=text_embedding)
@@ -113,6 +115,20 @@ class IngestionPipeline:
                 job_id, current_step="extracting_text", progress_pct=40.0
             )
             await self._extract_text(job_id, job.source_path, doc_id, file_hash)
+
+            # Auto-tag if the user didn't manually specify tags/categories
+            # and the LLM is available. Runs after text extraction so we have
+            # page text to analyze.
+            if (
+                self.auto_tagger is not None
+                and not job.requested_categories
+                and not job.requested_tags
+                and collection == "default"
+            ):
+                try:
+                    await self._auto_tag(doc_id, collection)
+                except Exception as exc:
+                    logger.warning("Auto-tagging failed (continuing): %s", exc)
 
             # Phase 3 steps — only run if services are wired up
             if self.text_embedding is not None:
@@ -353,6 +369,75 @@ class IngestionPipeline:
         logger.info("Rasterized %d pages for hash=%s", page_count, file_hash[:12])
 
     # ------------------------------------------------------------------ step 3
+
+    async def _auto_tag(self, doc_id: str, current_collection: str) -> None:
+        """Use the LLM to suggest collection, categories, and tags from page text."""
+        assert self.auto_tagger is not None
+
+        # Get document title
+        doc_rows = await self.neo4j.run_query(
+            "MATCH (d:Document {doc_id: $id}) RETURN d.title AS title, d.filename AS filename",
+            {"id": doc_id},
+        )
+        if not doc_rows:
+            return
+        title = doc_rows[0]["title"] or ""
+        filename = doc_rows[0]["filename"] or ""
+
+        # Get text from first meaningful pages (skip very short ones like covers)
+        page_rows = await self.neo4j.run_query(
+            """
+            MATCH (d:Document {doc_id: $id})-[:HAS_PAGE]->(p:Page)
+            WHERE p.text_char_count > 200
+            RETURN p.extracted_text AS text
+            ORDER BY p.page_number
+            LIMIT 5
+            """,
+            {"id": doc_id},
+        )
+        sample_texts = [r["text"] for r in page_rows if r["text"]]
+        if not sample_texts:
+            return
+
+        result = await self.auto_tagger.suggest(
+            title=title, filename=filename, sample_pages_text=sample_texts
+        )
+
+        # Apply collection if suggested and currently default
+        if result.collection and result.collection != "default" and current_collection == "default":
+            await self.neo4j.run_write(
+                "MATCH (d:Document {doc_id: $id}) SET d.collection = $col",
+                {"id": doc_id, "col": result.collection},
+            )
+
+        # Apply categories
+        for cat in result.categories:
+            await self.neo4j.run_write(
+                """
+                MERGE (c:Category {name: $name})
+                WITH c
+                MATCH (d:Document {doc_id: $doc_id})
+                MERGE (d)-[:IN_CATEGORY]->(c)
+                """,
+                {"name": cat, "doc_id": doc_id},
+            )
+
+        # Apply tags
+        for tag in result.tags:
+            await self.neo4j.run_write(
+                """
+                MERGE (t:Tag {name: $name})
+                WITH t
+                MATCH (d:Document {doc_id: $doc_id})
+                MERGE (d)-[:TAGGED_WITH]->(t)
+                """,
+                {"name": tag, "doc_id": doc_id},
+            )
+
+        logger.info(
+            "Auto-tagged doc %s: collection=%s, categories=%s, tags=%s",
+            doc_id, result.collection, result.categories, result.tags,
+        )
 
     async def _extract_text(
         self, job_id: str, source_path: str, doc_id: str, file_hash: str

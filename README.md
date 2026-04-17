@@ -32,8 +32,8 @@ Phases 1–6 complete. Phase 7 (Choom agent integration) next.
 - [x] **Phase 4**: LLM entity extraction (Qwen3.5 35B) + knowledge graph queries
 - [x] **Phase 5**: GraphRAG communities, hybrid search, page highlighting
 - [x] **Phase 6**: React/Vite frontend (Search, Ingest, Manage, Page Viewer)
-- [ ] **Phase 7**: Choom agent skill integration
-- [ ] **Phase 8**: Bulk ingestion, entity cleanup, auto-tagging
+- [x] **Phase 7**: Choom agent skill integration (5 tools: ask, search, query graph, explore, list collections)
+- [ ] **Phase 8**: Auto-tagging, entity cleanup, bulk operations
 
 ## Architecture
 
