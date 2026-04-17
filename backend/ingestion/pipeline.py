@@ -182,10 +182,11 @@ class IngestionPipeline:
             await self.jobs.fail(job_id, str(exc))
 
     async def run_embeddings_only(self, job_id: str, doc_id: str) -> None:
-        """Re-run only the embedding steps for an already-ingested document.
+        """Re-run the embedding steps for an already-ingested document.
 
-        Used by POST /documents/{doc_id}/reembed to backfill Phase 3 embeddings
-        on documents ingested during Phase 2.
+        Clears existing visual embeddings first so re-embed with a different
+        model (e.g., switching from ColPali to Nemotron) actually re-processes
+        all pages instead of skipping them.
         """
         try:
             # Look up file_hash from Neo4j
@@ -198,6 +199,20 @@ class IngestionPipeline:
             file_hash = rows[0]["h"]
 
             await self.jobs.update(job_id, status="processing", doc_id=doc_id, file_hash=file_hash)
+
+            # Clear existing visual embeddings so the new model re-processes them.
+            # Without this, switching from ColPali to Nemotron would skip all pages
+            # because colpali_vector_count > 0 from the old model.
+            await self.neo4j.run_write(
+                """
+                MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
+                SET p.colpali_vectors = NULL,
+                    p.colpali_vector_count = NULL,
+                    p.colpali_vector_dim = NULL
+                """,
+                {"doc_id": doc_id},
+            )
+            logger.info("Cleared existing visual embeddings for doc %s", doc_id)
 
             if self.text_embedding is not None:
                 await self.jobs.update(

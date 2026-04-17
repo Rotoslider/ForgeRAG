@@ -4,6 +4,14 @@ Local engineering knowledge graph for processing and querying large corpora of e
 
 Designed for personal/research use. Runs entirely on local hardware — no cloud APIs.
 
+## Screenshots
+
+![Search — Answer mode with VLM-generated response and page citations](docs/ForgeRAG-search.png)
+
+![Ingest — PDF upload with collection, category, and tag assignment](docs/ForgeRAG-ingest.png)
+
+![Manage — Documents, entities, GPU status, and GraphRAG communities](docs/ForgeRAG-manage.png)
+
 ## What it does
 
 Ask a question like *"What is alloy C12000 used for and how do I weld it?"* and ForgeRAG will:
