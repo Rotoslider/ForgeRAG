@@ -8,7 +8,6 @@ import {
   searchAnswer,
   reducedImageUrl,
   pageImageUrl,
-  highlightedImageUrl,
 } from "../api/client";
 import type { SearchHit, CommunityHit, HybridStrategy } from "../api/types";
 import type { AnswerResult } from "../api/client";
@@ -95,8 +94,10 @@ export default function Search() {
             <option value="answer">Answer (reads pages, cites sources)</option>
             <option value="keyword">Keyword (exact code/term match)</option>
             <option value="visual">Visual (ColPali page retrieval)</option>
-            <option value="semantic">Semantic (text concepts)</option>
-            <option value="hybrid">Hybrid (graph-aware)</option>
+            <optgroup label="Advanced">
+              <option value="semantic">Semantic (text vectors)</option>
+              <option value="hybrid">Hybrid (graph-aware)</option>
+            </optgroup>
           </select>
         </div>
         {mode === "hybrid" && (
@@ -204,7 +205,6 @@ export default function Search() {
               onToggleExpand={() =>
                 setExpanded(expanded === h.page_id ? null : h.page_id)
               }
-              query={query}
               mode={mode}
               strategy={strategy}
             />
@@ -219,25 +219,27 @@ function HitCard({
   hit,
   expanded,
   onToggleExpand,
-  query,
   mode,
   strategy,
 }: {
   hit: SearchHit;
   expanded: boolean;
   onToggleExpand: () => void;
-  query: string;
   mode: Mode;
   strategy: HybridStrategy;
 }) {
-  const [showHighlight, setShowHighlight] = useState(false);
-  // file_hash isn't on SearchHit — derive from image_url: /images/{hash}/{n}
+  const [pageOffset, setPageOffset] = useState(0); // for forward/back navigation
   const hash = hit.image_url.split("/")[2];
+  const currentPage = hit.page_number + pageOffset;
   const imgSrc = expanded
-    ? showHighlight && query
-      ? highlightedImageUrl(hash, hit.page_number, query)
-      : pageImageUrl(hash, hit.page_number)
+    ? pageImageUrl(hash, currentPage)
     : reducedImageUrl(hash, hit.page_number);
+
+  // Reset page offset when collapsing
+  const handleToggle = () => {
+    if (expanded) setPageOffset(0);
+    onToggleExpand();
+  };
 
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg overflow-hidden">
@@ -247,7 +249,7 @@ function HitCard({
             src={reducedImageUrl(hash, hit.page_number)}
             alt={`page ${hit.page_number}`}
             className="border border-forge-edge bg-white cursor-pointer w-24 shrink-0 self-start hover:opacity-80"
-            onClick={onToggleExpand}
+            onClick={handleToggle}
             title="Click to expand page image"
           />
         )}
@@ -289,35 +291,63 @@ function HitCard({
       </div>
       {expanded && (
         <div className="border-t border-forge-edge">
-          <div className="px-4 pt-3 pb-2 flex items-center gap-4">
-            <label className="flex items-center gap-2 text-sm text-forge-muted">
-              <input
-                type="checkbox"
-                checked={showHighlight}
-                onChange={(e) => setShowHighlight(e.target.checked)}
-                disabled={!query}
-              />
-              ColPali heatmap
-            </label>
-            <button
-              className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge"
-              onClick={onToggleExpand}
-            >
-              close
-            </button>
-            <a
-              href={pageImageUrl(hash, hit.page_number)}
-              target="_blank"
-              rel="noopener"
-              className="text-xs text-forge-secondary hover:underline ml-auto"
-            >
-              open full image in new tab
-            </a>
+          <div className="px-4 pt-3 pb-2 flex items-center gap-3 flex-wrap">
+            {/* Page navigation */}
+            <div className="flex items-center gap-1">
+              <button
+                className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge disabled:opacity-30"
+                onClick={() => setPageOffset(pageOffset - 1)}
+                disabled={currentPage <= 1}
+                title="Previous page"
+              >
+                ← Prev
+              </button>
+              <span className="text-sm font-mono px-2">
+                p.{currentPage}
+                {pageOffset !== 0 && (
+                  <span className="text-forge-muted text-xs ml-1">
+                    (match: p.{hit.page_number})
+                  </span>
+                )}
+              </span>
+              <button
+                className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge"
+                onClick={() => setPageOffset(pageOffset + 1)}
+                title="Next page"
+              >
+                Next →
+              </button>
+              {pageOffset !== 0 && (
+                <button
+                  className="text-xs text-forge-muted hover:text-forge-primary ml-1"
+                  onClick={() => setPageOffset(0)}
+                  title="Back to matched page"
+                >
+                  (reset)
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-3 ml-auto">
+              <a
+                href={pageImageUrl(hash, currentPage)}
+                target="_blank"
+                rel="noopener"
+                className="text-xs text-forge-secondary hover:underline"
+              >
+                open in new tab
+              </a>
+              <button
+                className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge"
+                onClick={handleToggle}
+              >
+                close
+              </button>
+            </div>
           </div>
           <div className="px-4 pb-4">
             <img
               src={imgSrc}
-              alt={`page ${hit.page_number} full view`}
+              alt={`page ${currentPage}`}
               className="max-w-full max-h-[80vh] mx-auto border border-forge-edge bg-white"
               loading="lazy"
             />
@@ -376,6 +406,19 @@ function renderCommunities(hit: SearchHit) {
 }
 
 function CommunityResults({ hits }: { hits: CommunityHit[] }) {
+  if (!hits || hits.length === 0) {
+    return (
+      <div className="bg-forge-panel border border-forge-edge rounded-lg p-5 text-forge-muted">
+        <p className="font-semibold mb-2">No communities found.</p>
+        <p className="text-sm">
+          Communities are built from entity relationships. Run{" "}
+          <span className="font-mono text-forge-primary">Manage → GraphRAG Communities → rebuild</span>{" "}
+          after entity extraction is complete for your documents. Try <strong>Answer</strong> or{" "}
+          <strong>Keyword</strong> mode instead.
+        </p>
+      </div>
+    );
+  }
   return (
     <div className="space-y-4">
       {hits.map((c) => (
