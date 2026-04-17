@@ -88,7 +88,7 @@ class IngestionPipeline:
             scanned_text_threshold_chars=settings.ingestion.scanned_text_threshold_chars,
         )
 
-    async def run_job(self, job_id: str) -> None:
+    async def run_job(self, job_id: str, collection: str = "default") -> None:
         """Run the full pipeline for a queued job. Catches and records errors."""
         try:
             job = await self.jobs.get(job_id)
@@ -97,7 +97,7 @@ class IngestionPipeline:
                 return
 
             await self.jobs.update(job_id, status="processing", current_step="registering")
-            doc_id, file_hash, page_count = await self._register(job)
+            doc_id, file_hash, page_count = await self._register(job, collection=collection)
 
             await self.jobs.update(
                 job_id,
@@ -219,7 +219,7 @@ class IngestionPipeline:
 
     # ------------------------------------------------------------------ step 1
 
-    async def _register(self, job) -> tuple[str, str, int]:
+    async def _register(self, job, collection: str = "default") -> tuple[str, str, int]:
         """Compute hash, dedup, create :Document node + category/tag relationships.
 
         Returns (doc_id, file_hash, page_count).
@@ -263,7 +263,8 @@ class IngestionPipeline:
                     page_count: $page_count,
                     file_size_bytes: $file_size,
                     ingested_at: datetime($ingested_at),
-                    source_type: 'unknown'
+                    source_type: 'unknown',
+                    collection: $collection
                 })
                 """,
                 {
@@ -274,6 +275,7 @@ class IngestionPipeline:
                     "page_count": page_count,
                     "file_size": size_bytes,
                     "ingested_at": now_iso,
+                    "collection": collection,
                 },
             )
             logger.info("Created :Document %s for %s (%d pages)", doc_id, job.filename, page_count)

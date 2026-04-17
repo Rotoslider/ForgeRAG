@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 
 class SearchFilters(BaseModel):
+    collection: str | None = None
     categories: list[str] | None = None
     tags: list[str] | None = None
     document_ids: list[str] | None = None

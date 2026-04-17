@@ -18,9 +18,26 @@ router = APIRouter(tags=["documents"])
 
 # Documents ----------------------------------------------------------------
 
+@router.get("/collections")
+async def list_collections(request: Request) -> ForgeResult:
+    """List all collections with document counts."""
+    neo4j = request.app.state.neo4j
+    rows = await neo4j.run_query(
+        """
+        MATCH (d:Document)
+        RETURN coalesce(d.collection, 'default') AS collection,
+               count(d) AS document_count,
+               sum(d.page_count) AS total_pages
+        ORDER BY collection
+        """
+    )
+    return ForgeResult(success=True, data=rows)
+
+
 @router.get("/documents")
 async def list_documents(
     request: Request,
+    collection: str | None = Query(None, description="Filter by collection name"),
     category: str | None = Query(None, description="Filter by category name"),
     tag: str | None = Query(None, description="Filter by tag name"),
     source_type: str | None = Query(None, description="digital_native/scanned/hybrid"),
@@ -33,6 +50,9 @@ async def list_documents(
     where_clauses = []
     params: dict = {"limit": limit, "offset": offset}
 
+    if collection:
+        where_clauses.append("coalesce(d.collection, 'default') = $collection")
+        params["collection"] = collection
     if category:
         where_clauses.append("EXISTS { (d)-[:IN_CATEGORY]->(:Category {name: $category}) }")
         params["category"] = category
@@ -54,6 +74,7 @@ async def list_documents(
                d.page_count AS page_count,
                d.file_size_bytes AS file_size_bytes,
                d.source_type AS source_type,
+               coalesce(d.collection, 'default') AS collection,
                toString(d.ingested_at) AS ingested_at,
                [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
                [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
@@ -62,6 +83,24 @@ async def list_documents(
     """
     rows = await neo4j.run_query(query, params)
     return ForgeResult(success=True, data=rows)
+
+
+@router.put("/documents/{doc_id}/collection")
+async def move_document(doc_id: str, request: Request, collection: str = Query(..., description="Target collection name")) -> ForgeResult:
+    """Move a document to a different collection. No re-ingestion needed —
+    just updates the collection property. All pages, embeddings, and
+    entities stay intact."""
+    neo4j = request.app.state.neo4j
+    rows = await neo4j.run_query(
+        "MATCH (d:Document {doc_id: $id}) RETURN d.doc_id", {"id": doc_id}
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+    await neo4j.run_write(
+        "MATCH (d:Document {doc_id: $id}) SET d.collection = $col",
+        {"id": doc_id, "col": collection},
+    )
+    return ForgeResult(success=True, data={"doc_id": doc_id, "collection": collection})
 
 
 @router.get("/documents/{doc_id}")
@@ -78,6 +117,7 @@ async def get_document(doc_id: str, request: Request) -> ForgeResult:
                d.page_count AS page_count,
                d.file_size_bytes AS file_size_bytes,
                d.source_type AS source_type,
+               coalesce(d.collection, 'default') AS collection,
                toString(d.ingested_at) AS ingested_at,
                [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
                [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags

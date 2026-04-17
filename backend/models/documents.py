@@ -26,6 +26,7 @@ class DocumentMeta(BaseModel):
     file_size_bytes: int = 0
     ingested_at: datetime
     source_type: SourceType = "unknown"
+    collection: str = "default"
     edition: str | None = None
     publisher: str | None = None
     year: int | None = None

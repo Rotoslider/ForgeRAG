@@ -28,6 +28,7 @@ def _uploads_dir(settings) -> Path:
 async def start_ingestion(
     request: Request,
     file: UploadFile = File(..., description="PDF file to ingest"),
+    collection: str = Form("default", description="Collection name (e.g. asm_references, mechanical_design)"),
     categories: str = Form("", description="Comma-separated category names"),
     tags: str = Form("", description="Comma-separated tag names"),
 ) -> ForgeResult:
@@ -59,6 +60,7 @@ async def start_ingestion(
     # Parse categories/tags (comma-separated, trim whitespace, drop empty)
     cats = [c.strip() for c in categories.split(",") if c.strip()]
     tgs = [t.strip() for t in tags.split(",") if t.strip()]
+    col = collection.strip() or "default"
 
     # Create job record
     job = await jobs.create(
@@ -68,13 +70,14 @@ async def start_ingestion(
         tags=tgs,
     )
 
-    # Kick off the pipeline in the background. Do not await — we want to
-    # return the job_id to the caller immediately so they can poll progress.
-    asyncio.create_task(pipeline.run_job(job.job_id))
+    # Kick off the pipeline in the background with collection info.
+    # Collection is passed directly to run_job since it's not persisted
+    # in the job table — it gets set on the Document node during _register.
+    asyncio.create_task(pipeline.run_job(job.job_id, collection=col))
 
     logger.info(
-        "Enqueued ingestion job %s for %s (categories=%s, tags=%s)",
-        job.job_id, file.filename, cats, tgs,
+        "Enqueued ingestion job %s for %s (collection=%s, categories=%s, tags=%s)",
+        job.job_id, file.filename, col, cats, tgs,
     )
     return ForgeResult(
         success=True,

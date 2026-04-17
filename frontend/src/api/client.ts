@@ -90,13 +90,36 @@ export const deleteTag = (name: string) =>
   request<{ name: string }>(`/tags/${encodeURIComponent(name)}`, { method: "DELETE" });
 
 // ---- Ingestion ----
+export const listCollections = () =>
+  request<Array<{ collection: string; document_count: number; total_pages: number }>>("/collections");
+
+export const moveDocument = (docId: string, collection: string) =>
+  request<{ doc_id: string; collection: string }>(
+    `/documents/${docId}/collection?collection=${encodeURIComponent(collection)}`,
+    { method: "PUT" }
+  );
+
+export const addDocumentTag = (docId: string, tag: string) =>
+  request<{ doc_id: string; tag: string }>(
+    `/documents/${docId}/tags`,
+    { method: "POST", body: JSON.stringify({ name: tag }) }
+  );
+
+export const removeDocumentTag = (docId: string, tag: string) =>
+  request<{ doc_id: string; removed_tag: string }>(
+    `/documents/${docId}/tags/${encodeURIComponent(tag)}`,
+    { method: "DELETE" }
+  );
+
 export async function uploadPdf(
   file: File,
+  collection: string,
   categories: string[],
   tags: string[]
 ): Promise<ForgeResult<{ job_id: string; status: string; filename: string }>> {
   const fd = new FormData();
   fd.append("file", file);
+  fd.append("collection", collection);
   fd.append("categories", categories.join(","));
   fd.append("tags", tags.join(","));
   const res = await fetch("/ingest", { method: "POST", body: fd });

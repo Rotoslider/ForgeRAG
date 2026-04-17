@@ -38,6 +38,7 @@ class Job(BaseModel):
     # What we're ingesting
     source_path: str               # original uploaded PDF path (temp or workspace)
     filename: str
+    requested_collection: str = "default"
     requested_categories: list[str] = Field(default_factory=list)
     requested_tags: list[str] = Field(default_factory=list)
 

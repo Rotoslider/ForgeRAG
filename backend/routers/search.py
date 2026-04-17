@@ -38,6 +38,9 @@ def _filter_clauses(filters: SearchFilters | None) -> tuple[str, dict]:
         return "", {}
     parts: list[str] = []
     params: dict = {}
+    if filters.collection:
+        parts.append("coalesce(d.collection, 'default') = $collection")
+        params["collection"] = filters.collection
     if filters.categories:
         parts.append(
             "ALL(cn IN $cats WHERE EXISTS { (d)-[:IN_CATEGORY]->(:Category {name: cn}) })"

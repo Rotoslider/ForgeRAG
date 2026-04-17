@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   listCategories,
+  listCollections,
   listTags,
   listJobs,
   uploadPdf,
@@ -28,16 +29,22 @@ function UploadForm() {
   const qc = useQueryClient();
   const { data: catsResp } = useQuery({ queryKey: ["categories"], queryFn: listCategories });
   const { data: tagsResp } = useQuery({ queryKey: ["tags"], queryFn: listTags });
+  const { data: collectionsResp } = useQuery({ queryKey: ["collections"], queryFn: listCollections });
 
   const [file, setFile] = useState<File | null>(null);
+  const [collection, setCollection] = useState("default");
+  const [newCollection, setNewCollection] = useState("");
   const [selectedCats, setSelectedCats] = useState<string[]>([]);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [newTag, setNewTag] = useState("");
 
+  const collections = collectionsResp?.data || [];
+
   const upload = useMutation({
     mutationFn: async () => {
       if (!file) throw new Error("Select a PDF first");
-      const res = await uploadPdf(file, selectedCats, selectedTags);
+      const col = newCollection.trim() || collection;
+      const res = await uploadPdf(file, col, selectedCats, selectedTags);
       if (!res.success) throw new Error(res.reason || "Upload failed");
       return res.data!;
     },
@@ -45,7 +52,9 @@ function UploadForm() {
       setFile(null);
       setSelectedCats([]);
       setSelectedTags([]);
+      setNewCollection("");
       qc.invalidateQueries({ queryKey: ["jobs"] });
+      qc.invalidateQueries({ queryKey: ["collections"] });
     },
   });
 
@@ -56,15 +65,51 @@ function UploadForm() {
     <div className="bg-forge-panel border border-forge-edge rounded-lg p-5 mb-8">
       <h2 className="font-semibold mb-3">Upload PDF</h2>
 
-      <div className="mb-4">
-        <label className="block text-xs text-forge-muted mb-1">File</label>
-        <input
-          type="file"
-          accept="application/pdf"
-          onChange={(e) => setFile(e.target.files?.[0] || null)}
-          className="block w-full text-sm"
-        />
+      <div className="grid md:grid-cols-2 gap-4 mb-4">
+        <div>
+          <label className="block text-xs text-forge-muted mb-1">File</label>
+          <input
+            type="file"
+            accept="application/pdf"
+            onChange={(e) => setFile(e.target.files?.[0] || null)}
+            className="block w-full text-sm"
+          />
+        </div>
+        <div>
+          <label className="block text-xs text-forge-muted mb-1">Collection</label>
+          <div className="flex gap-2">
+            <select
+              value={newCollection ? "__new__" : collection}
+              onChange={(e) => {
+                if (e.target.value === "__new__") {
+                  setNewCollection(collection === "default" ? "" : collection);
+                } else {
+                  setCollection(e.target.value);
+                  setNewCollection("");
+                }
+              }}
+              className="bg-forge-bg border border-forge-edge rounded px-2 py-1.5 text-sm flex-1"
+            >
+              {collections.map((c) => (
+                <option key={c.collection} value={c.collection}>
+                  {c.collection} ({c.document_count} docs)
+                </option>
+              ))}
+              {collections.length === 0 && <option value="default">default</option>}
+              <option value="__new__">+ New collection...</option>
+            </select>
+            {newCollection !== "" && (
+              <input
+                placeholder="collection name"
+                value={newCollection}
+                onChange={(e) => setNewCollection(e.target.value.replace(/\s+/g, "_").toLowerCase())}
+                className="bg-forge-bg border border-forge-edge rounded px-2 py-1.5 text-sm flex-1"
+              />
+            )}
+          </div>
+        </div>
       </div>
+
 
       <div className="grid md:grid-cols-2 gap-4 mb-4">
         <div>
