@@ -78,8 +78,14 @@ async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeR
     """
     neo4j = request.app.state.neo4j
 
-    # Try the full-text index first (scales to 100K+ pages)
+    # Try the full-text index first (scales to 100K+ pages).
+    # Wrap in double quotes for Lucene phrase matching — "ASTM A 709"
+    # matches as a phrase, not as three individual words (which would
+    # return every page mentioning "A" or "709" separately).
     try:
+        # Escape any existing quotes in the query
+        escaped = body.query.replace('"', '\\"')
+        phrase_query = f'"{escaped}"'
         rows = await neo4j.run_query(
             """
             CALL db.index.fulltext.queryNodes('page_text_fulltext', $q)
@@ -98,7 +104,7 @@ async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeR
             ORDER BY ft_score DESC
             LIMIT $limit
             """,
-            {"q": body.query, "limit": body.limit},
+            {"q": phrase_query, "limit": body.limit},
         )
     except Exception:
         # Fallback: CONTAINS scan (works without the index, slower at scale)
@@ -170,6 +176,12 @@ class AnswerRequest(BaseModel):
         description="Traverse the knowledge graph from query-matched entities to "
         "find related pages the user didn't ask about. Enables cross-document "
         "reasoning (material→process→standard chains).",
+    )
+    include_adjacent: bool = Field(
+        default=True,
+        description="Include pages N-1 and N+1 for each retrieved page. Catches "
+        "tables and content that span page boundaries. Slightly slower but "
+        "much more accurate for handbook-style content.",
     )
 
 
@@ -310,12 +322,37 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         )
 
     # Step 2: Build LLM context — page images (vision) or extracted text
+    # For each retrieved page, also include adjacent pages (N-1, N+1) so the
+    # VLM can read tables and content that span page boundaries. This fixes
+    # the common "table starts on page 997 but the row I need is on 998"
+    # problem. We deduplicate so a page isn't sent twice if two search hits
+    # are adjacent.
     import base64
     from pathlib import Path
 
     data_dir = Path(settings.server.data_dir)
     messages_content: list[dict] = []
     sources = []
+    sent_pages: set[tuple[str, int]] = set()  # (doc_hash, page_number) dedup
+
+    async def _add_page_image(doc_hash: str, pn: int, title: str, label: str) -> bool:
+        """Add a page image to the LLM context. Returns True if added."""
+        key = (doc_hash, pn)
+        if key in sent_pages or pn < 1:
+            return False
+        img_path = data_dir / "reduced_images" / doc_hash / f"page_{str(pn).zfill(4)}.jpg"
+        if not img_path.exists():
+            return False
+        sent_pages.add(key)
+        img_bytes = img_path.read_bytes()
+        b64 = base64.b64encode(img_bytes).decode("ascii")
+        messages_content.append(
+            {"type": "text", "text": f"[{label} — Page {pn} from {title}]"}
+        )
+        messages_content.append(
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+        )
+        return True
 
     for p in pages[: body.limit]:
         page_rows = await neo4j.run_query(
@@ -330,37 +367,25 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         if not page_rows:
             continue
         pr = page_rows[0]
+        doc_hash = pr["hash"]
+        pn = pr["pn"]
+        title = pr["title"]
         sources.append({
-            "document_title": pr["title"],
-            "page_number": pr["pn"],
+            "document_title": title,
+            "page_number": pn,
             "image_url": p.get("image_url", ""),
             "score": p.get("score", 0),
         })
 
-        if body.use_vision and pr.get("img_path"):
-            # Send the reduced page image to the VLM
-            img_path = Path(pr["img_path"])
-            if not img_path.exists():
-                # Fall back to constructed path
-                img_path = (
-                    data_dir
-                    / "reduced_images"
-                    / pr["hash"]
-                    / f"page_{str(pr['pn']).zfill(4)}.jpg"
-                )
-            if img_path.exists():
-                img_bytes = img_path.read_bytes()
-                b64 = base64.b64encode(img_bytes).decode("ascii")
-                messages_content.append(
-                    {"type": "text", "text": f"[Page {pr['pn']} from {pr['title']}]"}
-                )
-                messages_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                    }
-                )
-                continue
+        if body.use_vision:
+            # Send the matched page, optionally with adjacent pages
+            if body.include_adjacent:
+                await _add_page_image(doc_hash, pn - 1, title, "Context (prev page)")
+            await _add_page_image(doc_hash, pn, title, "Source")
+            if body.include_adjacent:
+                await _add_page_image(doc_hash, pn + 1, title, "Context (next page)")
+            continue
+
         # Fallback: send extracted text
         text = (pr["text"] or "")[:3000]
         messages_content.append(
@@ -423,12 +448,17 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
             "role": "system",
             "content": "You are an engineering reference assistant with access to "
             "a knowledge graph of materials, processes, standards, and equipment. "
-            "You can see page images from engineering handbooks. Read the pages "
+            "You can see page images from engineering handbooks. Read ALL pages "
             "carefully including tables, diagrams, and figure captions. "
+            "Pages labeled 'Context (prev page)' or 'Context (next page)' are "
+            "adjacent pages included because tables and data often span page "
+            "boundaries — check them for continuation of tables, footnotes, "
+            "and additional data. "
             "Answer questions based on the source pages AND the knowledge graph "
             "context. When you see a relationship chain (e.g., Material → "
             "GOVERNED_BY → Standard), use it to provide comprehensive answers "
-            "that connect information across different sections of the handbook.",
+            "that connect information across different sections of the handbook. "
+            "Always cite the specific page number where you found each fact.",
         },
         {"role": "user", "content": messages_content},
     ]
