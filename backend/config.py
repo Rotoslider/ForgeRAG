@@ -51,9 +51,17 @@ class Neo4jSettings(BaseModel):
 
 
 class ModelSettings(BaseModel):
+    # Visual retrieval model — the model that embeds page images for MaxSim scoring.
+    # Default is Nemotron ColEmbed 4B (significant upgrade from ColPali v1.3).
+    # Set to "vidore/colpali-v1.3" to use the original ColPali.
+    visual_model_name: str = "nvidia/nemotron-colembed-vl-4b-v2"
+    visual_model_type: str = "nemotron"  # "nemotron" or "colpali"
+    visual_embed_dim: int = 128  # projection target (128 retains 96.8% accuracy)
+    # Legacy ColPali settings (only used when visual_model_type = "colpali")
     colpali_name: str = "vidore/colpali-v1.3"
     colpali_pool_factor_storage: int = 3
     colpali_pool_factor_search: int = 24
+    # Text embedding model
     text_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5"
     text_embedding_dim: int = 768
     vlm_name: str = "Qwen/Qwen2.5-VL-7B-Instruct"

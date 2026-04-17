@@ -22,6 +22,7 @@ from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pipeline import IngestionPipeline
 from backend.routers import admin, documents, graph, health, images, ingestion, search, system
 from backend.services.colpali_service import create_colpali_service
+from backend.services.nemotron_service import create_nemotron_service
 from backend.services.image_service import ImageHighlighter
 from backend.services.gpu_manager import GPUManager
 from backend.services.llm_service import create_llm_service
@@ -76,16 +77,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.warning("Text embedding service not wired: %s", exc)
         app.state.text_embedding = None
 
+    # Visual retrieval model — Nemotron ColEmbed 4B (default) or ColPali v1.3
+    visual_model = None
     try:
-        colpali = create_colpali_service(settings, gpu)
-        app.state.colpali = colpali
+        if settings.models.visual_model_type == "nemotron":
+            visual_model = create_nemotron_service(settings, gpu)
+            logger.info("Using Nemotron ColEmbed VL-4B-v2 for visual retrieval")
+        else:
+            visual_model = create_colpali_service(settings, gpu)
+            logger.info("Using ColPali v1.3 for visual retrieval")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("ColPali service not wired: %s", exc)
-        app.state.colpali = None
+        logger.warning("Visual retrieval service not wired: %s", exc)
 
-    if app.state.colpali is not None:
+    # Expose as 'colpali' for backward compatibility with search endpoints
+    # (they reference request.app.state.colpali). Both models implement the
+    # same interface: embed_images(), embed_query(), is_loaded(), unload().
+    app.state.colpali = visual_model
+
+    if visual_model is not None:
         app.state.highlighter = ImageHighlighter(
-            data_dir=data_dir, colpali=app.state.colpali, gpu=gpu
+            data_dir=data_dir, colpali=visual_model, gpu=gpu
         )
     else:
         app.state.highlighter = None

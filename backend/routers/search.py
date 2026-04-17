@@ -612,6 +612,9 @@ async def visual_search(body: VisualSearchRequest, request: Request) -> ForgeRes
 
     # Stage 2: MaxSim rerank in Python
     from backend.services.colpali_service import deserialize_colpali, maxsim_score
+    from backend.services.nemotron_service import deserialize_nemotron
+    # Both deserializers have the same interface: (blob, K, D) -> ndarray
+    # MaxSim is model-agnostic — works with any (K, D) embeddings
 
     async with gpu.load_scope("colpali"):
         qvec = await asyncio.to_thread(colpali.embed_query, body.query)

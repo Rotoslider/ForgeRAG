@@ -30,6 +30,7 @@ from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pdf_processor import PDFProcessor
 from backend.ingestion.text_extractor import TextExtractor
 from backend.services.colpali_service import ColPaliService, serialize_colpali
+from backend.services.nemotron_service import NemotronService, serialize_nemotron
 from backend.services.gpu_manager import GPUManager
 from backend.services.llm_service import LLMService
 from backend.services.neo4j_service import Neo4jService
@@ -486,11 +487,15 @@ class IngestionPipeline:
     # ------------------------------------------------------------------ step 5
 
     async def _embed_visual(self, job_id: str, doc_id: str, file_hash: str) -> None:
-        """Generate ColPali embeddings for every page and store as bytes on Page."""
+        """Generate visual embeddings for every page and store as bytes on Page.
+
+        Works with both Nemotron ColEmbed and ColPali — both implement
+        embed_images() returning list[np.ndarray] of (K, D) float32.
+        """
         assert self.colpali is not None
         assert self.gpu is not None
 
-        # Find all pages that don't yet have a ColPali embedding
+        # Find all pages that don't yet have visual embeddings
         rows = await self.neo4j.run_query(
             """
             MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
@@ -501,13 +506,16 @@ class IngestionPipeline:
             {"doc_id": doc_id},
         )
         if not rows:
-            logger.info("No pages need ColPali embedding for doc %s", doc_id)
+            logger.info("No pages need visual embedding for doc %s", doc_id)
             return
 
         total = len(rows)
         batch_size = self.settings.ingestion.colpali_batch_size
 
-        async with self.gpu.load_scope("colpali"):
+        # Use the appropriate GPU scope name based on model type
+        scope_name = "visual_embed" if isinstance(self.colpali, NemotronService) else "colpali"
+
+        async with self.gpu.load_scope(scope_name):
             for start in range(0, total, batch_size):
                 batch = rows[start:start + batch_size]
                 image_paths = [
@@ -516,14 +524,16 @@ class IngestionPipeline:
                 ]
                 page_ids = [r["page_id"] for r in batch]
 
-                # ColPali returns a list of (K, D) float32 arrays
+                # Both models return list of (K, D) float32 arrays
                 embeddings = await asyncio.to_thread(
                     self.colpali.embed_images, image_paths
                 )
 
+                # Serialize — format is identical for both models
+                _serialize = serialize_nemotron if isinstance(self.colpali, NemotronService) else serialize_colpali
                 payload = []
                 for pid, arr in zip(page_ids, embeddings, strict=True):
-                    blob, k = serialize_colpali(arr)
+                    blob, k = _serialize(arr)
                     payload.append(
                         {"page_id": pid, "blob": blob, "count": k, "dim": int(arr.shape[1]) if arr.size else 128}
                     )
