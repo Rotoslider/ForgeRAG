@@ -126,92 +126,197 @@ async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeR
 class AnswerRequest(BaseModel):
     query: str
     limit: int = Field(default=5, ge=1, le=20, description="Pages to retrieve and read")
-    search_mode: str = Field(default="semantic", description="semantic, keyword, or hybrid")
+    search_mode: str = Field(
+        default="auto",
+        description="auto (keyword+visual), keyword, visual, semantic, or hybrid",
+    )
+    use_vision: bool = Field(
+        default=True,
+        description="If true, send page IMAGES to the LLM instead of extracted text. "
+        "Much more accurate (LLM reads the actual page) but slower.",
+    )
 
 
 @router.post("/answer")
 async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
     """Retrieve relevant pages and ask the LLM to synthesize an answer.
 
-    This is the core RAG loop:
-    1. Search for relevant pages using the chosen search mode
-    2. Feed the page text + query to the LLM
-    3. Return the LLM's answer with page citations
+    The core RAG loop:
+    1. Retrieve pages via keyword + ColPali visual search (or chosen mode)
+    2. Send page IMAGES (not extracted text) to the vision LLM — the LLM
+       reads the actual page including tables, diagrams, and formatting
+    3. Return the LLM's answer with [Page N] citations
 
-    Uses the same LLM configured for entity extraction.
+    This mirrors the accuracy of the original ColPali + Qwen-VL pipeline
+    while adding the knowledge graph context.
     """
     neo4j = request.app.state.neo4j
     llm = getattr(request.app.state, "llm", None)
+    colpali = getattr(request.app.state, "colpali", None)
     text_emb = getattr(request.app.state, "text_embedding", None)
     gpu = request.app.state.gpu
+    settings = request.app.state.settings
 
     if llm is None:
         raise HTTPException(503, "LLM service not available")
 
     # Step 1: Retrieve pages
-    if body.search_mode == "keyword":
+    # "auto" mode: run keyword + visual in parallel, merge results
+    pages: list[dict] = []
+    mode = body.search_mode
+
+    if mode == "auto":
+        # Keyword search for exact matches
+        kw_result = await keyword_search(
+            KeywordSearchRequest(query=body.query, limit=body.limit), request
+        )
+        kw_pages = kw_result.data or []
+
+        # ColPali visual search for conceptual matches
+        vis_pages: list[dict] = []
+        if colpali is not None and text_emb is not None:
+            try:
+                vis_result = await visual_search(
+                    VisualSearchRequest(
+                        query=body.query, limit=body.limit, candidate_pool=30
+                    ),
+                    request,
+                )
+                vis_pages = vis_result.data or []
+            except Exception:
+                pass  # visual not available, keyword only
+
+        # Merge: keyword hits first (exact match = highest priority), then
+        # visual hits not already in keyword results
+        seen_page_ids = {p["page_id"] for p in kw_pages}
+        pages = list(kw_pages)
+        for vp in vis_pages:
+            if vp["page_id"] not in seen_page_ids:
+                pages.append(vp)
+                seen_page_ids.add(vp["page_id"])
+        pages = pages[: body.limit]
+    elif mode == "keyword":
         result = await keyword_search(
             KeywordSearchRequest(query=body.query, limit=body.limit), request
         )
         pages = result.data or []
-    elif body.search_mode == "hybrid":
-        result = await hybrid_search(
-            HybridSearchRequest(query=body.query, strategy="graph_boosted", limit=body.limit),
+    elif mode == "visual":
+        if colpali is None or text_emb is None:
+            raise HTTPException(503, "ColPali or text embedding not available")
+        result = await visual_search(
+            VisualSearchRequest(query=body.query, limit=body.limit, candidate_pool=30),
             request,
         )
         pages = result.data or []
-    else:
+    elif mode == "semantic":
         if text_emb is None:
             raise HTTPException(503, "Text embedding not available")
         result = await semantic_search(
             SemanticSearchRequest(query=body.query, limit=body.limit), request
         )
         pages = result.data or []
+    elif mode == "hybrid":
+        result = await hybrid_search(
+            HybridSearchRequest(
+                query=body.query, strategy="graph_boosted", limit=body.limit
+            ),
+            request,
+        )
+        pages = result.data or []
 
     if not pages:
-        return ForgeResult(success=True, data={
-            "answer": "No relevant pages found for this query.",
-            "sources": [],
-        })
+        return ForgeResult(
+            success=True,
+            data={
+                "answer": "No relevant pages found for this query.",
+                "sources": [],
+            },
+        )
 
-    # Step 2: Build context from retrieved page text
-    context_parts = []
+    # Step 2: Build LLM context — page images (vision) or extracted text
+    import base64
+    from pathlib import Path
+
+    data_dir = Path(settings.server.data_dir)
+    messages_content: list[dict] = []
     sources = []
-    for p in pages[:body.limit]:
-        # Fetch full text for each page
+
+    for p in pages[: body.limit]:
         page_rows = await neo4j.run_query(
             """
-            MATCH (d:Document)-[:HAS_PAGE]->(p:Page {page_id: $pid})
-            RETURN p.extracted_text AS text, p.page_number AS pn, d.title AS title
+            MATCH (d:Document)-[:HAS_PAGE]->(pg:Page {page_id: $pid})
+            RETURN pg.extracted_text AS text, pg.page_number AS pn,
+                   pg.reduced_image_path AS img_path,
+                   d.title AS title, d.file_hash AS hash
             """,
             {"pid": p["page_id"]},
         )
-        if page_rows:
-            pr = page_rows[0]
-            text = (pr["text"] or "")[:3000]  # cap per page
-            context_parts.append(
-                f"[Source: {pr['title']}, Page {pr['pn']}]\n{text}"
-            )
-            sources.append({
-                "document_title": pr["title"],
-                "page_number": pr["pn"],
-                "image_url": p.get("image_url", ""),
-                "score": p.get("score", 0),
-            })
+        if not page_rows:
+            continue
+        pr = page_rows[0]
+        sources.append({
+            "document_title": pr["title"],
+            "page_number": pr["pn"],
+            "image_url": p.get("image_url", ""),
+            "score": p.get("score", 0),
+        })
 
-    context = "\n\n---\n\n".join(context_parts)
+        if body.use_vision and pr.get("img_path"):
+            # Send the reduced page image to the VLM
+            img_path = Path(pr["img_path"])
+            if not img_path.exists():
+                # Fall back to constructed path
+                img_path = (
+                    data_dir
+                    / "reduced_images"
+                    / pr["hash"]
+                    / f"page_{str(pr['pn']).zfill(4)}.jpg"
+                )
+            if img_path.exists():
+                img_bytes = img_path.read_bytes()
+                b64 = base64.b64encode(img_bytes).decode("ascii")
+                messages_content.append(
+                    {"type": "text", "text": f"[Page {pr['pn']} from {pr['title']}]"}
+                )
+                messages_content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    }
+                )
+                continue
+        # Fallback: send extracted text
+        text = (pr["text"] or "")[:3000]
+        messages_content.append(
+            {
+                "type": "text",
+                "text": f"[Page {pr['pn']} from {pr['title']}]\n{text}",
+            }
+        )
 
     # Step 3: Ask the LLM
+    messages_content.append(
+        {
+            "type": "text",
+            "text": (
+                f"\nQuestion: {body.query}\n\n"
+                "Answer the question based on the source pages above. "
+                "Cite page numbers inline as [Page N]. Be precise with "
+                "numbers, codes, and specifications. If the answer isn't "
+                "in the sources, say so.\n\n/no_think"
+            ),
+        }
+    )
+
     messages = [
-        {"role": "system", "content":
-            "You are an engineering reference assistant. Answer the user's "
-            "question based ONLY on the provided source pages. Cite your "
-            "sources inline as [Page N]. If the answer isn't in the sources, "
-            "say so. Be precise with numbers, codes, and specifications."},
-        {"role": "user", "content":
-            f"Question: {body.query}\n\n"
-            f"Source pages:\n\n{context}\n\n"
-            "Answer the question based on these sources. Cite page numbers.\n\n/no_think"},
+        {
+            "role": "system",
+            "content": "You are an engineering reference assistant. You can see "
+            "page images from engineering handbooks. Read the pages carefully "
+            "including tables, diagrams, and figure captions. Answer questions "
+            "based ONLY on what you see in the provided pages.",
+        },
+        {"role": "user", "content": messages_content},
     ]
 
     try:
@@ -219,12 +324,16 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
     except Exception as exc:
         answer = f"LLM error: {exc}"
 
-    return ForgeResult(success=True, data={
-        "answer": answer,
-        "sources": sources,
-        "query": body.query,
-        "search_mode": body.search_mode,
-    })
+    return ForgeResult(
+        success=True,
+        data={
+            "answer": answer,
+            "sources": sources,
+            "query": body.query,
+            "search_mode": mode,
+            "used_vision": body.use_vision,
+        },
+    )
 
 
 @router.post("/semantic")

@@ -17,7 +17,7 @@ type Mode = "semantic" | "keyword" | "visual" | "hybrid" | "answer";
 
 export default function Search() {
   const [query, setQuery] = useState("");
-  const [mode, setMode] = useState<Mode>("semantic");
+  const [mode, setMode] = useState<Mode>("answer");
   const [strategy, setStrategy] = useState<HybridStrategy>("graph_boosted");
   const [limit, setLimit] = useState(10);
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -69,10 +69,10 @@ export default function Search() {
     <div className="p-6 max-w-7xl">
       <h1 className="text-2xl font-bold mb-1">Search</h1>
       <p className="text-sm text-forge-muted mb-4">
-        Query the engineering knowledge base. Use <strong>Keyword</strong> for
-        exact codes (C12000, QW-451.1). Use <strong>Semantic</strong> for
-        concepts. Use <strong>Answer</strong> to get an LLM-synthesized response
-        with page citations.
+        Ask a question — the LLM reads the actual page images and answers
+        with citations. Use <strong>Keyword</strong> for exact codes (C12000,
+        QW-451.1). Use <strong>Visual</strong> for ColPali page-image retrieval.
+        Right-click thumbnails → Open in New Tab for full-size pages.
       </p>
 
       <form onSubmit={onSubmit} className="flex flex-wrap gap-3 items-end mb-6">
@@ -92,11 +92,11 @@ export default function Search() {
             onChange={(e) => setMode(e.target.value as Mode)}
             className="bg-forge-panel border border-forge-edge rounded px-2 py-2"
           >
-            <option value="keyword">Keyword (exact match)</option>
-            <option value="semantic">Semantic (concepts)</option>
-            <option value="answer">Answer (LLM + sources)</option>
+            <option value="answer">Answer (reads pages, cites sources)</option>
+            <option value="keyword">Keyword (exact code/term match)</option>
+            <option value="visual">Visual (ColPali page retrieval)</option>
+            <option value="semantic">Semantic (text concepts)</option>
             <option value="hybrid">Hybrid (graph-aware)</option>
-            <option value="visual">Visual (ColPali)</option>
           </select>
         </div>
         {mode === "hybrid" && (
