@@ -4,13 +4,16 @@ import {
   searchSemantic,
   searchVisual,
   searchHybrid,
+  searchKeyword,
+  searchAnswer,
   reducedImageUrl,
   pageImageUrl,
   highlightedImageUrl,
 } from "../api/client";
 import type { SearchHit, CommunityHit, HybridStrategy } from "../api/types";
+import type { AnswerResult } from "../api/client";
 
-type Mode = "semantic" | "visual" | "hybrid";
+type Mode = "semantic" | "keyword" | "visual" | "hybrid" | "answer";
 
 export default function Search() {
   const [query, setQuery] = useState("");
@@ -25,8 +28,12 @@ export default function Search() {
       let result;
       if (mode === "semantic") {
         result = await searchSemantic(query, limit);
+      } else if (mode === "keyword") {
+        result = await searchKeyword(query, limit);
       } else if (mode === "visual") {
         result = await searchVisual(query, Math.min(limit, 10));
+      } else if (mode === "answer") {
+        return []; // answer mode uses its own mutation
       } else {
         result = await searchHybrid({ query, strategy, limit });
       }
@@ -35,21 +42,37 @@ export default function Search() {
     },
   });
 
+  const answerMutation = useMutation({
+    mutationFn: async (): Promise<AnswerResult | null> => {
+      if (!query.trim()) return null;
+      const result = await searchAnswer(query, Math.min(limit, 10));
+      if (!result.success) throw new Error(result.reason || "Answer failed");
+      return result.data ?? null;
+    },
+  });
+
   const hits = searchMutation.data ?? [];
   const isCommunity = mode === "hybrid" && strategy === "community";
+  const answerData = answerMutation.data;
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    searchMutation.mutate();
     setExpanded(null);
+    if (mode === "answer") {
+      answerMutation.mutate();
+    } else {
+      searchMutation.mutate();
+    }
   };
 
   return (
     <div className="p-6 max-w-7xl">
       <h1 className="text-2xl font-bold mb-1">Search</h1>
       <p className="text-sm text-forge-muted mb-4">
-        Query the engineering knowledge base — semantic text, visual (ColPali),
-        or hybrid graph-aware strategies.
+        Query the engineering knowledge base. Use <strong>Keyword</strong> for
+        exact codes (C12000, QW-451.1). Use <strong>Semantic</strong> for
+        concepts. Use <strong>Answer</strong> to get an LLM-synthesized response
+        with page citations.
       </p>
 
       <form onSubmit={onSubmit} className="flex flex-wrap gap-3 items-end mb-6">
@@ -69,9 +92,11 @@ export default function Search() {
             onChange={(e) => setMode(e.target.value as Mode)}
             className="bg-forge-panel border border-forge-edge rounded px-2 py-2"
           >
-            <option value="semantic">Semantic</option>
+            <option value="keyword">Keyword (exact match)</option>
+            <option value="semantic">Semantic (concepts)</option>
+            <option value="answer">Answer (LLM + sources)</option>
+            <option value="hybrid">Hybrid (graph-aware)</option>
             <option value="visual">Visual (ColPali)</option>
-            <option value="hybrid">Hybrid</option>
           </select>
         </div>
         {mode === "hybrid" && (
@@ -103,25 +128,55 @@ export default function Search() {
         <button
           type="submit"
           className="bg-forge-accent text-black font-semibold rounded px-4 py-2 hover:brightness-110 disabled:opacity-50"
-          disabled={searchMutation.isPending}
+          disabled={searchMutation.isPending || answerMutation.isPending}
         >
-          {searchMutation.isPending ? "Searching…" : "Search"}
+          {(searchMutation.isPending || answerMutation.isPending) ? "Searching…" : mode === "answer" ? "Ask" : "Search"}
         </button>
       </form>
 
-      {searchMutation.isError && (
+      {(searchMutation.isError || answerMutation.isError) && (
         <div className="bg-rose-950 border border-rose-700 text-rose-200 rounded p-3 mb-4">
-          {(searchMutation.error as Error).message}
+          {((searchMutation.error || answerMutation.error) as Error).message}
         </div>
       )}
 
-      {!searchMutation.isPending && hits.length === 0 && searchMutation.isSuccess && (
+      {mode === "answer" && answerData && (
+        <div className="bg-forge-panel border border-forge-edge rounded-lg p-5 mb-6">
+          <div className="text-sm font-semibold text-forge-primary mb-2">Answer</div>
+          <div className="text-forge-fg whitespace-pre-wrap leading-relaxed">
+            {answerData.answer}
+          </div>
+          {answerData.sources.length > 0 && (
+            <div className="mt-4 pt-3 border-t border-forge-edge">
+              <div className="text-xs text-forge-muted mb-2">
+                Sources ({answerData.sources.length} pages):
+              </div>
+              <div className="flex flex-wrap gap-2">
+                {answerData.sources.map((s, i) => (
+                  <a
+                    key={i}
+                    href={s.image_url}
+                    target="_blank"
+                    rel="noopener"
+                    className="text-xs bg-forge-edge rounded px-2 py-1 hover:text-forge-primary"
+                    title="Open source page image"
+                  >
+                    {s.document_title.slice(0, 30)}… p.{s.page_number}
+                  </a>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {mode !== "answer" && !searchMutation.isPending && hits.length === 0 && searchMutation.isSuccess && (
         <div className="text-forge-muted text-sm">No results.</div>
       )}
 
       {isCommunity ? (
         <CommunityResults hits={hits as CommunityHit[]} />
-      ) : (
+      ) : mode !== "answer" ? (
         <div className="space-y-4">
           {(hits as SearchHit[]).map((h) => (
             <HitCard
@@ -137,7 +192,7 @@ export default function Search() {
             />
           ))}
         </div>
-      )}
+      ) : null}
     </div>
   );
 }

@@ -14,6 +14,7 @@ from backend.models.search import (
     SemanticSearchRequest,
     VisualSearchRequest,
 )
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,178 @@ def _filter_clauses(filters: SearchFilters | None) -> tuple[str, dict]:
         parts.append("d.source_type = $stype")
         params["stype"] = filters.source_type
     return " AND ".join(parts), params
+
+
+# ============================================================================
+# Keyword search — the missing Ctrl+F equivalent
+# ============================================================================
+
+class KeywordSearchRequest(BaseModel):
+    query: str = Field(..., description="Exact text to search for (case-insensitive)")
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+@router.post("/keyword")
+async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeResult:
+    """Direct text search on extracted page text (case-insensitive CONTAINS).
+
+    This is the equivalent of Ctrl+F in a PDF viewer. Use it for specific
+    codes, designations, alloy numbers, clause IDs, etc. that vector search
+    can't find because embeddings map them to generic concepts.
+    """
+    neo4j = request.app.state.neo4j
+    rows = await neo4j.run_query(
+        """
+        MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
+        WHERE toLower(p.extracted_text) CONTAINS toLower($q)
+        RETURN p.page_id AS page_id,
+               p.page_number AS page_number,
+               p.extracted_text AS extracted_text,
+               d.doc_id AS doc_id,
+               d.title AS document_title,
+               d.filename AS filename,
+               d.file_hash AS file_hash,
+               [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
+               [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+        ORDER BY d.title, p.page_number
+        LIMIT $limit
+        """,
+        {"q": body.query, "limit": body.limit},
+    )
+    hits = []
+    for r in rows:
+        # Extract a context snippet around the match
+        text = r["extracted_text"] or ""
+        idx = text.lower().find(body.query.lower())
+        if idx >= 0:
+            start = max(0, idx - 80)
+            end = min(len(text), idx + len(body.query) + 120)
+            snippet = ("..." if start > 0 else "") + text[start:end] + ("..." if end < len(text) else "")
+        else:
+            snippet = _snippet(text)
+
+        hits.append({
+            "page_id": r["page_id"],
+            "doc_id": r["doc_id"],
+            "document_title": r["document_title"],
+            "filename": r["filename"],
+            "page_number": r["page_number"],
+            "score": 1.0,  # exact match, all equally relevant
+            "text_snippet": snippet,
+            "image_url": f"/images/{r['file_hash']}/{r['page_number']}",
+            "reduced_image_url": f"/images/{r['file_hash']}/{r['page_number']}/reduced",
+            "categories": r["categories"],
+            "tags": r["tags"],
+        })
+    return ForgeResult(success=True, data=hits)
+
+
+# ============================================================================
+# RAG Answer — synthesize an answer from retrieved pages
+# ============================================================================
+
+class AnswerRequest(BaseModel):
+    query: str
+    limit: int = Field(default=5, ge=1, le=20, description="Pages to retrieve and read")
+    search_mode: str = Field(default="semantic", description="semantic, keyword, or hybrid")
+
+
+@router.post("/answer")
+async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
+    """Retrieve relevant pages and ask the LLM to synthesize an answer.
+
+    This is the core RAG loop:
+    1. Search for relevant pages using the chosen search mode
+    2. Feed the page text + query to the LLM
+    3. Return the LLM's answer with page citations
+
+    Uses the same LLM configured for entity extraction.
+    """
+    neo4j = request.app.state.neo4j
+    llm = getattr(request.app.state, "llm", None)
+    text_emb = getattr(request.app.state, "text_embedding", None)
+    gpu = request.app.state.gpu
+
+    if llm is None:
+        raise HTTPException(503, "LLM service not available")
+
+    # Step 1: Retrieve pages
+    if body.search_mode == "keyword":
+        result = await keyword_search(
+            KeywordSearchRequest(query=body.query, limit=body.limit), request
+        )
+        pages = result.data or []
+    elif body.search_mode == "hybrid":
+        result = await hybrid_search(
+            HybridSearchRequest(query=body.query, strategy="graph_boosted", limit=body.limit),
+            request,
+        )
+        pages = result.data or []
+    else:
+        if text_emb is None:
+            raise HTTPException(503, "Text embedding not available")
+        result = await semantic_search(
+            SemanticSearchRequest(query=body.query, limit=body.limit), request
+        )
+        pages = result.data or []
+
+    if not pages:
+        return ForgeResult(success=True, data={
+            "answer": "No relevant pages found for this query.",
+            "sources": [],
+        })
+
+    # Step 2: Build context from retrieved page text
+    context_parts = []
+    sources = []
+    for p in pages[:body.limit]:
+        # Fetch full text for each page
+        page_rows = await neo4j.run_query(
+            """
+            MATCH (d:Document)-[:HAS_PAGE]->(p:Page {page_id: $pid})
+            RETURN p.extracted_text AS text, p.page_number AS pn, d.title AS title
+            """,
+            {"pid": p["page_id"]},
+        )
+        if page_rows:
+            pr = page_rows[0]
+            text = (pr["text"] or "")[:3000]  # cap per page
+            context_parts.append(
+                f"[Source: {pr['title']}, Page {pr['pn']}]\n{text}"
+            )
+            sources.append({
+                "document_title": pr["title"],
+                "page_number": pr["pn"],
+                "image_url": p.get("image_url", ""),
+                "score": p.get("score", 0),
+            })
+
+    context = "\n\n---\n\n".join(context_parts)
+
+    # Step 3: Ask the LLM
+    messages = [
+        {"role": "system", "content":
+            "You are an engineering reference assistant. Answer the user's "
+            "question based ONLY on the provided source pages. Cite your "
+            "sources inline as [Page N]. If the answer isn't in the sources, "
+            "say so. Be precise with numbers, codes, and specifications."},
+        {"role": "user", "content":
+            f"Question: {body.query}\n\n"
+            f"Source pages:\n\n{context}\n\n"
+            "Answer the question based on these sources. Cite page numbers.\n\n/no_think"},
+    ]
+
+    try:
+        answer = await llm.chat(messages, max_tokens=2048, temperature=0.1)
+    except Exception as exc:
+        answer = f"LLM error: {exc}"
+
+    return ForgeResult(success=True, data={
+        "answer": answer,
+        "sources": sources,
+        "query": body.query,
+        "search_mode": body.search_mode,
+    })
 
 
 @router.post("/semantic")

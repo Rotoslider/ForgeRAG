@@ -17,6 +17,48 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
+@router.post("/cleanup-uploads")
+async def cleanup_uploads(request: Request) -> ForgeResult:
+    """Delete staged upload files from data/uploads/.
+
+    These are copies of PDFs left over from ingestion runs. The originals
+    are wherever the user stored them; these are temporary staging copies
+    that should be cleaned periodically. Active (processing/queued) jobs
+    are excluded — we only delete files not referenced by any in-flight job.
+    """
+    import os
+    from pathlib import Path
+
+    settings = request.app.state.settings
+    uploads_dir = Path(settings.server.data_dir) / "uploads"
+    if not uploads_dir.exists():
+        return ForgeResult(success=True, data={"deleted": 0, "freed_bytes": 0})
+
+    # Get source_paths of active jobs
+    jobs = request.app.state.job_manager
+    active = await jobs.list_recent(status="processing", limit=100)
+    queued = await jobs.list_recent(status="queued", limit=100)
+    active_paths = {j.source_path for j in active + queued}
+
+    deleted = 0
+    freed = 0
+    for f in uploads_dir.iterdir():
+        if f.is_file() and str(f) not in active_paths:
+            size = f.stat().st_size
+            f.unlink()
+            deleted += 1
+            freed += size
+
+    return ForgeResult(
+        success=True,
+        data={
+            "deleted": deleted,
+            "freed_bytes": freed,
+            "freed_mb": round(freed / 1e6, 1),
+        },
+    )
+
+
 # Dedup ranks each Page in a (doc_id, page_number) group:
 #   colpali_done  worth 2 (has colpali_vector_count > 0)
 #   text_emb_done worth 1 (has text_embedding set)

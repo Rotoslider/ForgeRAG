@@ -127,6 +127,31 @@ export const searchSemantic = (query: string, limit = 10) =>
     body: JSON.stringify({ query, limit }),
   });
 
+export const searchKeyword = (query: string, limit = 20) =>
+  request<SearchHit[]>("/search/keyword", {
+    method: "POST",
+    body: JSON.stringify({ query, limit }),
+  });
+
+export interface AnswerResult {
+  answer: string;
+  sources: Array<{ document_title: string; page_number: number; image_url: string; score: number }>;
+  query: string;
+  search_mode: string;
+}
+
+export const searchAnswer = (query: string, limit = 5, search_mode = "semantic") =>
+  request<AnswerResult>("/search/answer", {
+    method: "POST",
+    body: JSON.stringify({ query, limit, search_mode }),
+  });
+
+export const cleanupUploads = () =>
+  request<{ deleted: number; freed_bytes: number; freed_mb: number }>(
+    "/admin/cleanup-uploads",
+    { method: "POST" }
+  );
+
 export const searchVisual = (query: string, limit = 5, candidate_pool = 30) =>
   request<SearchHit[]>("/search/visual", {
     method: "POST",
