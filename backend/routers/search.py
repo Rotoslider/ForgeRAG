@@ -66,31 +66,59 @@ class KeywordSearchRequest(BaseModel):
 
 @router.post("/keyword")
 async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeResult:
-    """Direct text search on extracted page text (case-insensitive CONTAINS).
+    """Full-text keyword search on extracted page text.
 
-    This is the equivalent of Ctrl+F in a PDF viewer. Use it for specific
-    codes, designations, alloy numbers, clause IDs, etc. that vector search
-    can't find because embeddings map them to generic concepts.
+    Uses Neo4j's Lucene-backed full-text index (page_text_fulltext) for
+    O(1) lookup at any collection size. Falls back to CONTAINS scan if
+    the index doesn't exist yet. This is the equivalent of Ctrl+F in a
+    PDF viewer — use it for specific codes, alloy designations, clause
+    IDs, etc.
     """
     neo4j = request.app.state.neo4j
-    rows = await neo4j.run_query(
-        """
-        MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
-        WHERE toLower(p.extracted_text) CONTAINS toLower($q)
-        RETURN p.page_id AS page_id,
-               p.page_number AS page_number,
-               p.extracted_text AS extracted_text,
-               d.doc_id AS doc_id,
-               d.title AS document_title,
-               d.filename AS filename,
-               d.file_hash AS file_hash,
-               [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
-               [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
-        ORDER BY d.title, p.page_number
-        LIMIT $limit
-        """,
-        {"q": body.query, "limit": body.limit},
-    )
+
+    # Try the full-text index first (scales to 100K+ pages)
+    try:
+        rows = await neo4j.run_query(
+            """
+            CALL db.index.fulltext.queryNodes('page_text_fulltext', $q)
+            YIELD node AS p, score AS ft_score
+            MATCH (d:Document)-[:HAS_PAGE]->(p)
+            RETURN p.page_id AS page_id,
+                   p.page_number AS page_number,
+                   p.extracted_text AS extracted_text,
+                   d.doc_id AS doc_id,
+                   d.title AS document_title,
+                   d.filename AS filename,
+                   d.file_hash AS file_hash,
+                   ft_score,
+                   [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
+                   [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+            ORDER BY ft_score DESC
+            LIMIT $limit
+            """,
+            {"q": body.query, "limit": body.limit},
+        )
+    except Exception:
+        # Fallback: CONTAINS scan (works without the index, slower at scale)
+        rows = await neo4j.run_query(
+            """
+            MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
+            WHERE toLower(p.extracted_text) CONTAINS toLower($q)
+            RETURN p.page_id AS page_id,
+                   p.page_number AS page_number,
+                   p.extracted_text AS extracted_text,
+                   d.doc_id AS doc_id,
+                   d.title AS document_title,
+                   d.filename AS filename,
+                   d.file_hash AS file_hash,
+                   1.0 AS ft_score,
+                   [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
+                   [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+            ORDER BY d.title, p.page_number
+            LIMIT $limit
+            """,
+            {"q": body.query, "limit": body.limit},
+        )
     hits = []
     for r in rows:
         # Extract a context snippet around the match

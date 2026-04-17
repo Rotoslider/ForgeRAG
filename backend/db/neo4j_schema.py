@@ -75,6 +75,14 @@ INDEXES: list[str] = [
 ]
 
 
+# Full-text index for keyword search — Lucene-backed, handles 100K+ pages
+# without scanning every row. Supports fuzzy matching, phrase queries, etc.
+FULLTEXT_INDEXES: list[str] = [
+    """CREATE FULLTEXT INDEX page_text_fulltext IF NOT EXISTS
+       FOR (p:Page) ON EACH [p.extracted_text]""",
+]
+
+
 def vector_indexes(dim: int) -> list[str]:
     """Vector indexes — parameterized by embedding dimension."""
     return [
@@ -118,6 +126,10 @@ async def apply_schema(svc: Neo4jService, embedding_dim: int = 768) -> dict[str,
 
     logger.info("Applying Neo4j vector indexes (dim=%d)...", embedding_dim)
     await _run_all(vector_indexes(embedding_dim), "vector_indexes")
+
+    logger.info("Applying Neo4j full-text indexes...")
+    await _run_all(FULLTEXT_INDEXES, "fulltext_indexes")
+    counts["fulltext_indexes"] = len(FULLTEXT_INDEXES)
 
     logger.info(
         "Schema applied: %d constraints, %d indexes, %d vector indexes",
