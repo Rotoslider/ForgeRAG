@@ -76,23 +76,25 @@ async def explore_from_query(
     if not terms:
         return ctx
 
-    # Step 1: Find entities matching query terms
-    matched_entities = await neo4j.run_query(
-        """
-        MATCH (e)
-        WHERE any(l IN labels(e) WHERE l IN ['Material','Process','Standard','Equipment'])
-          AND (
-            any(t IN $terms WHERE toLower(coalesce(e.name, e.code, '')) CONTAINS t)
-            OR any(alias IN coalesce(e.common_names, [])
-                   WHERE any(t IN $terms WHERE toLower(alias) CONTAINS t))
-          )
-        RETURN labels(e)[0] AS label,
-               coalesce(e.name, e.code) AS name,
-               properties(e) AS props
-        LIMIT 20
-        """,
-        {"terms": terms},
-    )
+    # Step 1: Find entities matching query terms — search each type separately
+    # so a flood of Process matches from "weld" doesn't crowd out a specific
+    # Material like "C12000". Each type gets its own LIMIT 5.
+    matched_entities = []
+    for label in ["Material", "Process", "Standard", "Equipment"]:
+        rows = await neo4j.run_query(
+            f"""
+            MATCH (e:{label})
+            WHERE any(t IN $terms WHERE toLower(coalesce(e.name, e.code, '')) CONTAINS t)
+               OR any(alias IN coalesce(e.common_names, [])
+                      WHERE any(t IN $terms WHERE toLower(alias) CONTAINS t))
+            RETURN '{label}' AS label,
+                   coalesce(e.name, e.code) AS name,
+                   properties(e) AS props
+            LIMIT 5
+            """,
+            {"terms": terms},
+        )
+        matched_entities.extend(rows)
 
     if not matched_entities:
         logger.debug("No entities matched query terms: %s", terms)
