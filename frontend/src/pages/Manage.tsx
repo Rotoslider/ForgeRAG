@@ -365,6 +365,7 @@ function DocEditPanel({ doc }: { doc: DocumentRow; onDone: () => void }) {
   const currentCol = doc.collection || "default";
 
   const [col, setCol] = useState(currentCol);
+  const [creatingCol, setCreatingCol] = useState(false);
   const [newCol, setNewCol] = useState("");
   const [newTag, setNewTag] = useState("");
   const [newCat, setNewCat] = useState("");
@@ -378,10 +379,12 @@ function DocEditPanel({ doc }: { doc: DocumentRow; onDone: () => void }) {
   };
 
   const doMove = async () => {
-    const target = newCol.trim() || col;
-    if (target === currentCol) return;
+    const target = creatingCol ? newCol.trim() : col;
+    if (!target || target === currentCol) return;
     setBusy(true);
     await moveDocument(doc.doc_id, target);
+    setCreatingCol(false);
+    setNewCol("");
     refresh();
     setBusy(false);
   };
@@ -431,30 +434,44 @@ function DocEditPanel({ doc }: { doc: DocumentRow; onDone: () => void }) {
       <div>
         <div className="text-xs text-forge-muted mb-1 font-semibold">Collection</div>
         <div className="flex gap-1">
-          <select
-            value={newCol ? "__new__" : col}
-            onChange={(e) => {
-              if (e.target.value === "__new__") setNewCol("");
-              else { setCol(e.target.value); setNewCol(""); }
-            }}
-            className="bg-forge-panel border border-forge-edge rounded px-2 py-1 text-xs flex-1"
-          >
-            {collections.map((c) => (
-              <option key={c.collection} value={c.collection}>{c.collection}</option>
-            ))}
-            <option value="__new__">+ New...</option>
-          </select>
-          {newCol !== "" && (
-            <input
-              value={newCol}
-              onChange={(e) => setNewCol(e.target.value.replace(/\s+/g, "_").toLowerCase())}
-              placeholder="name"
-              className="bg-forge-panel border border-forge-edge rounded px-2 py-1 text-xs w-28"
-            />
+          {!creatingCol ? (
+            <select
+              value={col}
+              onChange={(e) => {
+                if (e.target.value === "__new__") {
+                  setCreatingCol(true);
+                  setNewCol("");
+                } else {
+                  setCol(e.target.value);
+                }
+              }}
+              className="bg-forge-panel border border-forge-edge rounded px-2 py-1 text-xs flex-1"
+            >
+              {collections.map((c) => (
+                <option key={c.collection} value={c.collection}>{c.collection}</option>
+              ))}
+              <option value="__new__">+ New collection...</option>
+            </select>
+          ) : (
+            <div className="flex gap-1 flex-1">
+              <input
+                value={newCol}
+                onChange={(e) => setNewCol(e.target.value.replace(/\s+/g, "_").toLowerCase())}
+                placeholder="collection_name"
+                className="bg-forge-panel border border-forge-edge rounded px-2 py-1 text-xs flex-1"
+                autoFocus
+              />
+              <button
+                onClick={() => { setCreatingCol(false); setNewCol(""); }}
+                className="text-xs text-forge-muted hover:text-forge-fg"
+              >
+                cancel
+              </button>
+            </div>
           )}
           <button
             onClick={doMove}
-            disabled={busy || ((newCol.trim() || col) === currentCol)}
+            disabled={busy || (creatingCol ? !newCol.trim() : col === currentCol)}
             className="text-xs bg-forge-primary/20 text-forge-primary border border-forge-primary/30 rounded px-2 py-1 hover:bg-forge-primary/30 disabled:opacity-30"
           >
             move
