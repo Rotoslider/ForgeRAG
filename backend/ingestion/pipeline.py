@@ -51,6 +51,30 @@ async def _sha256_file(path: Path) -> str:
     return await asyncio.to_thread(_hash)
 
 
+def _is_blank_page(image_path: Path, text_char_count: int) -> bool:
+    """True if a page appears visually blank with no meaningful text.
+
+    Pages with more than a trivial amount of extracted text are never blank.
+    For short-text pages, we load the (small) reduced JPG and check grayscale
+    std-dev — a uniformly white page has stddev near 0. Threshold 5.0 accepts
+    page-number footers but rejects truly empty pages.
+
+    Returns False on any load error — we'd rather embed a page than silently
+    lose content to a misbehaving image file.
+    """
+    if text_char_count > 20:
+        return False
+    try:
+        from PIL import Image, ImageStat
+        with Image.open(image_path) as img:
+            stat = ImageStat.Stat(img.convert("L"))
+            stddev = stat.stddev[0]
+        return stddev < 5.0
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("blank-page check failed for %s: %s", image_path, exc)
+        return False
+
+
 class IngestionPipeline:
     """Orchestrates PDF ingestion. One instance per app, shared across jobs."""
 
@@ -197,6 +221,53 @@ class IngestionPipeline:
             logger.exception("Extraction-only job %s failed", job_id)
             await self.jobs.fail(job_id, str(exc))
 
+    async def _backfill_blank_flags(self, doc_id: str, file_hash: str) -> int:
+        """Compute and store is_blank on any Page that doesn't have it yet.
+
+        Used before re-embed so existing docs (ingested before the blank-page
+        filter existed) can have their blank pages skipped on re-processing.
+        Only touches pages where is_blank IS NULL — never overwrites an
+        already-computed value.
+        """
+        rows = await self.neo4j.run_query(
+            """
+            MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
+            WHERE p.is_blank IS NULL
+            RETURN p.page_id AS page_id,
+                   p.page_number AS page_number,
+                   p.text_char_count AS text_char_count
+            """,
+            {"doc_id": doc_id},
+        )
+        if not rows:
+            return 0
+
+        def _compute_batch() -> list[dict]:
+            out = []
+            for r in rows:
+                reduced = self.pdf_processor.reduced_image_path(
+                    file_hash, r["page_number"]
+                )
+                blank = _is_blank_page(reduced, r["text_char_count"] or 0)
+                out.append({"page_id": r["page_id"], "is_blank": blank})
+            return out
+
+        payload = await asyncio.to_thread(_compute_batch)
+        await self.neo4j.run_write(
+            """
+            UNWIND $rows AS row
+            MATCH (p:Page {page_id: row.page_id})
+            SET p.is_blank = row.is_blank
+            """,
+            {"rows": payload},
+        )
+        flagged = sum(1 for r in payload if r["is_blank"])
+        logger.info(
+            "Backfilled is_blank on %d pages of doc %s (%d flagged blank)",
+            len(payload), doc_id, flagged,
+        )
+        return flagged
+
     async def run_embeddings_only(self, job_id: str, doc_id: str) -> None:
         """Re-run the embedding steps for an already-ingested document.
 
@@ -229,6 +300,10 @@ class IngestionPipeline:
                 {"doc_id": doc_id},
             )
             logger.info("Cleared existing visual embeddings for doc %s", doc_id)
+
+            # Ensure is_blank is populated before re-embedding so we don't
+            # waste GPU cycles on pages that are visually empty.
+            await self._backfill_blank_flags(doc_id, file_hash)
 
             if self.text_embedding is not None:
                 await self.jobs.update(
@@ -384,14 +459,18 @@ class IngestionPipeline:
         title = doc_rows[0]["title"] or ""
         filename = doc_rows[0]["filename"] or ""
 
-        # Get text from first meaningful pages (skip very short ones like covers)
+        # Get text from first meaningful pages. The >500 char threshold skips
+        # covers, blank frontmatter, and dense-but-uninformative TOC pages; the
+        # LIMIT 10 widens the window so books with long front-matter (preface
+        # starting past page 10) still reach real body text for tagging.
         page_rows = await self.neo4j.run_query(
             """
             MATCH (d:Document {doc_id: $id})-[:HAS_PAGE]->(p:Page)
-            WHERE p.text_char_count > 200
+            WHERE p.text_char_count > 500
+              AND (p.is_blank IS NULL OR p.is_blank = false)
             RETURN p.extracted_text AS text
             ORDER BY p.page_number
-            LIMIT 5
+            LIMIT 10
             """,
             {"id": doc_id},
         )
@@ -479,16 +558,24 @@ class IngestionPipeline:
 
         # Batch create :Page nodes in a single transaction per document.
         # Neo4j UNWIND makes this efficient for large documents.
+        # Flag visually-blank pages so downstream visual embedding can skip them.
         now_iso = datetime.now(timezone.utc).isoformat()
         pages_params = []
+        blank_count = 0
         for p in extraction.pages:
             page_id = str(uuid.uuid4())
+            reduced_path_obj = self.pdf_processor.reduced_image_path(
+                file_hash, p.page_number
+            )
             image_path = str(
                 self.pdf_processor.page_image_path(file_hash, p.page_number)
             )
-            reduced_path = str(
-                self.pdf_processor.reduced_image_path(file_hash, p.page_number)
+            reduced_path = str(reduced_path_obj)
+            is_blank = await asyncio.to_thread(
+                _is_blank_page, reduced_path_obj, p.char_count
             )
+            if is_blank:
+                blank_count += 1
             pages_params.append({
                 "page_id": page_id,
                 "page_number": p.page_number,
@@ -497,6 +584,7 @@ class IngestionPipeline:
                 "extracted_text": p.text,
                 "text_char_count": p.char_count,
                 "source_type": p.source_type,
+                "is_blank": is_blank,
             })
 
         if pages_params:
@@ -511,11 +599,17 @@ class IngestionPipeline:
                     reduced_image_path: page.reduced_image_path,
                     extracted_text: page.extracted_text,
                     text_char_count: page.text_char_count,
-                    source_type: page.source_type
+                    source_type: page.source_type,
+                    is_blank: page.is_blank
                 })
                 CREATE (d)-[:HAS_PAGE {page_number: page.page_number}]->(p)
                 """,
                 {"doc_id": doc_id, "pages": pages_params, "now": now_iso},
+            )
+        if blank_count:
+            logger.info(
+                "Flagged %d blank page(s) in doc %s (will skip visual embedding)",
+                blank_count, doc_id,
             )
 
         await self.jobs.update(
@@ -597,11 +691,13 @@ class IngestionPipeline:
         assert self.colpali is not None
         assert self.gpu is not None
 
-        # Find all pages that don't yet have visual embeddings
+        # Find all pages that don't yet have visual embeddings, excluding
+        # pages flagged as visually blank (no signal for ColPali/Nemotron).
         rows = await self.neo4j.run_query(
             """
             MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
-            WHERE p.colpali_vector_count IS NULL OR p.colpali_vector_count = 0
+            WHERE (p.colpali_vector_count IS NULL OR p.colpali_vector_count = 0)
+              AND (p.is_blank IS NULL OR p.is_blank = false)
             RETURN p.page_id AS page_id, p.page_number AS page_number
             ORDER BY p.page_number
             """,

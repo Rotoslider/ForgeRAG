@@ -90,17 +90,14 @@ export interface CommunityHit {
 export type HybridStrategy = "graph_boosted" | "vector_first" | "graph_first" | "community";
 
 // --- Graph ---
+export interface GraphStatLabel {
+  label: string;
+  count: number;
+}
+
 export interface GraphStats {
-  documents: number;
-  pages: number;
-  materials: number;
-  processes: number;
-  standards: number;
-  clauses: number;
-  equipment: number;
-  categories: number;
-  tags: number;
-  communities: number;
+  labels: GraphStatLabel[];
+  total: number;
 }
 
 export interface EntityRow {

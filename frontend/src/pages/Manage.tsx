@@ -34,36 +34,40 @@ export default function Manage() {
   );
 }
 
+// Naive pluralization that handles the labels currently in the graph schema.
+// Uncountable nouns are listed explicitly; the rule-based fallback covers
+// future labels well enough (Widget → Widgets, Analysis → Analyses, etc.).
+const UNCOUNTABLE = new Set(["Equipment", "Hardware", "Software"]);
+function pluralize(label: string): string {
+  if (UNCOUNTABLE.has(label)) return label;
+  if (/[^aeiou]y$/i.test(label)) return label.slice(0, -1) + "ies";
+  if (/(s|x|ch|sh|z|ss)$/i.test(label)) return label + "es";
+  if (/is$/i.test(label)) return label.slice(0, -2) + "es";
+  return label + "s";
+}
+
 function StatsCard() {
   const { data } = useQuery({
     queryKey: ["graph-stats"],
     queryFn: graphStats,
     refetchInterval: 5000,
   });
-  const s = data?.data;
-  const rows: Array<[string, number]> = s
-    ? [
-        ["Documents", s.documents],
-        ["Pages", s.pages],
-        ["Materials", s.materials],
-        ["Processes", s.processes],
-        ["Standards", s.standards],
-        ["Clauses", s.clauses],
-        ["Equipment", s.equipment],
-        ["Communities", s.communities],
-      ]
-    : [];
+  const labels = data?.data?.labels || [];
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg p-4">
       <h2 className="font-semibold mb-3">Graph Stats</h2>
-      <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
-        {rows.map(([k, v]) => (
-          <div key={k} className="flex items-baseline justify-between gap-3">
-            <span className="text-forge-muted/80">{k}</span>
-            <span className="font-mono tabular-nums">{v}</span>
-          </div>
-        ))}
-      </div>
+      {labels.length === 0 ? (
+        <div className="text-xs text-forge-muted">No nodes in the graph yet.</div>
+      ) : (
+        <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+          {labels.map(({ label, count }) => (
+            <div key={label} className="flex items-baseline justify-between gap-3">
+              <span className="text-forge-muted/80">{pluralize(label)}</span>
+              <span className="font-mono tabular-nums">{count.toLocaleString()}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

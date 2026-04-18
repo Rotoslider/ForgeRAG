@@ -277,23 +277,58 @@ async def list_communities(
     return ForgeResult(success=True, data=rows)
 
 
+_STATS_LABEL_PRIORITY = {"Document": 0, "Page": 1}
+
+
 @router.get("/stats")
 async def graph_stats(request: Request) -> ForgeResult:
-    """Summary of the knowledge graph — total counts per label."""
+    """Per-label node counts across the whole graph.
+
+    Fully dynamic — every label present in the graph appears here without
+    code changes, so new node types added by future ingestion phases show
+    up automatically. Internal labels (prefixed with `_` — Bloom, GDS, etc.)
+    are hidden, and labels with zero nodes are omitted to keep the UI clean.
+
+    Returned shape:
+        {
+          "labels": [{"label": "Document", "count": 12}, ...],
+          "total": <sum of all counts>
+        }
+    Document and Page are pinned to the top since they're structural;
+    everything else is sorted by count descending, tie-broken by label.
+    """
     neo4j = request.app.state.neo4j
-    rows = await neo4j.run_query(
-        """
-        OPTIONAL MATCH (d:Document) WITH count(d) AS documents
-        OPTIONAL MATCH (pg:Page) WITH documents, count(pg) AS pages
-        OPTIONAL MATCH (m:Material) WITH documents, pages, count(m) AS materials
-        OPTIONAL MATCH (pr:Process) WITH documents, pages, materials, count(pr) AS processes
-        OPTIONAL MATCH (s:Standard) WITH documents, pages, materials, processes, count(s) AS standards
-        OPTIONAL MATCH (c:Clause) WITH documents, pages, materials, processes, standards, count(c) AS clauses
-        OPTIONAL MATCH (e:Equipment) WITH documents, pages, materials, processes, standards, clauses, count(e) AS equipment
-        OPTIONAL MATCH (cat:Category) WITH documents, pages, materials, processes, standards, clauses, equipment, count(cat) AS categories
-        OPTIONAL MATCH (t:Tag) WITH documents, pages, materials, processes, standards, clauses, equipment, categories, count(t) AS tags
-        OPTIONAL MATCH (com:Community)
-        RETURN documents, pages, materials, processes, standards, clauses, equipment, categories, tags, count(com) AS communities
-        """
+
+    # db.labels() returns every label currently present in the schema, even
+    # ones with zero nodes — we filter to non-empty below via a per-label
+    # count. Each per-label query is cheap: Neo4j maintains label-indexed
+    # counts, so MATCH (n:Label) RETURN count(n) is a metadata lookup.
+    label_rows = await neo4j.run_query(
+        "CALL db.labels() YIELD label RETURN label"
     )
-    return ForgeResult(success=True, data=rows[0] if rows else {})
+    labels = [
+        r["label"] for r in label_rows
+        if r["label"] and not r["label"].startswith("_")
+    ]
+
+    results: list[dict] = []
+    for label in labels:
+        # `label` is sourced from db.labels() and vetted above, so it's
+        # safe to interpolate inside backticks. We never accept a label
+        # value from user input here.
+        count_rows = await neo4j.run_query(
+            f"MATCH (n:`{label}`) RETURN count(n) AS c"
+        )
+        c = count_rows[0]["c"] if count_rows else 0
+        if c > 0:
+            results.append({"label": label, "count": int(c)})
+
+    results.sort(
+        key=lambda r: (
+            _STATS_LABEL_PRIORITY.get(r["label"], 10),
+            -r["count"],
+            r["label"],
+        )
+    )
+    total = sum(r["count"] for r in results)
+    return ForgeResult(success=True, data={"labels": results, "total": total})

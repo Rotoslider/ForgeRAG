@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   listCategories,
@@ -31,28 +31,79 @@ function UploadForm() {
   const { data: tagsResp } = useQuery({ queryKey: ["tags"], queryFn: listTags });
   const { data: collectionsResp } = useQuery({ queryKey: ["collections"], queryFn: listCollections });
 
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [collection, setCollection] = useState("default");
   const [newCollection, setNewCollection] = useState("");
   const [selectedCats, setSelectedCats] = useState<string[]>([]);
   const [selectedTags, setSelectedTags] = useState<string[]>([]);
   const [newTag, setNewTag] = useState("");
+  const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(null);
+  const [uploadErrors, setUploadErrors] = useState<Array<{ name: string; reason: string }>>([]);
+
+  const folderInputRef = useRef<HTMLInputElement | null>(null);
 
   const collections = collectionsResp?.data || [];
 
+  const dedupByName = (current: File[], incoming: File[]): File[] => {
+    const seen = new Set(current.map((f) => `${f.name}|${f.size}`));
+    const merged = [...current];
+    for (const f of incoming) {
+      const key = `${f.name}|${f.size}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        merged.push(f);
+      }
+    }
+    return merged;
+  };
+
+  const addFiles = (incoming: FileList | null) => {
+    if (!incoming || incoming.length === 0) return;
+    const pdfs = Array.from(incoming).filter((f) =>
+      f.name.toLowerCase().endsWith(".pdf")
+    );
+    if (pdfs.length === 0) return;
+    setFiles((prev) => dedupByName(prev, pdfs));
+  };
+
+  const removeFile = (idx: number) => {
+    setFiles((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  // Sequential upload: one POST at a time so we can show per-file progress
+  // and avoid firing N concurrent file-upload streams from the browser.
+  // The backend starts each pipeline as a background task, so server-side
+  // processing can still overlap — serialization here is just for upload I/O.
   const upload = useMutation({
     mutationFn: async () => {
-      if (!file) throw new Error("Select a PDF first");
+      if (files.length === 0) throw new Error("Select at least one PDF first");
       const col = newCollection.trim() || collection;
-      const res = await uploadPdf(file, col, selectedCats, selectedTags);
-      if (!res.success) throw new Error(res.reason || "Upload failed");
-      return res.data!;
+      const errors: Array<{ name: string; reason: string }> = [];
+      setUploadErrors([]);
+      setUploadProgress({ done: 0, total: files.length });
+      for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        try {
+          const res = await uploadPdf(f, col, selectedCats, selectedTags);
+          if (!res.success) {
+            errors.push({ name: f.name, reason: res.reason || "upload failed" });
+          }
+        } catch (e) {
+          errors.push({ name: f.name, reason: (e as Error).message });
+        }
+        setUploadProgress({ done: i + 1, total: files.length });
+        // Refresh jobs list so queued items appear as they go
+        qc.invalidateQueries({ queryKey: ["jobs"] });
+      }
+      setUploadErrors(errors);
+      return { queued: files.length - errors.length, failed: errors.length };
     },
     onSuccess: () => {
-      setFile(null);
+      setFiles([]);
       setSelectedCats([]);
       setSelectedTags([]);
       setNewCollection("");
+      if (folderInputRef.current) folderInputRef.current.value = "";
       qc.invalidateQueries({ queryKey: ["jobs"] });
       qc.invalidateQueries({ queryKey: ["collections"] });
     },
@@ -63,17 +114,81 @@ function UploadForm() {
 
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg p-5 mb-8">
-      <h2 className="font-semibold mb-3">Upload PDF</h2>
+      <h2 className="font-semibold mb-3">Upload PDFs</h2>
 
       <div className="grid md:grid-cols-2 gap-4 mb-4">
         <div>
-          <label className="block text-xs text-forge-muted mb-1">File</label>
-          <input
-            type="file"
-            accept="application/pdf"
-            onChange={(e) => setFile(e.target.files?.[0] || null)}
-            className="block w-full text-sm"
-          />
+          <label className="block text-xs text-forge-muted mb-1">
+            Files ({files.length} selected)
+          </label>
+          <div className="flex flex-wrap gap-2 mb-2">
+            <label className="text-xs border border-forge-edge rounded px-3 py-1.5 cursor-pointer hover:bg-forge-edge">
+              Add files…
+              <input
+                type="file"
+                accept="application/pdf"
+                multiple
+                onChange={(e) => {
+                  addFiles(e.target.files);
+                  e.target.value = "";
+                }}
+                className="hidden"
+              />
+            </label>
+            <label className="text-xs border border-forge-edge rounded px-3 py-1.5 cursor-pointer hover:bg-forge-edge">
+              Add folder…
+              <input
+                ref={(el) => {
+                  folderInputRef.current = el;
+                  if (el) {
+                    // webkitdirectory isn't in the standard React types but is
+                    // the supported Chromium/Safari way to pick a directory.
+                    el.setAttribute("webkitdirectory", "");
+                    el.setAttribute("directory", "");
+                  }
+                }}
+                type="file"
+                multiple
+                onChange={(e) => {
+                  addFiles(e.target.files);
+                  e.target.value = "";
+                }}
+                className="hidden"
+              />
+            </label>
+            {files.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setFiles([])}
+                className="text-xs text-forge-muted hover:text-forge-danger"
+              >
+                clear
+              </button>
+            )}
+          </div>
+          {files.length > 0 && (
+            <div className="max-h-32 overflow-y-auto border border-forge-edge rounded bg-forge-bg">
+              {files.map((f, i) => (
+                <div
+                  key={`${f.name}-${f.size}-${i}`}
+                  className="flex items-center gap-2 px-2 py-1 text-xs border-b border-forge-edge last:border-b-0"
+                >
+                  <span className="flex-1 truncate font-mono">{f.name}</span>
+                  <span className="text-forge-muted tabular-nums">
+                    {(f.size / 1e6).toFixed(1)} MB
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => removeFile(i)}
+                    className="text-forge-muted hover:text-forge-danger"
+                    title="remove"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
         <div>
           <label className="block text-xs text-forge-muted mb-1">Collection</label>
@@ -199,13 +314,19 @@ function UploadForm() {
         </div>
       </div>
 
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-3 flex-wrap">
         <button
           onClick={() => upload.mutate()}
-          disabled={!file || upload.isPending}
+          disabled={files.length === 0 || upload.isPending}
           className="bg-forge-accent text-black font-semibold rounded px-4 py-2 hover:brightness-110 disabled:opacity-50"
         >
-          {upload.isPending ? "Uploading…" : "Start Ingestion"}
+          {upload.isPending
+            ? uploadProgress
+              ? `Uploading ${uploadProgress.done}/${uploadProgress.total}…`
+              : "Uploading…"
+            : files.length > 1
+            ? `Start Ingestion (${files.length} files)`
+            : "Start Ingestion"}
         </button>
         {upload.isError && (
           <span className="text-rose-400 text-sm">
@@ -214,10 +335,20 @@ function UploadForm() {
         )}
         {upload.isSuccess && upload.data && (
           <span className="text-emerald-400 text-sm">
-            Queued: {upload.data.filename} (job {upload.data.job_id.slice(0, 8)}…)
+            Queued {upload.data.queued} file(s)
+            {upload.data.failed > 0 ? ` · ${upload.data.failed} failed` : ""}
           </span>
         )}
       </div>
+      {uploadErrors.length > 0 && (
+        <div className="mt-3 text-xs text-rose-400 space-y-1">
+          {uploadErrors.map((e) => (
+            <div key={e.name} className="font-mono">
+              ✗ {e.name}: {e.reason}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
