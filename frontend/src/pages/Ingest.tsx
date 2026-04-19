@@ -1,13 +1,18 @@
 import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  checkDuplicates,
   listCategories,
   listCollections,
   listTags,
   listJobs,
+  sha256File,
   uploadPdf,
 } from "../api/client";
+import type { DuplicateInfo } from "../api/client";
 import type { JobRow } from "../api/types";
+
+const fileKey = (f: File) => `${f.name}|${f.size}`;
 
 export default function Ingest() {
   return (
@@ -39,6 +44,16 @@ function UploadForm() {
   const [newTag, setNewTag] = useState("");
   const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(null);
   const [uploadErrors, setUploadErrors] = useState<Array<{ name: string; reason: string }>>([]);
+
+  // Duplicate-check gate: when set, the user has selected files that include
+  // PDFs whose SHA-256 already matches an existing :Document. We surface those
+  // matches and let the user choose per-file: skip (default) or re-ingest.
+  const [dupGate, setDupGate] = useState<{
+    duplicates: Map<string, DuplicateInfo>; // fileKey -> existing doc info
+    decisions: Map<string, "skip" | "force">; // fileKey -> action
+  } | null>(null);
+  const [hashing, setHashing] = useState<{ done: number; total: number } | null>(null);
+  const [precheckError, setPrecheckError] = useState<string | null>(null);
 
   const folderInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -75,14 +90,14 @@ function UploadForm() {
   // The backend starts each pipeline as a background task, so server-side
   // processing can still overlap — serialization here is just for upload I/O.
   const upload = useMutation({
-    mutationFn: async () => {
-      if (files.length === 0) throw new Error("Select at least one PDF first");
+    mutationFn: async (filesToUpload: File[]) => {
+      if (filesToUpload.length === 0) throw new Error("Select at least one PDF first");
       const col = newCollection.trim() || collection;
       const errors: Array<{ name: string; reason: string }> = [];
       setUploadErrors([]);
-      setUploadProgress({ done: 0, total: files.length });
-      for (let i = 0; i < files.length; i++) {
-        const f = files[i];
+      setUploadProgress({ done: 0, total: filesToUpload.length });
+      for (let i = 0; i < filesToUpload.length; i++) {
+        const f = filesToUpload[i];
         try {
           const res = await uploadPdf(f, col, selectedCats, selectedTags);
           if (!res.success) {
@@ -91,12 +106,12 @@ function UploadForm() {
         } catch (e) {
           errors.push({ name: f.name, reason: (e as Error).message });
         }
-        setUploadProgress({ done: i + 1, total: files.length });
+        setUploadProgress({ done: i + 1, total: filesToUpload.length });
         // Refresh jobs list so queued items appear as they go
         qc.invalidateQueries({ queryKey: ["jobs"] });
       }
       setUploadErrors(errors);
-      return { queued: files.length - errors.length, failed: errors.length };
+      return { queued: filesToUpload.length - errors.length, failed: errors.length };
     },
     onSuccess: () => {
       setFiles([]);
@@ -108,6 +123,65 @@ function UploadForm() {
       qc.invalidateQueries({ queryKey: ["collections"] });
     },
   });
+
+  // Hash all selected files, ask the backend which already exist. If any do,
+  // open the gate; otherwise upload everything immediately.
+  const startIngest = async () => {
+    if (files.length === 0 || upload.isPending || hashing) return;
+    setPrecheckError(null);
+    setHashing({ done: 0, total: files.length });
+    try {
+      const hashes: string[] = [];
+      for (let i = 0; i < files.length; i++) {
+        hashes.push(await sha256File(files[i]));
+        setHashing({ done: i + 1, total: files.length });
+      }
+      const res = await checkDuplicates(hashes);
+      if (!res.success) {
+        setPrecheckError(res.reason || "duplicate check failed");
+        return;
+      }
+      const dupes = res.data?.duplicates || {};
+      if (Object.keys(dupes).length === 0) {
+        upload.mutate(files);
+        return;
+      }
+      const duplicates = new Map<string, DuplicateInfo>();
+      const decisions = new Map<string, "skip" | "force">();
+      files.forEach((f, i) => {
+        const info = dupes[hashes[i]];
+        if (info) {
+          const k = fileKey(f);
+          duplicates.set(k, info);
+          decisions.set(k, "skip");
+        }
+      });
+      setDupGate({ duplicates, decisions });
+    } catch (e) {
+      setPrecheckError((e as Error).message);
+    } finally {
+      setHashing(null);
+    }
+  };
+
+  const confirmDupGate = () => {
+    if (!dupGate) return;
+    const filtered = files.filter((f) => {
+      const k = fileKey(f);
+      if (!dupGate.duplicates.has(k)) return true;
+      return dupGate.decisions.get(k) === "force";
+    });
+    setDupGate(null);
+    if (filtered.length === 0) return;
+    upload.mutate(filtered);
+  };
+
+  const setDupDecision = (key: string, action: "skip" | "force") => {
+    if (!dupGate) return;
+    const next = new Map(dupGate.decisions);
+    next.set(key, action);
+    setDupGate({ ...dupGate, decisions: next });
+  };
 
   const categories = catsResp?.data || [];
   const tags = tagsResp?.data || [];
@@ -314,13 +388,26 @@ function UploadForm() {
         </div>
       </div>
 
+      {dupGate && (
+        <DuplicateGate
+          files={files}
+          duplicates={dupGate.duplicates}
+          decisions={dupGate.decisions}
+          onChange={setDupDecision}
+          onConfirm={confirmDupGate}
+          onCancel={() => setDupGate(null)}
+        />
+      )}
+
       <div className="flex items-center gap-3 flex-wrap">
         <button
-          onClick={() => upload.mutate()}
-          disabled={files.length === 0 || upload.isPending}
+          onClick={startIngest}
+          disabled={files.length === 0 || upload.isPending || hashing !== null || dupGate !== null}
           className="bg-forge-accent text-black font-semibold rounded px-4 py-2 hover:brightness-110 disabled:opacity-50"
         >
-          {upload.isPending
+          {hashing
+            ? `Checking ${hashing.done}/${hashing.total}…`
+            : upload.isPending
             ? uploadProgress
               ? `Uploading ${uploadProgress.done}/${uploadProgress.total}…`
               : "Uploading…"
@@ -328,6 +415,9 @@ function UploadForm() {
             ? `Start Ingestion (${files.length} files)`
             : "Start Ingestion"}
         </button>
+        {precheckError && (
+          <span className="text-rose-400 text-sm">{precheckError}</span>
+        )}
         {upload.isError && (
           <span className="text-rose-400 text-sm">
             {(upload.error as Error).message}
@@ -349,6 +439,92 @@ function UploadForm() {
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function DuplicateGate({
+  files,
+  duplicates,
+  decisions,
+  onChange,
+  onConfirm,
+  onCancel,
+}: {
+  files: File[];
+  duplicates: Map<string, DuplicateInfo>;
+  decisions: Map<string, "skip" | "force">;
+  onChange: (key: string, action: "skip" | "force") => void;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const dupFiles = files.filter((f) => duplicates.has(fileKey(f)));
+  const newCount = files.length - dupFiles.length;
+  const forceCount = Array.from(decisions.values()).filter((d) => d === "force").length;
+  const willUpload = newCount + forceCount;
+
+  return (
+    <div className="border border-amber-500/60 bg-amber-500/10 rounded p-4 mb-4">
+      <div className="font-semibold text-amber-300 mb-2">
+        {dupFiles.length} of {files.length} file(s) already in the database
+      </div>
+      <p className="text-xs text-forge-muted mb-3">
+        These PDFs match an existing document by SHA-256. Re-ingesting reuses
+        the existing doc_id but re-runs embeddings and entity extraction.
+      </p>
+      <div className="space-y-2 mb-3 max-h-64 overflow-y-auto">
+        {dupFiles.map((f) => {
+          const k = fileKey(f);
+          const info = duplicates.get(k)!;
+          const action = decisions.get(k) || "skip";
+          return (
+            <div key={k} className="bg-forge-bg border border-forge-edge rounded p-2 text-xs">
+              <div className="font-mono truncate mb-1">{f.name}</div>
+              <div className="text-forge-muted mb-2">
+                already ingested as <span className="text-forge-fg">{info.title}</span>
+                {" · "}{info.page_count} pages · collection: {info.collection}
+              </div>
+              <div className="flex gap-3">
+                <label className="flex items-center gap-1 cursor-pointer">
+                  <input
+                    type="radio"
+                    name={`dup-${k}`}
+                    checked={action === "skip"}
+                    onChange={() => onChange(k, "skip")}
+                  />
+                  <span>Skip</span>
+                </label>
+                <label className="flex items-center gap-1 cursor-pointer">
+                  <input
+                    type="radio"
+                    name={`dup-${k}`}
+                    checked={action === "force"}
+                    onChange={() => onChange(k, "force")}
+                  />
+                  <span>Re-ingest anyway</span>
+                </label>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      <div className="flex gap-2">
+        <button
+          onClick={onConfirm}
+          disabled={willUpload === 0}
+          className="bg-forge-accent text-black font-semibold rounded px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50"
+        >
+          {willUpload === 0
+            ? "Nothing to upload"
+            : `Continue with ${willUpload} file${willUpload === 1 ? "" : "s"}`}
+        </button>
+        <button
+          onClick={onCancel}
+          className="border border-forge-edge rounded px-3 py-1.5 text-sm hover:bg-forge-edge"
+        >
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }

@@ -111,6 +111,30 @@ export const removeDocumentTag = (docId: string, tag: string) =>
     { method: "DELETE" }
   );
 
+export interface DuplicateInfo {
+  file_hash: string;
+  doc_id: string;
+  title: string;
+  filename: string;
+  collection: string;
+  page_count: number;
+  ingested_at: string;
+}
+
+export async function sha256File(file: File): Promise<string> {
+  const buf = await file.arrayBuffer();
+  const digest = await crypto.subtle.digest("SHA-256", buf);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+export const checkDuplicates = (hashes: string[]) =>
+  request<{ duplicates: Record<string, DuplicateInfo> }>(
+    "/ingest/check-duplicates",
+    { method: "POST", body: JSON.stringify({ hashes }) }
+  );
+
 export async function uploadPdf(
   file: File,
   collection: string,

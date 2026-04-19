@@ -9,8 +9,13 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
+from pydantic import BaseModel
 
 from backend.models.common import ForgeResult
+
+
+class DuplicateCheckRequest(BaseModel):
+    hashes: list[str]
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +88,34 @@ async def start_ingestion(
         success=True,
         data={"job_id": job.job_id, "status": job.status, "filename": file.filename},
     )
+
+
+@router.post("/check-duplicates")
+async def check_duplicates(body: DuplicateCheckRequest, request: Request) -> ForgeResult:
+    """Look up which of the given SHA-256 hashes already exist as :Document.
+
+    Frontend hashes selected files in the browser and calls this before upload
+    so the user can choose to skip or re-ingest. Hashes not present in the
+    response are not duplicates.
+    """
+    if not body.hashes:
+        return ForgeResult(success=True, data={"duplicates": {}})
+    neo4j = request.app.state.neo4j
+    rows = await neo4j.run_query(
+        """
+        MATCH (d:Document) WHERE d.file_hash IN $hashes
+        RETURN d.file_hash AS file_hash,
+               d.doc_id AS doc_id,
+               d.title AS title,
+               d.filename AS filename,
+               coalesce(d.collection, 'default') AS collection,
+               d.page_count AS page_count,
+               toString(d.ingested_at) AS ingested_at
+        """,
+        {"hashes": body.hashes},
+    )
+    duplicates = {r["file_hash"]: r for r in rows}
+    return ForgeResult(success=True, data={"duplicates": duplicates})
 
 
 @router.get("/jobs/{job_id}")
