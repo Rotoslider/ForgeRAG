@@ -87,7 +87,7 @@ export interface CommunityHit {
   sample_pages: Array<{ doc_id: string; title: string; page_number: number; file_hash: string }>;
 }
 
-export type HybridStrategy = "graph_boosted" | "vector_first" | "graph_first" | "community";
+export type HybridStrategy = "rrf" | "graph_boosted" | "vector_first" | "graph_first" | "community";
 
 // --- Graph ---
 export interface GraphStatLabel {

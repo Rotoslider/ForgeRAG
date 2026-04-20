@@ -17,7 +17,7 @@ type Mode = "semantic" | "keyword" | "visual" | "hybrid" | "answer";
 export default function Search() {
   const [query, setQuery] = useState("");
   const [mode, setMode] = useState<Mode>("answer");
-  const [strategy, setStrategy] = useState<HybridStrategy>("graph_boosted");
+  const [strategy, setStrategy] = useState<HybridStrategy>("rrf");
   const [limit, setLimit] = useState(10);
   const [expanded, setExpanded] = useState<string | null>(null);
 
@@ -108,6 +108,7 @@ export default function Search() {
               onChange={(e) => setStrategy(e.target.value as HybridStrategy)}
               className="bg-forge-panel border border-forge-edge rounded px-2 py-2"
             >
+              <option value="rrf">rrf (BM25 + dense + reranker)</option>
               <option value="graph_boosted">graph_boosted</option>
               <option value="vector_first">vector_first</option>
               <option value="graph_first">graph_first</option>

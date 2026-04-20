@@ -82,13 +82,21 @@ async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeR
     neo4j = request.app.state.neo4j
 
     # Try the full-text index first (scales to 100K+ pages).
-    # Wrap in double quotes for Lucene phrase matching — "ASTM A 709"
-    # matches as a phrase, not as three individual words (which would
-    # return every page mentioning "A" or "709" separately).
-    try:
-        # Escape any existing quotes in the query
-        escaped = body.query.replace('"', '\\"')
+    # Build a Lucene query that starts with a boosted phrase match and
+    # falls back to OR-of-terms. This catches exact-hit cases like
+    # "ASTM A 709" while still returning pages that share most of the
+    # query's tokens (e.g., "wire gauge for a 20 amp circuit" no longer
+    # gets zero results just because the full string isn't in any doc).
+    escaped = body.query.replace('"', '\\"')
+    tokens = [t for t in body.query.split() if t]
+    escaped_tokens = [t.replace('"', '\\"') for t in tokens if len(t) >= 2]
+    # Phrase match ^4 (higher weight) OR any-of-terms
+    if escaped_tokens:
+        or_clause = " OR ".join(escaped_tokens)
+        phrase_query = f'"{escaped}"^4 OR ({or_clause})'
+    else:
         phrase_query = f'"{escaped}"'
+    try:
         rows = await neo4j.run_query(
             """
             CALL db.index.fulltext.queryNodes('page_text_fulltext', $q)
@@ -554,12 +562,15 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
 
 @router.post("/semantic")
 async def semantic_search(body: SemanticSearchRequest, request: Request) -> ForgeResult:
-    """Semantic text search via Neo4j vector index on Page.text_embedding.
+    """Semantic text search via the chunk vector index.
 
-    Uses nomic-embed-text to embed the query, then Neo4j's native vector
-    similarity search (cosine) to find top-K pages. Applies category/tag
-    filters as a second pass (after vector search) since Neo4j's procedure
-    doesn't combine them directly.
+    Queries chunk_embedding (BGE-M3 1024-dim) and dedupes to unique
+    pages. Falls back to page_text_embedding only if the chunk index
+    returns nothing — useful for docs that haven't been rebuilt into
+    chunks yet (though those also need 1024-dim page embeddings for
+    the fallback to work; currently page embeddings are stale 768-dim,
+    so the fallback is a no-op until we rerun text embedding on all
+    pages — the rebuild_chunks script populates chunks but not pages).
     """
     text_emb = getattr(request.app.state, "text_embedding", None)
     neo4j = request.app.state.neo4j
@@ -570,26 +581,32 @@ async def semantic_search(body: SemanticSearchRequest, request: Request) -> Forg
     async with gpu.load_scope("text_embedding"):
         query_vec = await asyncio.to_thread(text_emb.embed_query, body.query)
 
-    # Over-fetch from the vector index so we can apply filters without
-    # falling short of the requested limit.
-    topk = max(body.limit * 3, body.limit)
+    # Over-fetch from the vector index so dedupe-to-page filtering still
+    # leaves us with enough results.
+    topk = max(body.limit * 5, 20)
 
     filter_where, filter_params = _filter_clauses(body.filters)
     where = f" WHERE {filter_where}" if filter_where else ""
 
+    # Primary: chunk vector search, grouped by page (best chunk wins)
     cypher = f"""
-        CALL db.index.vector.queryNodes('page_text_embedding', $topk, $query_vec)
-        YIELD node AS p, score
+        CALL db.index.vector.queryNodes('chunk_embedding', $topk, $query_vec)
+        YIELD node AS c, score
+        MATCH (p:Page)-[:HAS_CHUNK]->(c)
         MATCH (d:Document)-[:HAS_PAGE]->(p){where}
+        WITH p, d, max(score) AS score,
+             collect(c)[0] AS best_chunk
         RETURN p.page_id AS page_id,
                p.page_number AS page_number,
                p.extracted_text AS extracted_text,
+               best_chunk.summary AS summary,
+               best_chunk.chunk_type AS chunk_type,
                d.doc_id AS doc_id,
                d.title AS document_title,
                d.filename AS filename,
                d.file_hash AS file_hash,
                score AS score,
-               [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
+               [(d)-[:IN_CATEGORY]->(c2) | c2.name] AS categories,
                [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
         ORDER BY score DESC
         LIMIT $limit
@@ -601,6 +618,9 @@ async def semantic_search(body: SemanticSearchRequest, request: Request) -> Forg
 
     hits = []
     for r in rows:
+        # Prefer chunk summary as snippet if available (more precise),
+        # else fall back to extracted page text.
+        snippet_source = r.get("summary") or r.get("extracted_text")
         hits.append({
             "page_id": r["page_id"],
             "doc_id": r["doc_id"],
@@ -608,7 +628,9 @@ async def semantic_search(body: SemanticSearchRequest, request: Request) -> Forg
             "filename": r["filename"],
             "page_number": r["page_number"],
             "score": float(r["score"]),
-            "text_snippet": _snippet(r["extracted_text"]),
+            "text_snippet": _snippet(snippet_source),
+            "summary": r.get("summary"),
+            "chunk_type": r.get("chunk_type"),
             "image_url": f"/images/{r['file_hash']}/{r['page_number']}",
             "reduced_image_url": f"/images/{r['file_hash']}/{r['page_number']}/reduced",
             "categories": r["categories"],
@@ -637,7 +659,10 @@ async def visual_search(body: VisualSearchRequest, request: Request) -> ForgeRes
     if colpali is None:
         raise HTTPException(503, "ColPali service not available")
 
-    # Stage 1: coarse candidates via text vector search
+    # Stage 1: coarse candidates. Prefer the chunk vector index (populated
+    # and correct dim) so text-relevant pages surface first. Fall back to
+    # full-text BM25 if chunk search returns nothing — this way visual
+    # retrieval still finds pages in docs that haven't been chunked yet.
     async with gpu.load_scope("text_embedding"):
         tvec = await asyncio.to_thread(text_emb.embed_query, body.query)
 
@@ -645,10 +670,12 @@ async def visual_search(body: VisualSearchRequest, request: Request) -> ForgeRes
     where = f" WHERE {filter_where}" if filter_where else ""
 
     cand_cypher = f"""
-        CALL db.index.vector.queryNodes('page_text_embedding', $pool, $vec)
-        YIELD node AS p, score AS coarse_score
+        CALL db.index.vector.queryNodes('chunk_embedding', $pool, $vec)
+        YIELD node AS c, score AS coarse_score
+        MATCH (p:Page)-[:HAS_CHUNK]->(c)
         MATCH (d:Document)-[:HAS_PAGE]->(p){where}
         WHERE p.colpali_vector_count IS NOT NULL AND p.colpali_vector_count > 0
+        WITH p, d, max(coarse_score) AS coarse_score
         RETURN p.page_id AS page_id,
                p.page_number AS page_number,
                p.extracted_text AS extracted_text,
@@ -660,12 +687,53 @@ async def visual_search(body: VisualSearchRequest, request: Request) -> ForgeRes
                d.title AS document_title,
                d.filename AS filename,
                d.file_hash AS file_hash,
-               [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
+               [(d)-[:IN_CATEGORY]->(c2) | c2.name] AS categories,
                [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+        ORDER BY coarse_score DESC
+        LIMIT $pool
     """
     params = {"pool": body.candidate_pool, "vec": tvec.tolist()}
     params.update(filter_params)
     candidates = await neo4j.run_query(cand_cypher, params)
+
+    # Fallback: if no chunks matched, cast a wide net via page full-text
+    # BM25 (useful for non-chunked docs). ColPali MaxSim in stage 2 will
+    # still rank by visual similarity.
+    if not candidates:
+        terms = [t for t in body.query.split() if t]
+        ft_query = (
+            " OR ".join(t.replace('"', '\\"') for t in terms if len(t) >= 2)
+            if len(terms) > 3
+            else f'"{body.query.replace(chr(34), chr(92) + chr(34))}"'
+        )
+        fallback_cypher = f"""
+            CALL db.index.fulltext.queryNodes('page_text_fulltext', $q)
+            YIELD node AS p, score AS coarse_score
+            MATCH (d:Document)-[:HAS_PAGE]->(p){where}
+            WHERE p.colpali_vector_count IS NOT NULL AND p.colpali_vector_count > 0
+            RETURN p.page_id AS page_id,
+                   p.page_number AS page_number,
+                   p.extracted_text AS extracted_text,
+                   p.colpali_vectors AS colpali_vectors,
+                   p.colpali_vector_count AS colpali_count,
+                   p.colpali_vector_dim AS colpali_dim,
+                   coarse_score,
+                   d.doc_id AS doc_id,
+                   d.title AS document_title,
+                   d.filename AS filename,
+                   d.file_hash AS file_hash,
+                   [(d)-[:IN_CATEGORY]->(c2) | c2.name] AS categories,
+                   [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+            ORDER BY coarse_score DESC
+            LIMIT $pool
+        """
+        fallback_params = {"q": ft_query, "pool": body.candidate_pool}
+        fallback_params.update(filter_params)
+        try:
+            candidates = await neo4j.run_query(fallback_cypher, fallback_params)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Visual-search fallback BM25 failed: %s", exc)
+            candidates = []
 
     if not candidates:
         return ForgeResult(success=True, data=[])
@@ -955,14 +1023,18 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
     where = f" WHERE {filter_where}" if filter_where else ""
 
     if body.strategy == "graph_boosted":
-        # Text vector candidates, then boost score by number of entity
-        # names (or common_names / aliases) from the query appearing on the
-        # page's graph edges.
+        # Chunk vector candidates (deduped to unique pages), then boost
+        # score by number of entity names / aliases from the query
+        # appearing on the page's graph edges. Previously used the stale
+        # page_text_embedding index and returned nothing post-BGE-M3
+        # migration — rewritten to go through chunk_embedding.
         query_terms = [t.lower() for t in body.query.split() if len(t) >= 3]
 
         cypher = f"""
-            CALL db.index.vector.queryNodes('page_text_embedding', $pool, $vec)
-            YIELD node AS p, score AS base_score
+            CALL db.index.vector.queryNodes('chunk_embedding', $pool, $vec)
+            YIELD node AS c, score AS chunk_score
+            MATCH (p:Page)-[:HAS_CHUNK]->(c)
+            WITH p, max(chunk_score) AS base_score
             MATCH (d:Document)-[:HAS_PAGE]->(p){where}
             // Gather linked entity keys plus their aliases in a single list
             OPTIONAL MATCH (p)-[r]->(e)
@@ -1008,12 +1080,14 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
         return ForgeResult(success=True, data=hits)
 
     if body.strategy == "vector_first":
-        # Pure vector search, enriched with entities and community membership.
-        # Entity/community collects use list comprehensions so null results
-        # from OPTIONAL MATCH become empty lists, not [{name: null}] sentinels.
+        # Pure vector search (via chunks), enriched with entities and
+        # community membership. Chunks dedupe to unique pages; the page's
+        # best chunk score is used as the page score.
         cypher = f"""
-            CALL db.index.vector.queryNodes('page_text_embedding', $pool, $vec)
-            YIELD node AS p, score
+            CALL db.index.vector.queryNodes('chunk_embedding', $pool, $vec)
+            YIELD node AS c, score AS chunk_score
+            MATCH (p:Page)-[:HAS_CHUNK]->(c)
+            WITH p, max(chunk_score) AS score
             MATCH (d:Document)-[:HAS_PAGE]->(p){where}
             RETURN p.page_id AS page_id,
                    p.page_number AS page_number,
