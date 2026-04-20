@@ -19,6 +19,12 @@ JobStep = Literal[
     "embedding_visual",  # Phase 3 (ColPali)
     "extracting_entities",  # Phase 4
     "building_graph",    # Phase 4
+    # Phase 9 chunk pipeline
+    "building_chunks",   # umbrella step when fired during run_job
+    "chunking",          # Docling structural parse
+    "summarizing",       # per-chunk LLM summaries
+    "embedding_chunks",  # BGE-M3 embeddings over (summary + text)
+    "writing_chunks",    # MERGE Chunk nodes + HAS_CHUNK edges
     "done",
     "error",
 ]
