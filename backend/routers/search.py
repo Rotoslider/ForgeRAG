@@ -300,12 +300,19 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         )
         pages = result.data or []
 
-    # Step 1b: Graph exploration — traverse the knowledge graph for related pages
+    # Step 1b: Graph exploration — traverse the knowledge graph for related pages.
+    # Seeded from the entities actually mentioned on our top retrieval hits,
+    # not from query-term keyword matching. This prevents noise words like
+    # "wire" or "amp" in a general-English query from flooding the context
+    # with welding chains pulled in via substring collisions.
     graph_ctx = GraphContext()
+    seed_pids = [p["page_id"] for p in pages if p.get("page_id")][: body.limit]
     if body.use_graph:
         try:
             graph_ctx = await explore_from_query(
-                body.query, neo4j, max_pages=body.limit * 2
+                body.query, neo4j,
+                max_pages=body.limit * 2,
+                seed_page_ids=seed_pids if seed_pids else None,
             )
             # Add graph-discovered pages (that aren't already in search results)
             search_page_ids = {p["page_id"] for p in pages}
@@ -442,7 +449,13 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
             }
         )
 
-    # Step 3: Build graph context summary for the LLM
+    # Step 3: Build graph context summary for the LLM.
+    #
+    # Capped tightly to keep topical drift out of the prompt — a flood of
+    # tangentially-related chains (e.g. material → process → standard
+    # walks on entities that only appear once on a single retrieved page)
+    # biases the LLM more than it helps it. We show at most 5 chains and
+    # the top ~6 entities per category.
     graph_summary = ""
     if body.use_graph and (
         graph_ctx.reasoning_chains
@@ -453,16 +466,16 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         parts = ["KNOWLEDGE GRAPH CONTEXT (relationships discovered from the engineering database):"]
         if graph_ctx.reasoning_chains:
             parts.append("Relationship chains:")
-            for chain in graph_ctx.reasoning_chains[:15]:
+            for chain in graph_ctx.reasoning_chains[:5]:
                 parts.append(f"  • {chain}")
         if graph_ctx.materials:
-            mat_names = [m["name"] for m in graph_ctx.materials[:10]]
+            mat_names = [m["name"] for m in graph_ctx.materials[:6]]
             parts.append(f"Related materials: {', '.join(mat_names)}")
         if graph_ctx.processes:
-            proc_names = [p["name"] for p in graph_ctx.processes[:10]]
+            proc_names = [p["name"] for p in graph_ctx.processes[:6]]
             parts.append(f"Related processes: {', '.join(proc_names)}")
         if graph_ctx.standards:
-            std_names = [s["name"] for s in graph_ctx.standards[:10]]
+            std_names = [s["name"] for s in graph_ctx.standards[:6]]
             parts.append(f"Related standards: {', '.join(std_names)}")
         if graph_ctx.community_summaries:
             parts.append("Topic summaries:")

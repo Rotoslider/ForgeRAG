@@ -50,60 +50,118 @@ class GraphContext:
     community_summaries: list[str] = field(default_factory=list)
 
 
+# Short noise words / stopwords that produce catastrophic false matches
+# when used in a CONTAINS-style entity name query. "for" hits forging,
+# forming, formation. "amp" hits a dozen welding terms. "wire" hits
+# every filler-wire and wire-feeder entity in the welding handbooks.
+# Used only as a safety net for the legacy query-term-match fallback;
+# the preferred exploration path now seeds entities from the retrieved
+# pages rather than the query text.
+_STOPWORDS = frozenset({
+    "what", "when", "where", "which", "who", "why", "how",
+    "the", "and", "for", "with", "from", "this", "that", "these", "those",
+    "are", "was", "has", "have", "had", "can", "will", "would", "should",
+    "could", "may", "might", "does", "did", "about", "into", "over",
+    "amp", "wire", "feet", "foot",  # too noisy as bare tokens
+    "size", "type", "kind", "data", "page", "book", "text",
+    "please", "tell", "show", "give", "find", "look", "search",
+})
+
+
 async def explore_from_query(
     query: str,
     neo4j: Neo4jService,
     *,
     max_pages: int = 15,
     hop_depth: int = 2,
+    seed_page_ids: list[str] | None = None,
 ) -> GraphContext:
-    """Explore the knowledge graph starting from entities mentioned in the query.
+    """Explore the knowledge graph, starting either from entities on a set
+    of primary retrieval pages (preferred) or — as a fallback — from
+    entities whose names keyword-match query terms.
 
-    1. Find entities whose names appear in the query (keyword match)
-    2. Traverse 1-2 hops from each matched entity
-    3. Collect pages connected to discovered entities
-    4. Gather community summaries for the topic
-    5. Build human-readable reasoning chains
+    When `seed_page_ids` is provided, the exploration is GROUNDED in
+    content that has already been validated as relevant by the primary
+    retriever (RRF hybrid, keyword, or visual). This avoids the classic
+    failure mode where a multi-word English question ("what gauge wire
+    for a 20 amp circuit") keyword-matches dozens of welding entities
+    via substring collisions on "wire" / "amp" / "for" and flood-fills
+    the graph context with unrelated welding chains.
 
-    Returns a GraphContext with page IDs, entities, and reasoning chains
-    that the answer endpoint feeds into the LLM prompt.
+    Returns a GraphContext with page IDs, entities, reasoning chains,
+    and community summaries that the answer endpoint feeds into the
+    LLM prompt.
     """
     ctx = GraphContext()
-    query_lower = query.lower()
 
-    # Extract query terms (3+ chars, deduplicated)
-    terms = list({t.lower() for t in query.split() if len(t) >= 3})
-    if not terms:
-        return ctx
+    matched_entities: list[dict] = []
 
-    # Step 1: Find entities matching query terms — search each type separately
-    # so a flood of Process matches from "weld" doesn't crowd out a specific
-    # Material like "C12000". Each type gets its own LIMIT 5.
-    matched_entities = []
-    for label in ["Material", "Process", "Standard", "Equipment"]:
+    if seed_page_ids:
+        # PREFERRED PATH: entities mentioned by the primary-retrieval pages.
+        # Rank by how many seed pages mention each entity — entities
+        # appearing on multiple pages carry more signal than a one-off
+        # mention that might be tangential.
         rows = await neo4j.run_query(
-            f"""
-            MATCH (e:{label})
-            WHERE any(t IN $terms WHERE toLower(coalesce(e.name, e.code, '')) CONTAINS t)
-               OR any(alias IN coalesce(e.common_names, [])
-                      WHERE any(t IN $terms WHERE toLower(alias) CONTAINS t))
-            RETURN '{label}' AS label,
+            """
+            UNWIND $pids AS pid
+            MATCH (p:Page {page_id: pid})-[r]->(e)
+            WHERE type(r) IN ['MENTIONS_MATERIAL','DESCRIBES_PROCESS',
+                              'REFERENCES_STANDARD','MENTIONS_EQUIPMENT']
+              AND any(l IN labels(e) WHERE l IN
+                      ['Material','Process','Standard','Equipment'])
+            WITH e, count(DISTINCT p) AS page_hits
+            RETURN labels(e)[0] AS label,
                    coalesce(e.name, e.code) AS name,
-                   properties(e) AS props
-            LIMIT 5
+                   properties(e) AS props,
+                   page_hits
+            ORDER BY page_hits DESC, name
+            LIMIT 20
             """,
-            {"terms": terms},
+            {"pids": seed_page_ids[:20]},  # cap to avoid unbounded UNWIND
         )
-        matched_entities.extend(rows)
+        matched_entities = [dict(r) for r in rows]
+        logger.info(
+            "Graph exploration seeded from %d retrieved pages: "
+            "%d entities discovered",
+            len(seed_page_ids), len(matched_entities),
+        )
+    else:
+        # LEGACY FALLBACK: query-term keyword match. Kept for callers that
+        # don't pre-retrieve (direct /graph endpoints, tests). Filters
+        # stopwords and short noise tokens to limit false-positive explosion.
+        terms = list({
+            t.lower() for t in query.split()
+            if len(t) >= 4 and t.lower() not in _STOPWORDS
+        })
+        if not terms:
+            logger.debug("Query had no usable terms after stopword filtering: %s", query)
+            return ctx
+
+        for label in ["Material", "Process", "Standard", "Equipment"]:
+            rows = await neo4j.run_query(
+                f"""
+                MATCH (e:{label})
+                WHERE any(t IN $terms WHERE toLower(coalesce(e.name, e.code, '')) CONTAINS t)
+                   OR any(alias IN coalesce(e.common_names, [])
+                          WHERE any(t IN $terms WHERE toLower(alias) CONTAINS t))
+                RETURN '{label}' AS label,
+                       coalesce(e.name, e.code) AS name,
+                       properties(e) AS props
+                LIMIT 5
+                """,
+                {"terms": terms},
+            )
+            matched_entities.extend(rows)
 
     if not matched_entities:
-        logger.debug("No entities matched query terms: %s", terms)
+        logger.debug("No graph entities to explore from")
         return ctx
 
     entity_names = [e["name"] for e in matched_entities]
     logger.info(
-        "Graph exploration: %d entities matched from query: %s",
+        "Graph exploration: %d entities matched (mode=%s): %s",
         len(entity_names),
+        "seed_pages" if seed_page_ids else "query_terms",
         entity_names[:10],
     )
 
