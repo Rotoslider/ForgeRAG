@@ -575,25 +575,71 @@ function AnswerText({
     segments.push({ kind: "text", text: answer.slice(lastIdx) });
   }
 
+  // Fallback — if a citation references a page not in sources (e.g.
+  // the VLM used the printed page number instead of the physical
+  // index), still try to open SOMETHING useful. Pick the nearest page
+  // from the most-frequent source document; better than a dead
+  // plain-text citation.
+  const sourcePages = Array.from(pageMap.entries())
+    .map(([page, meta]) => ({ page, ...meta }))
+    .sort((a, b) => a.page - b.page);
+
+  function fallbackTarget(pages: number[]): { url: string; title: string; note: string } | null {
+    if (sourcePages.length === 0 || pages.length === 0) return null;
+    const want = pages[0];
+    let closest = sourcePages[0];
+    let bestDiff = Math.abs(closest.page - want);
+    for (const sp of sourcePages) {
+      const d = Math.abs(sp.page - want);
+      if (d < bestDiff) {
+        bestDiff = d;
+        closest = sp;
+      }
+    }
+    return {
+      url: closest.url,
+      title: closest.title,
+      note: `printed page ${want} — opens physical page ${closest.page} of ${closest.title}`,
+    };
+  }
+
   return (
     <div className="text-forge-fg whitespace-pre-wrap leading-relaxed">
       {segments.map((seg, i) => {
         if (seg.kind === "text") return <span key={i}>{seg.text}</span>;
         const linked = seg.pages.find((p) => pageMap.has(p));
-        if (linked === undefined) return <span key={i}>{seg.text}</span>;
-        const target = pageMap.get(linked)!;
-        return (
-          <a
-            key={i}
-            href={target.url}
-            target="_blank"
-            rel="noopener"
-            className="text-forge-accent hover:underline"
-            title={`${target.title} — open page ${linked} in viewer`}
-          >
-            {seg.text}
-          </a>
-        );
+        if (linked !== undefined) {
+          const target = pageMap.get(linked)!;
+          return (
+            <a
+              key={i}
+              href={target.url}
+              target="_blank"
+              rel="noopener"
+              className="text-forge-accent hover:underline"
+              title={`${target.title} — open page ${linked} in viewer`}
+            >
+              {seg.text}
+            </a>
+          );
+        }
+        // Fallback: approximate link to nearest source page.
+        const fb = fallbackTarget(seg.pages);
+        if (fb) {
+          return (
+            <a
+              key={i}
+              href={fb.url}
+              target="_blank"
+              rel="noopener"
+              className="text-forge-accent/70 hover:underline hover:text-forge-accent italic"
+              title={fb.note}
+            >
+              {seg.text}
+            </a>
+          );
+        }
+        return <span key={i}>{seg.text}</span>;
       })}
     </div>
   );

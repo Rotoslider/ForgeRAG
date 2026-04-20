@@ -503,10 +503,24 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         )
     question_text += (
         "Answer the question based on the source pages and graph context. "
-        "Cite page numbers inline as [Page N]. Be precise with numbers, "
-        "codes, and specifications. If you notice relevant cross-references "
-        "or related considerations (e.g., applicable standards, compatible "
-        "processes, known limitations), mention them proactively.\n\n/no_think"
+        "\n\n"
+        "CITATION RULES — CRITICAL:\n"
+        "- Each page image you see is preceded by a text label of the form "
+        "'[Source — Page N from <title>]' or '[Context (prev page) — Page N "
+        "from <title>]'. The number N in that label is the PDF's physical "
+        "page index and is what the user's page viewer uses.\n"
+        "- When citing, ALWAYS use that label's N, not the printed page "
+        "number you see in the page header or footer. The printed number is "
+        "often offset by front matter or chapter-relative numbering and does "
+        "NOT link to the viewer.\n"
+        "- Format citations as [Page N] using the label's N. Never emit "
+        "[Page 3.14] or chapter-qualified forms; use the integer from the "
+        "label.\n"
+        "\n"
+        "Be precise with numbers, codes, and specifications. If you notice "
+        "relevant cross-references or related considerations (e.g., applicable "
+        "standards, compatible processes, known limitations), mention them "
+        "proactively.\n\n/no_think"
     )
 
     messages_content.append({"type": "text", "text": question_text})
@@ -526,7 +540,11 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
             "context. When you see a relationship chain (e.g., Material → "
             "GOVERNED_BY → Standard), use it to provide comprehensive answers "
             "that connect information across different sections of the handbook. "
-            "Always cite the specific page number where you found each fact.",
+            "CITE PAGES USING ONLY THE NUMBER FROM THE [Source — Page N from "
+            "<title>] LABEL THAT INTRODUCES EACH IMAGE. Never use the printed "
+            "page number shown in the page's header or footer — that number is "
+            "often wrong for the viewer's linking because of front matter and "
+            "chapter-relative numbering.",
         },
         {"role": "user", "content": messages_content},
     ]
