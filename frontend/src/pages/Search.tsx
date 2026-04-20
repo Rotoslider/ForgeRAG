@@ -15,18 +15,47 @@ import type { AnswerResult } from "../api/client";
 
 type Mode = "semantic" | "keyword" | "visual" | "hybrid" | "answer";
 
+// localStorage keys for last-search persistence. URL params cover the
+// common case (same-tab navigation), but clicking the sidebar "Search"
+// link resets the URL to /app/search with no query — localStorage rescues
+// the last search in that case.
+const LS_QUERY = "forgerag.lastSearch.query";
+const LS_MODE = "forgerag.lastSearch.mode";
+const LS_STRATEGY = "forgerag.lastSearch.strategy";
+
+function lsGet(key: string): string | null {
+  try {
+    return window.localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+function lsSet(key: string, value: string): void {
+  try {
+    window.localStorage.setItem(key, value);
+  } catch {
+    /* storage full or disabled */
+  }
+}
+
 export default function Search() {
-  // Query, mode, and strategy are persisted in the URL so navigating
-  // away and back (or following a page-viewer link and returning) keeps
-  // the search in place. The limit slider and expanded-row state are
-  // ephemeral and stay in component state.
+  // Query, mode, and strategy are persisted in the URL (so back/forward
+  // and bookmarking work) AND in localStorage (so clicking the sidebar
+  // Search link after navigating away restores the last search even
+  // though the link URL carries no params).
   const [searchParams, setSearchParams] = useSearchParams();
-  const [query, setQuery] = useState(searchParams.get("q") || "");
+  const [query, setQuery] = useState(
+    searchParams.get("q") || lsGet(LS_QUERY) || "",
+  );
   const [mode, setMode] = useState<Mode>(
-    (searchParams.get("m") as Mode) || "answer",
+    (searchParams.get("m") as Mode) ||
+      (lsGet(LS_MODE) as Mode) ||
+      "answer",
   );
   const [strategy, setStrategy] = useState<HybridStrategy>(
-    (searchParams.get("s") as HybridStrategy) || "rrf",
+    (searchParams.get("s") as HybridStrategy) ||
+      (lsGet(LS_STRATEGY) as HybridStrategy) ||
+      "rrf",
   );
   const [limit, setLimit] = useState(10);
   const [expanded, setExpanded] = useState<string | null>(null);
@@ -81,13 +110,16 @@ export default function Search() {
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setExpanded(null);
-    // Persist current state to URL before the search fires so a mid-
-    // query navigation leaves a reproducible URL behind.
+    // Persist current state to URL (same-tab nav) AND localStorage
+    // (survives sidebar-link re-mounts).
     const next = new URLSearchParams();
     if (query.trim()) next.set("q", query.trim());
     next.set("m", mode);
     if (mode === "hybrid") next.set("s", strategy);
     setSearchParams(next, { replace: true });
+    lsSet(LS_QUERY, query.trim());
+    lsSet(LS_MODE, mode);
+    lsSet(LS_STRATEGY, strategy);
     if (mode === "answer") {
       answerMutation.mutate();
     } else {
@@ -180,9 +212,7 @@ export default function Search() {
       {mode === "answer" && answerData && (
         <div className="bg-forge-panel border border-forge-edge rounded-lg p-5 mb-6">
           <div className="text-sm font-semibold text-forge-primary mb-2">Answer</div>
-          <div className="text-forge-fg whitespace-pre-wrap leading-relaxed">
-            {answerData.answer}
-          </div>
+          <AnswerText answer={answerData.answer} sources={answerData.sources} />
           {answerData.graph_context && answerData.graph_context.reasoning_chains.length > 0 && (
             <div className="mt-4 pt-3 border-t border-forge-edge">
               <div className="text-xs text-forge-muted mb-2">
@@ -493,6 +523,82 @@ function CommunityResults({ hits }: { hits: CommunityHit[] }) {
     </div>
   );
 }
+
+// Render the VLM answer with inline [Page N] citations turned into
+// clickable anchors that open the page viewer. Matches both singular
+// "[Page 81]" and plural "[Pages 97, 252]" / "[Pages 510-519]" forms.
+// For a bracket containing multiple page numbers, we link to the first
+// one that has a matching source — the user still sees the original
+// text (e.g. "[Pages 97, 252]") so the multiple-page context isn't lost.
+function AnswerText({
+  answer,
+  sources,
+}: {
+  answer: string;
+  sources: Array<{
+    page_number: number;
+    image_url: string;
+    document_title: string;
+  }>;
+}) {
+  // Build page_number → viewer URL. First source that claims a page wins;
+  // no attempt to disambiguate cross-doc collisions (rare in practice).
+  const pageMap = new Map<number, { url: string; title: string }>();
+  for (const s of sources || []) {
+    const parts = (s.image_url || "").split("/");
+    const hash = parts[2];
+    if (hash && s.page_number != null && !pageMap.has(s.page_number)) {
+      pageMap.set(s.page_number, {
+        url: `/app/view/${hash}/${s.page_number}?from=/search`,
+        title: s.document_title,
+      });
+    }
+  }
+
+  // Split on bracketed page refs. Keep the bracket text so the UI reads
+  // naturally; wrap the whole bracket in a link if any contained page
+  // matches a source.
+  const re = /\[Pages?\s+([^\]]+)\]/g;
+  const segments: Array<{ kind: "text"; text: string }
+                      | { kind: "cite"; text: string; pages: number[] }> = [];
+  let lastIdx = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(answer)) !== null) {
+    if (m.index > lastIdx) {
+      segments.push({ kind: "text", text: answer.slice(lastIdx, m.index) });
+    }
+    const pages = [...m[1].matchAll(/\d+/g)].map((n) => parseInt(n[0], 10));
+    segments.push({ kind: "cite", text: m[0], pages });
+    lastIdx = m.index + m[0].length;
+  }
+  if (lastIdx < answer.length) {
+    segments.push({ kind: "text", text: answer.slice(lastIdx) });
+  }
+
+  return (
+    <div className="text-forge-fg whitespace-pre-wrap leading-relaxed">
+      {segments.map((seg, i) => {
+        if (seg.kind === "text") return <span key={i}>{seg.text}</span>;
+        const linked = seg.pages.find((p) => pageMap.has(p));
+        if (linked === undefined) return <span key={i}>{seg.text}</span>;
+        const target = pageMap.get(linked)!;
+        return (
+          <a
+            key={i}
+            href={target.url}
+            target="_blank"
+            rel="noopener"
+            className="text-forge-accent hover:underline"
+            title={`${target.title} — open page ${linked} in viewer`}
+          >
+            {seg.text}
+          </a>
+        );
+      })}
+    </div>
+  );
+}
+
 
 // Staged progress indicator for search/answer requests. Shows an animated
 // dot, the current stage (time-based), and an elapsed counter so users

@@ -24,47 +24,81 @@ const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
 
 async function request<T>(
   path: string,
-  opts: RequestInit & { timeoutMs?: number } = {}
+  opts: RequestInit & { timeoutMs?: number; retries?: number } = {}
 ): Promise<ForgeResult<T>> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const { timeoutMs: _ignore, ...fetchOpts } = opts;
-  try {
-    const res = await fetch(path, {
-      headers: {
-        "Content-Type": "application/json",
-        ...(fetchOpts.headers || {}),
-      },
-      signal: AbortSignal.timeout(timeoutMs),
-      ...fetchOpts,
-    });
-    if (!res.ok) {
-      let reason: string;
-      try {
-        const body = await res.json();
-        reason = body.detail || body.reason || res.statusText;
-      } catch {
-        reason = res.statusText;
+  const retries = opts.retries ?? 1;
+  const { timeoutMs: _t, retries: _r, ...fetchOpts } = opts;
+
+  let lastErr: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(path, {
+        headers: {
+          "Content-Type": "application/json",
+          ...(fetchOpts.headers || {}),
+        },
+        signal: AbortSignal.timeout(timeoutMs),
+        ...fetchOpts,
+      });
+      if (!res.ok) {
+        let reason: string;
+        try {
+          const body = await res.json();
+          reason = body.detail || body.reason || res.statusText;
+        } catch {
+          reason = res.statusText;
+        }
+        // 5xx might be transient — retry once. 4xx is a real client
+        // error, fail fast.
+        if (res.status >= 500 && attempt < retries) {
+          lastErr = new Error(`HTTP ${res.status}: ${reason}`);
+          await new Promise((r) => setTimeout(r, 750));
+          continue;
+        }
+        return { success: false, reason };
       }
-      return { success: false, reason };
-    }
-    return (await res.json()) as ForgeResult<T>;
-  } catch (err) {
-    // AbortSignal.timeout() rejects with TimeoutError; generic network
-    // failures raise TypeError. Normalise both into a friendly message.
-    const msg = (err instanceof Error ? err.message : String(err));
-    if (msg.includes("aborted") || msg.includes("Timeout")) {
+      return (await res.json()) as ForgeResult<T>;
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      // Only retry transient-looking failures. True timeouts (AbortSignal)
+      // don't retry because the server might still be working on the
+      // previous request — a retry would stack. The user can explicitly
+      // resubmit.
+      const looksTransient =
+        msg.includes("NetworkError") ||
+        msg.includes("Failed to fetch") ||
+        msg.includes("ECONNRESET") ||
+        msg.includes("ECONNREFUSED");
+      if (looksTransient && attempt < retries) {
+        await new Promise((r) => setTimeout(r, 500 + 500 * attempt));
+        continue;
+      }
+      // Normalize to a friendly message.
+      if (msg.includes("aborted") || msg.includes("Timeout")) {
+        return {
+          success: false,
+          reason:
+            `Request timed out after ${Math.round(timeoutMs / 1000)}s. ` +
+            `The LLM may be loading a model or the query is unusually complex — ` +
+            `try again, or reduce the page limit.`,
+        };
+      }
       return {
         success: false,
-        reason: `Request timed out after ${Math.round(timeoutMs / 1000)}s. ` +
-          `The LLM may be loading a model or the query is unusually complex — ` +
-          `try again, or reduce the page limit.`,
+        reason: `Network error: ${msg}. Is the ForgeRAG backend running?`,
       };
     }
-    return {
-      success: false,
-      reason: `Network error: ${msg}. Is the ForgeRAG backend running?`,
-    };
   }
+  // Exhausted retries on 5xx
+  return {
+    success: false,
+    reason:
+      lastErr instanceof Error
+        ? `Request failed after retries: ${lastErr.message}`
+        : "Request failed after retries",
+  };
 }
 
 // ---- Health ----
