@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
 import {
   searchSemantic,
@@ -134,6 +134,10 @@ export default function Search() {
           {(searchMutation.isPending || answerMutation.isPending) ? "Searching…" : mode === "answer" ? "Ask" : "Search"}
         </button>
       </form>
+
+      {(searchMutation.isPending || answerMutation.isPending) && (
+        <AnswerProgress inProgress isAnswer={mode === "answer"} />
+      )}
 
       {(searchMutation.isError || answerMutation.isError) && (
         <div className="bg-rose-950 border border-rose-700 text-rose-200 rounded p-3 mb-4">
@@ -448,6 +452,56 @@ function CommunityResults({ hits }: { hits: CommunityHit[] }) {
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+// Staged progress indicator for search/answer requests. Shows an animated
+// dot, the current stage (time-based), and an elapsed counter so users
+// know the request is alive. Important because the VLM synthesis step
+// can legitimately take 30-90s on detailed engineering questions, and
+// the previous "Searching…" button text wasn't enough feedback to
+// distinguish "working" from "stuck".
+function AnswerProgress({ inProgress, isAnswer }: { inProgress: boolean; isAnswer: boolean }) {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!inProgress) {
+      setElapsed(0);
+      return;
+    }
+    const started = Date.now();
+    const t = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - started) / 1000));
+    }, 500);
+    return () => clearInterval(t);
+  }, [inProgress]);
+
+  let stage: string;
+  if (!isAnswer) {
+    stage = elapsed < 3 ? "Searching…" : "Searching (still working, index may be warming up)…";
+  } else if (elapsed < 3) {
+    stage = "Retrieving relevant chunks and pages…";
+  } else if (elapsed < 10) {
+    stage = "Running graph exploration and reranker…";
+  } else if (elapsed < 30) {
+    stage = "Reading page images with the vision LLM…";
+  } else if (elapsed < 60) {
+    stage = "Synthesizing the answer…";
+  } else if (elapsed < 120) {
+    stage = "Still working — the VLM takes longer on detailed questions…";
+  } else {
+    stage = "Taking unusually long. LM Studio may be reloading the model.";
+  }
+
+  return (
+    <div className="bg-forge-panel border border-forge-edge rounded-lg p-4 mb-4 flex items-center gap-3">
+      <div className="w-2 h-2 rounded-full bg-forge-accent animate-pulse" />
+      <div className="flex-1">
+        <div className="text-sm font-semibold text-forge-fg">{stage}</div>
+        <div className="text-xs text-forge-muted mt-0.5 font-mono">
+          elapsed {elapsed}s
+        </div>
+      </div>
     </div>
   );
 }

@@ -14,28 +14,57 @@ import type {
   TagRow,
 } from "./types";
 
+// Default fetch timeout for API requests. 5 minutes generously covers
+// even slow VLM answer roundtrips (visual retrieval + image reading +
+// synthesis can take 60-120s on a complex engineering question, and
+// LM Studio can be further delayed by model reload). Short requests
+// (health, list, etc.) complete in well under a second so the long
+// default is harmless for them.
+const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
+
 async function request<T>(
   path: string,
-  opts: RequestInit = {}
+  opts: RequestInit & { timeoutMs?: number } = {}
 ): Promise<ForgeResult<T>> {
-  const res = await fetch(path, {
-    headers: {
-      "Content-Type": "application/json",
-      ...(opts.headers || {}),
-    },
-    ...opts,
-  });
-  if (!res.ok) {
-    let reason: string;
-    try {
-      const body = await res.json();
-      reason = body.detail || body.reason || res.statusText;
-    } catch {
-      reason = res.statusText;
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const { timeoutMs: _ignore, ...fetchOpts } = opts;
+  try {
+    const res = await fetch(path, {
+      headers: {
+        "Content-Type": "application/json",
+        ...(fetchOpts.headers || {}),
+      },
+      signal: AbortSignal.timeout(timeoutMs),
+      ...fetchOpts,
+    });
+    if (!res.ok) {
+      let reason: string;
+      try {
+        const body = await res.json();
+        reason = body.detail || body.reason || res.statusText;
+      } catch {
+        reason = res.statusText;
+      }
+      return { success: false, reason };
     }
-    return { success: false, reason };
+    return (await res.json()) as ForgeResult<T>;
+  } catch (err) {
+    // AbortSignal.timeout() rejects with TimeoutError; generic network
+    // failures raise TypeError. Normalise both into a friendly message.
+    const msg = (err instanceof Error ? err.message : String(err));
+    if (msg.includes("aborted") || msg.includes("Timeout")) {
+      return {
+        success: false,
+        reason: `Request timed out after ${Math.round(timeoutMs / 1000)}s. ` +
+          `The LLM may be loading a model or the query is unusually complex — ` +
+          `try again, or reduce the page limit.`,
+      };
+    }
+    return {
+      success: false,
+      reason: `Network error: ${msg}. Is the ForgeRAG backend running?`,
+    };
   }
-  return (await res.json()) as ForgeResult<T>;
 }
 
 // ---- Health ----
