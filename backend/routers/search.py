@@ -212,35 +212,56 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         raise HTTPException(503, "LLM service not available")
 
     # Step 1: Retrieve pages
-    # "auto" mode: run keyword + visual in parallel, merge results
+    # "auto" mode: chunk-aware RRF hybrid (BGE-M3 dense + BM25 + reranker)
+    # fused with Nemotron visual results. This is a meaningful upgrade over
+    # the earlier "keyword + visual" auto mode — hybrid catches semantic
+    # paraphrases that plain keyword misses, and the reranker cleans up
+    # ordering. Visual retrieval still runs alongside to catch chart/diagram
+    # matches that aren't in the text.
     pages: list[dict] = []
     mode = body.search_mode
 
     if mode == "auto":
-        # Keyword search for exact matches
-        kw_result = await keyword_search(
-            KeywordSearchRequest(query=body.query, limit=body.limit), request
-        )
-        kw_pages = kw_result.data or []
+        # Primary: chunk-level RRF hybrid
+        try:
+            rrf_result = await hybrid_search(
+                HybridSearchRequest(
+                    query=body.query,
+                    strategy="rrf",
+                    limit=body.limit,
+                    filters=body.filters if hasattr(body, "filters") else None,
+                    rerank=True,
+                ),
+                request,
+            )
+            primary_pages = rrf_result.data or []
+        except Exception as exc:
+            logger.warning("RRF retrieval failed, falling back to keyword: %s", exc)
+            kw_result = await keyword_search(
+                KeywordSearchRequest(query=body.query, limit=body.limit), request
+            )
+            primary_pages = kw_result.data or []
 
-        # ColPali visual search for conceptual matches
+        # Secondary: visual search (charts, diagrams, tables a reranker
+        # might miss because the textual form doesn't match).
         vis_pages: list[dict] = []
         if colpali is not None and text_emb is not None:
             try:
                 vis_result = await visual_search(
                     VisualSearchRequest(
-                        query=body.query, limit=body.limit, candidate_pool=30
+                        query=body.query, limit=max(3, body.limit // 2),
+                        candidate_pool=30,
                     ),
                     request,
                 )
                 vis_pages = vis_result.data or []
             except Exception:
-                pass  # visual not available, keyword only
+                pass
 
-        # Merge: keyword hits first (exact match = highest priority), then
-        # visual hits not already in keyword results
-        seen_page_ids = {p["page_id"] for p in kw_pages}
-        pages = list(kw_pages)
+        # Merge: RRF hits first (text-precise), then visual hits not
+        # already covered.
+        seen_page_ids = {p["page_id"] for p in primary_pages}
+        pages = list(primary_pages)
         for vp in vis_pages:
             if vp["page_id"] not in seen_page_ids:
                 pages.append(vp)
@@ -267,9 +288,13 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         )
         pages = result.data or []
     elif mode == "hybrid":
+        # Default the hybrid strategy to `rrf` (chunk-aware) for the best
+        # general-purpose retrieval. Callers can still POST to /search/hybrid
+        # directly to pick another strategy.
         result = await hybrid_search(
             HybridSearchRequest(
-                query=body.query, strategy="graph_boosted", limit=body.limit
+                query=body.query, strategy="rrf", limit=body.limit,
+                rerank=True,
             ),
             request,
         )
@@ -379,6 +404,25 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
             "image_url": p.get("image_url", ""),
             "score": p.get("score", 0),
         })
+
+        # If the retrieval returned a specific matching chunk on this
+        # page, surface its summary + section path so the VLM knows which
+        # slice of the image matters. RRF retrieval populates these fields;
+        # older retrievers (keyword, visual) don't — in those cases we
+        # just label the page as "Source".
+        chunk_hint_parts: list[str] = []
+        if p.get("summary"):
+            chunk_hint_parts.append(f"Relevant chunk summary: {p['summary']}")
+        if p.get("section_path"):
+            chunk_hint_parts.append(
+                "Section: " + " › ".join(p["section_path"])
+            )
+        if p.get("chunk_type") and p["chunk_type"] not in (None, "text"):
+            chunk_hint_parts.append(f"Chunk type: {p['chunk_type']}")
+        if chunk_hint_parts:
+            messages_content.append(
+                {"type": "text", "text": "\n".join(chunk_hint_parts)}
+            )
 
         if body.use_vision:
             # Send the matched page, optionally with adjacent pages
@@ -658,6 +702,189 @@ async def visual_search(body: VisualSearchRequest, request: Request) -> ForgeRes
 
 
 # ============================================================================
+# Chunk-level retrieval (Phase 9)
+# ============================================================================
+
+
+class ChunkSearchRequest(BaseModel):
+    """Chunk-level retrieval with BGE-M3 dense + BM25 + reranker.
+
+    Returns raw chunk records (text + summary + section_path + page/doc
+    linkage) so agents can quote precisely rather than re-reading whole
+    pages. Skips the VLM — use /search/answer when you want a synthesized
+    answer.
+    """
+
+    query: str
+    limit: int = Field(default=10, ge=1, le=50)
+    filters: SearchFilters | None = None
+    rerank: bool = True
+    rerank_pool: int = Field(default=50, ge=5, le=200)
+    chunk_type: str | None = Field(
+        None,
+        description="Optional: filter to a specific chunk type ("
+        "'text', 'table', 'figure', 'equation', 'list', 'caption').",
+    )
+
+
+@router.post("/chunks")
+async def search_chunks(body: ChunkSearchRequest, request: Request) -> ForgeResult:
+    """Chunk-level retrieval — BGE-M3 dense + Lucene BM25 + bge-reranker.
+
+    Queries only Chunk nodes (not Page), so docs that haven't been
+    rebuilt into chunks yet won't surface here — use /search/keyword or
+    /search/hybrid (strategy=rrf) for mixed coverage. This endpoint is
+    designed for agents that want paragraph/table-precise evidence.
+    """
+    text_emb = getattr(request.app.state, "text_embedding", None)
+    neo4j = request.app.state.neo4j
+    gpu = request.app.state.gpu
+    reranker = getattr(request.app.state, "reranker", None)
+    if text_emb is None:
+        raise HTTPException(503, "Text embedding service not available")
+
+    async with gpu.load_scope("text_embedding"):
+        qvec = await asyncio.to_thread(text_emb.embed_query, body.query)
+
+    filter_where, filter_params = _filter_clauses(body.filters)
+    where_parts = [filter_where] if filter_where else []
+    if body.chunk_type:
+        where_parts.append("c.chunk_type = $chunk_type")
+        filter_params["chunk_type"] = body.chunk_type
+    where = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    pool = max(body.rerank_pool, body.limit * 3)
+    K_RRF = 60
+
+    # Build the Lucene query
+    terms = [t for t in body.query.split() if t]
+    if len(terms) <= 3:
+        ft_query = f'"{body.query.replace(chr(34), chr(92) + chr(34))}"'
+    else:
+        ft_query = " OR ".join(t.replace('"', '\\"') for t in terms if len(t) >= 2)
+
+    dense_cypher = f"""
+        CALL db.index.vector.queryNodes('chunk_embedding', $pool, $vec)
+        YIELD node AS c, score AS dense_score
+        MATCH (p:Page)-[:HAS_CHUNK]->(c)
+        MATCH (d:Document)-[:HAS_PAGE]->(p){where}
+        RETURN c.chunk_id AS chunk_id, dense_score,
+               c.text AS text, c.summary AS summary,
+               c.chunk_type AS chunk_type, c.section_path AS section_path,
+               p.page_id AS page_id, p.page_number AS page_number,
+               d.doc_id AS doc_id, d.title AS document_title,
+               d.filename AS filename, d.file_hash AS file_hash,
+               [(d)-[:IN_CATEGORY]->(cat) | cat.name] AS categories,
+               [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+        ORDER BY dense_score DESC
+    """
+    ft_cypher = f"""
+        CALL db.index.fulltext.queryNodes('chunk_text_fulltext', $q)
+        YIELD node AS c, score AS ft_score
+        MATCH (p:Page)-[:HAS_CHUNK]->(c)
+        MATCH (d:Document)-[:HAS_PAGE]->(p){where}
+        RETURN c.chunk_id AS chunk_id, ft_score
+        ORDER BY ft_score DESC
+        LIMIT $pool
+    """
+    dense_params = {"pool": pool, "vec": qvec.tolist()}
+    dense_params.update(filter_params)
+    ft_params = {"q": ft_query, "pool": pool}
+    ft_params.update(filter_params)
+
+    async def _safe(cypher: str, params: dict) -> list:
+        try:
+            return await neo4j.run_query(cypher, params)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Chunk retrieval subquery failed: %s", exc)
+            return []
+
+    dense_rows, ft_rows = await asyncio.gather(
+        _safe(dense_cypher, dense_params),
+        _safe(ft_cypher, ft_params),
+    )
+
+    records: dict[str, dict] = {r["chunk_id"]: dict(r) for r in dense_rows}
+    rrf_scores: dict[str, float] = {}
+    for rank, r in enumerate(dense_rows, start=1):
+        cid = r["chunk_id"]
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (K_RRF + rank)
+
+    # Hydrate chunks that only came in via BM25
+    ft_misses = [r["chunk_id"] for r in ft_rows if r["chunk_id"] not in records]
+    if ft_misses:
+        hyd = await neo4j.run_query(
+            """
+            MATCH (c:Chunk)<-[:HAS_CHUNK]-(p:Page)
+            WHERE c.chunk_id IN $ids
+            MATCH (d:Document)-[:HAS_PAGE]->(p)
+            RETURN c.chunk_id AS chunk_id, c.text AS text, c.summary AS summary,
+                   c.chunk_type AS chunk_type, c.section_path AS section_path,
+                   p.page_id AS page_id, p.page_number AS page_number,
+                   d.doc_id AS doc_id, d.title AS document_title,
+                   d.filename AS filename, d.file_hash AS file_hash,
+                   [(d)-[:IN_CATEGORY]->(cat) | cat.name] AS categories,
+                   [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+            """,
+            {"ids": ft_misses},
+        )
+        for row in hyd:
+            records[row["chunk_id"]] = dict(row)
+    for rank, r in enumerate(ft_rows, start=1):
+        cid = r["chunk_id"]
+        rrf_scores[cid] = rrf_scores.get(cid, 0.0) + 1.0 / (K_RRF + rank)
+
+    fused = sorted(
+        records.values(),
+        key=lambda r: rrf_scores.get(r["chunk_id"], 0.0),
+        reverse=True,
+    )
+
+    # Cross-encoder rerank
+    if body.rerank and reranker is not None and fused:
+        cands = fused[: body.rerank_pool]
+        passages = [(r.get("text") or "")[:1800] for r in cands]
+        try:
+            async with gpu.load_scope("reranker"):
+                scores = await asyncio.to_thread(
+                    reranker.score_pairs, body.query, passages
+                )
+            for rec, s in zip(cands, scores):
+                rec["rerank_score"] = float(s)
+            cands.sort(
+                key=lambda r: r.get("rerank_score", float("-inf")), reverse=True,
+            )
+            fused = cands + fused[body.rerank_pool:]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Reranker failed: %s", exc)
+
+    hits = []
+    for r in fused[: body.limit]:
+        cid = r["chunk_id"]
+        hits.append({
+            "chunk_id": cid,
+            "page_id": r.get("page_id"),
+            "page_number": r.get("page_number"),
+            "chunk_type": r.get("chunk_type"),
+            "section_path": r.get("section_path") or [],
+            "text": r.get("text") or "",
+            "summary": r.get("summary"),
+            "doc_id": r.get("doc_id"),
+            "document_title": r.get("document_title"),
+            "filename": r.get("filename"),
+            "score": float(r.get("rerank_score", rrf_scores.get(cid, 0.0))),
+            "rrf_score": float(rrf_scores.get(cid, 0.0)),
+            "rerank_score": r.get("rerank_score"),
+            "dense_score": r.get("dense_score"),
+            "image_url": f"/images/{r.get('file_hash')}/{r.get('page_number')}",
+            "reduced_image_url": f"/images/{r.get('file_hash')}/{r.get('page_number')}/reduced",
+            "categories": r.get("categories") or [],
+            "tags": r.get("tags") or [],
+        })
+    return ForgeResult(success=True, data=hits)
+
+
+# ============================================================================
 # Hybrid search (Phase 5)
 # ============================================================================
 
@@ -886,55 +1113,77 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
         return ForgeResult(success=True, data=hits[: body.limit])
 
     if body.strategy == "rrf":
-        # Reciprocal Rank Fusion of BM25 (full-text) + dense vector search.
-        # Each retriever returns a ranked list; each document gets a score
-        # of sum(1 / (k + rank_i)) across retrievers that found it. k=60
-        # is the standard constant from the original RRF paper — it
-        # dampens the dominance of the top-ranked item so fusion isn't
-        # pegged to either retriever alone.
+        # Reciprocal Rank Fusion over THREE retrievers:
         #
-        # Optionally followed by cross-encoder reranking on the top pool.
-        # This is the default strategy — dense catches semantic matches,
-        # BM25 catches exact designations ("QW-451.1", "6061-T6"),
-        # reranker cleans up ordering.
+        #   (1) Chunk dense   — BGE-M3 embeddings on (summary + text) via
+        #                       the chunk_embedding vector index
+        #   (2) Chunk BM25    — Lucene full-text on chunk_text_fulltext
+        #                       (covers chunk.text AND chunk.summary)
+        #   (3) Page BM25     — Lucene full-text on page_text_fulltext
+        #                       (fallback for docs that haven't been
+        #                       rebuilt into chunks yet)
+        #
+        # k=60 is the standard RRF constant. Each retriever contributes
+        # 1/(k+rank) to the fused score of whichever Page the hit maps
+        # to. Chunks are always deduped-to-page for the final response
+        # — the VLM reads page images, not isolated chunks — but the
+        # winning chunk's summary and section path are attached as
+        # context so the LLM knows *which* slice of the page matters.
+        #
+        # Optional cross-encoder reranking runs over the fused pool
+        # using the chunk text (if available) or page text as the
+        # candidate passage.
         K_RRF = 60
-
-        # Run both retrievers in parallel with over-fetch so the fused
-        # list has enough candidates for the reranker.
         pool = max(body.rerank_pool, body.limit * 3)
 
+        # Filter-where operates on the Document; we reuse filter_params
+        # verbatim for all three Cypher calls.
         where = f" WHERE {filter_where}" if filter_where else ""
 
-        dense_cypher = f"""
-            CALL db.index.vector.queryNodes('page_text_embedding', $pool, $vec)
-            YIELD node AS p, score AS dense_score
-            MATCH (d:Document)-[:HAS_PAGE]->(p){where}
-            RETURN p.page_id AS page_id, dense_score,
-                   p.extracted_text AS extracted_text,
-                   p.page_number AS page_number,
-                   d.doc_id AS doc_id, d.title AS document_title,
-                   d.filename AS filename, d.file_hash AS file_hash,
-                   [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
-                   [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
-            ORDER BY dense_score DESC
-        """
-        dense_params = {"pool": pool, "vec": qvec.tolist()}
-        dense_params.update(filter_params)
-
-        # Full-text: use a Lucene phrase for short queries, boolean OR for
-        # longer natural-language queries. The Neo4j full-text index we
-        # created is named 'page_text_fulltext' (same index the keyword
-        # endpoint uses).
+        # Lucene query construction (same for both BM25 retrievers).
         terms = [t for t in body.query.split() if t]
         if len(terms) <= 3:
             escaped = body.query.replace('"', '\\"')
             ft_query = f'"{escaped}"'
         else:
-            # Boolean OR — matches any term, full-text index scores by tf-idf.
             escaped_terms = [t.replace('"', '\\"') for t in terms if len(t) >= 2]
             ft_query = " OR ".join(escaped_terms)
 
-        ft_cypher = f"""
+        # (1) Chunk dense
+        chunk_dense_cypher = f"""
+            CALL db.index.vector.queryNodes('chunk_embedding', $pool, $vec)
+            YIELD node AS c, score AS dense_score
+            MATCH (p:Page)-[:HAS_CHUNK]->(c)
+            MATCH (d:Document)-[:HAS_PAGE]->(p){where}
+            RETURN c.chunk_id AS chunk_id, dense_score,
+                   c.text AS text, c.summary AS summary,
+                   c.chunk_type AS chunk_type, c.section_path AS section_path,
+                   p.page_id AS page_id, p.page_number AS page_number,
+                   p.extracted_text AS page_text,
+                   d.doc_id AS doc_id, d.title AS document_title,
+                   d.filename AS filename, d.file_hash AS file_hash,
+                   [(d)-[:IN_CATEGORY]->(cat) | cat.name] AS categories,
+                   [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+            ORDER BY dense_score DESC
+        """
+        chunk_dense_params = {"pool": pool, "vec": qvec.tolist()}
+        chunk_dense_params.update(filter_params)
+
+        # (2) Chunk BM25
+        chunk_ft_cypher = f"""
+            CALL db.index.fulltext.queryNodes('chunk_text_fulltext', $q)
+            YIELD node AS c, score AS ft_score
+            MATCH (p:Page)-[:HAS_CHUNK]->(c)
+            MATCH (d:Document)-[:HAS_PAGE]->(p){where}
+            RETURN c.chunk_id AS chunk_id, ft_score
+            ORDER BY ft_score DESC
+            LIMIT $pool
+        """
+        chunk_ft_params = {"q": ft_query, "pool": pool}
+        chunk_ft_params.update(filter_params)
+
+        # (3) Page BM25 — fallback for non-chunked docs
+        page_ft_cypher = f"""
             CALL db.index.fulltext.queryNodes('page_text_fulltext', $q)
             YIELD node AS p, score AS ft_score
             MATCH (d:Document)-[:HAS_PAGE]->(p){where}
@@ -942,51 +1191,118 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
             ORDER BY ft_score DESC
             LIMIT $pool
         """
-        ft_params = {"q": ft_query, "pool": pool}
-        ft_params.update(filter_params)
+        page_ft_params = {"q": ft_query, "pool": pool}
+        page_ft_params.update(filter_params)
 
-        # Run both in parallel
         import asyncio as _asyncio
-        try:
-            dense_rows, ft_rows = await _asyncio.gather(
-                neo4j.run_query(dense_cypher, dense_params),
-                neo4j.run_query(ft_cypher, ft_params),
-            )
-        except Exception as exc:
-            logger.warning("RRF full-text query failed, falling back to dense-only: %s", exc)
-            dense_rows = await neo4j.run_query(dense_cypher, dense_params)
-            ft_rows = []
+        async def _safe(cypher: str, params: dict) -> list:
+            try:
+                return await neo4j.run_query(cypher, params)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("RRF retriever failed (continuing): %s", exc)
+                return []
 
-        # Build a page-id → record map keyed off dense results (carries the
-        # full row we need for the response payload).
-        records: dict[str, dict] = {r["page_id"]: dict(r) for r in dense_rows}
+        chunk_dense_rows, chunk_ft_rows, page_ft_rows = await _asyncio.gather(
+            _safe(chunk_dense_cypher, chunk_dense_params),
+            _safe(chunk_ft_cypher, chunk_ft_params),
+            _safe(page_ft_cypher, page_ft_params),
+        )
 
-        # RRF: accumulate reciprocal-rank contributions from each retriever.
+        # Build a page-id → record map. The "best" chunk for each page
+        # (first one seen, since chunks are ranked) populates the
+        # chunk-level fields. Pages that only came in via page_text
+        # fallback get empty chunk fields.
+        records: dict[str, dict] = {}
         rrf_scores: dict[str, float] = {}
-        for rank, r in enumerate(dense_rows, start=1):
-            rrf_scores[r["page_id"]] = rrf_scores.get(r["page_id"], 0.0) + 1.0 / (K_RRF + rank)
-        for rank, r in enumerate(ft_rows, start=1):
+
+        def _ensure_record(page_id: str) -> dict:
+            return records.setdefault(page_id, {"page_id": page_id})
+
+        # (1) Chunk dense — populates per-page record
+        for rank, r in enumerate(chunk_dense_rows, start=1):
+            pid = r["page_id"]
+            rec = _ensure_record(pid)
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (K_RRF + rank)
+            # Only overwrite chunk fields from a higher-ranked chunk on
+            # the same page. Since rows are already sorted by dense_score,
+            # the first arrival is the best.
+            if "chunk_id" not in rec:
+                for key in ("chunk_id", "chunk_type", "text", "summary",
+                            "section_path", "page_number", "doc_id",
+                            "document_title", "filename", "file_hash",
+                            "categories", "tags", "dense_score"):
+                    rec[key] = r.get(key)
+
+        # (2) Chunk BM25 — may promote chunks not in the dense top-K
+        # into the pool. Need a second query to hydrate their metadata.
+        chunk_ft_hydrate: list[str] = []
+        for rank, r in enumerate(chunk_ft_rows, start=1):
+            chunk_id = r["chunk_id"]
+            # Increment RRF score via page_id, but we need to resolve
+            # chunk_id → page_id first. Do that in bulk after.
+            chunk_ft_hydrate.append((rank, chunk_id))  # type: ignore[arg-type]
+        if chunk_ft_hydrate:
+            hydrate_rows = await neo4j.run_query(
+                """
+                MATCH (c:Chunk)<-[:HAS_CHUNK]-(p:Page)
+                WHERE c.chunk_id IN $ids
+                MATCH (d:Document)-[:HAS_PAGE]->(p)
+                RETURN c.chunk_id AS chunk_id,
+                       c.text AS text, c.summary AS summary,
+                       c.chunk_type AS chunk_type, c.section_path AS section_path,
+                       p.page_id AS page_id, p.page_number AS page_number,
+                       p.extracted_text AS page_text,
+                       d.doc_id AS doc_id, d.title AS document_title,
+                       d.filename AS filename, d.file_hash AS file_hash,
+                       [(d)-[:IN_CATEGORY]->(cat) | cat.name] AS categories,
+                       [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+                """,
+                {"ids": [cid for _, cid in chunk_ft_hydrate]},
+            )
+            hydrate_by_chunk = {r["chunk_id"]: r for r in hydrate_rows}
+            for rank, chunk_id in chunk_ft_hydrate:
+                row = hydrate_by_chunk.get(chunk_id)
+                if not row:
+                    continue
+                pid = row["page_id"]
+                rec = _ensure_record(pid)
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (K_RRF + rank)
+                if "chunk_id" not in rec:
+                    for key in ("chunk_id", "chunk_type", "text", "summary",
+                                "section_path", "page_number", "doc_id",
+                                "document_title", "filename", "file_hash",
+                                "categories", "tags"):
+                        rec[key] = row.get(key)
+
+        # (3) Page BM25 — fallback for pages that never got chunked
+        page_ft_hydrate: list[str] = []
+        for rank, r in enumerate(page_ft_rows, start=1):
             pid = r["page_id"]
             rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (K_RRF + rank)
-            if pid not in records:
-                # Need to hydrate this record — it came in via full-text only.
-                hyd = await neo4j.run_query(
-                    """
-                    MATCH (d:Document)-[:HAS_PAGE]->(p:Page {page_id: $pid})
-                    RETURN p.page_id AS page_id,
-                           p.extracted_text AS extracted_text,
-                           p.page_number AS page_number,
-                           d.doc_id AS doc_id, d.title AS document_title,
-                           d.filename AS filename, d.file_hash AS file_hash,
-                           [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
-                           [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
-                    """,
-                    {"pid": pid},
-                )
-                if hyd:
-                    rec = dict(hyd[0])
-                    rec["dense_score"] = None
-                    records[pid] = rec
+            rec = _ensure_record(pid)
+            if "doc_id" not in rec:  # needs hydration
+                page_ft_hydrate.append(pid)
+        if page_ft_hydrate:
+            hydrate_rows = await neo4j.run_query(
+                """
+                MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
+                WHERE p.page_id IN $ids
+                RETURN p.page_id AS page_id, p.page_number AS page_number,
+                       p.extracted_text AS page_text,
+                       d.doc_id AS doc_id, d.title AS document_title,
+                       d.filename AS filename, d.file_hash AS file_hash,
+                       [(d)-[:IN_CATEGORY]->(cat) | cat.name] AS categories,
+                       [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+                """,
+                {"ids": page_ft_hydrate},
+            )
+            for row in hydrate_rows:
+                rec = _ensure_record(row["page_id"])
+                for key in ("page_number", "page_text", "doc_id",
+                            "document_title", "filename", "file_hash",
+                            "categories", "tags"):
+                    if rec.get(key) is None:
+                        rec[key] = row.get(key)
 
         # Fused ranking.
         fused = sorted(
@@ -999,9 +1315,11 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
         reranker = getattr(request.app.state, "reranker", None)
         if body.rerank and reranker is not None and fused:
             rerank_candidates = fused[: body.rerank_pool]
-            # Prefer passing the extracted text; fall back to snippet if empty.
+            # Prefer chunk text (more precise) over page text; cap at
+            # 1800 chars so the cross-encoder's 512-token context limit
+            # doesn't truncate mid-sentence after tokenization.
             passages = [
-                (r.get("extracted_text") or "")[:1800]
+                ((r.get("text") or r.get("page_text") or "")[:1800])
                 for r in rerank_candidates
             ]
             try:
@@ -1010,14 +1328,12 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
                     scores = await _asyncio2.to_thread(
                         reranker.score_pairs, body.query, passages
                     )
-                # Attach rerank score and re-sort
                 for rec, s in zip(rerank_candidates, scores):
                     rec["rerank_score"] = float(s)
                 rerank_candidates.sort(
                     key=lambda r: r.get("rerank_score", float("-inf")),
                     reverse=True,
                 )
-                # Keep any fused-but-not-reranked candidates behind the reranked set.
                 tail = fused[body.rerank_pool:]
                 fused = rerank_candidates + tail
             except Exception as exc:  # noqa: BLE001
@@ -1026,8 +1342,17 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
         hits = []
         for r in fused[: body.limit]:
             pid = r["page_id"]
+            chunk_id = r.get("chunk_id")
+            # Use chunk text for the snippet when available, else page
+            # text. Summary is surfaced as a separate field so callers
+            # (especially /search/answer) can use it as LLM context.
+            snippet_source = r.get("text") or r.get("page_text")
             hits.append({
                 "page_id": pid,
+                "chunk_id": chunk_id,
+                "chunk_type": r.get("chunk_type"),
+                "section_path": r.get("section_path") or [],
+                "summary": r.get("summary"),
                 "doc_id": r.get("doc_id"),
                 "document_title": r.get("document_title"),
                 "filename": r.get("filename"),
@@ -1036,11 +1361,12 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
                 "rrf_score": float(rrf_scores.get(pid, 0.0)),
                 "rerank_score": r.get("rerank_score"),
                 "dense_score": r.get("dense_score"),
-                "text_snippet": _snippet(r.get("extracted_text")),
+                "text_snippet": _snippet(snippet_source),
                 "image_url": f"/images/{r.get('file_hash')}/{r.get('page_number')}",
                 "reduced_image_url": f"/images/{r.get('file_hash')}/{r.get('page_number')}/reduced",
                 "categories": r.get("categories") or [],
                 "tags": r.get("tags") or [],
+                "has_chunks": chunk_id is not None,
             })
         return ForgeResult(success=True, data=hits)
 

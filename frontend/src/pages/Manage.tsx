@@ -174,16 +174,17 @@ function CommunitiesCard() {
       </div>
       {build.isSuccess && (
         <div className="text-xs text-emerald-400 mb-2">
-          Queued as job {build.data?.data?.job_id.slice(0, 8)}…
+          Queued as job {build.data?.data?.job_id.slice(0, 8)}… (progress in Ingest tab)
         </div>
       )}
-      {comms.length === 0 && (
+      {comms.length === 0 && !build.isPending && !build.isSuccess && (
         <div className="text-sm text-forge-muted">
           No communities yet. Run "rebuild" after you have extracted entities
           for enough documents.
         </div>
       )}
-      <ol className="space-y-2">
+      {/* Scrollable list — communities can run into the dozens after a big rebuild */}
+      <ol className="space-y-2 max-h-80 overflow-y-auto pr-1">
         {comms.map((c) => (
           <li key={c.community_id} className="text-xs">
             <div className="font-mono text-forge-muted">
