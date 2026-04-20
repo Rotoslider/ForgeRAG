@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import {
   searchSemantic,
   searchVisual,
@@ -15,9 +16,18 @@ import type { AnswerResult } from "../api/client";
 type Mode = "semantic" | "keyword" | "visual" | "hybrid" | "answer";
 
 export default function Search() {
-  const [query, setQuery] = useState("");
-  const [mode, setMode] = useState<Mode>("answer");
-  const [strategy, setStrategy] = useState<HybridStrategy>("rrf");
+  // Query, mode, and strategy are persisted in the URL so navigating
+  // away and back (or following a page-viewer link and returning) keeps
+  // the search in place. The limit slider and expanded-row state are
+  // ephemeral and stay in component state.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [query, setQuery] = useState(searchParams.get("q") || "");
+  const [mode, setMode] = useState<Mode>(
+    (searchParams.get("m") as Mode) || "answer",
+  );
+  const [strategy, setStrategy] = useState<HybridStrategy>(
+    (searchParams.get("s") as HybridStrategy) || "rrf",
+  );
   const [limit, setLimit] = useState(10);
   const [expanded, setExpanded] = useState<string | null>(null);
 
@@ -54,9 +64,30 @@ export default function Search() {
   const isCommunity = mode === "hybrid" && strategy === "community";
   const answerData = answerMutation.data;
 
+  // Switching mode or strategy mid-session leaves stale results in the
+  // mutation cache whose shape doesn't match the new view. Example: a
+  // previous "keyword" search left SearchHit rows in `hits`; the user
+  // switches to hybrid/community; CommunityResults tries to render
+  // c.community_id.slice() on a SearchHit and the whole page crashes
+  // into a black screen. Reset both mutations so the view falls back
+  // to the empty state until the next search runs.
+  useEffect(() => {
+    searchMutation.reset();
+    answerMutation.reset();
+    setExpanded(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mode, strategy]);
+
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setExpanded(null);
+    // Persist current state to URL before the search fires so a mid-
+    // query navigation leaves a reproducible URL behind.
+    const next = new URLSearchParams();
+    if (query.trim()) next.set("q", query.trim());
+    next.set("m", mode);
+    if (mode === "hybrid") next.set("s", strategy);
+    setSearchParams(next, { replace: true });
     if (mode === "answer") {
       answerMutation.mutate();
     } else {
@@ -417,7 +448,13 @@ function renderCommunities(hit: SearchHit) {
 }
 
 function CommunityResults({ hits }: { hits: CommunityHit[] }) {
-  if (!hits || hits.length === 0) {
+  // Defensively filter out rows that don't look like CommunityHits —
+  // can happen if a stale useMutation result from another mode gets
+  // rendered here before the mode-change effect clears it.
+  const valid = (hits || []).filter(
+    (c): c is CommunityHit => !!c && typeof c.community_id === "string",
+  );
+  if (valid.length === 0) {
     return (
       <div className="bg-forge-panel border border-forge-edge rounded-lg p-5 text-forge-muted">
         <p className="font-semibold mb-2">No communities found.</p>
@@ -432,7 +469,7 @@ function CommunityResults({ hits }: { hits: CommunityHit[] }) {
   }
   return (
     <div className="space-y-4">
-      {hits.map((c) => (
+      {valid.map((c) => (
         <div key={c.community_id} className="bg-forge-panel border border-forge-edge rounded-lg p-4">
           <div className="flex items-baseline gap-3 mb-2">
             <div className="font-semibold">Community #{c.community_id.slice(0, 8)}</div>
