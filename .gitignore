@@ -18,10 +18,12 @@ config/forgerag.toml
 # Data
 data/page_images/
 data/reduced_images/
+data/highlighted_images/
 data/uploads/
 data/*.sqlite
 data/*.sqlite-shm
 data/*.sqlite-wal
+data/canonicalization/
 
 # Frontend
 frontend/node_modules/

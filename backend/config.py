@@ -61,9 +61,14 @@ class ModelSettings(BaseModel):
     colpali_name: str = "vidore/colpali-v1.3"
     colpali_pool_factor_storage: int = 3
     colpali_pool_factor_search: int = 24
-    # Text embedding model
-    text_embedding_model: str = "nomic-ai/nomic-embed-text-v1.5"
-    text_embedding_dim: int = 768
+    # Text embedding model — BGE-M3 (1024-dim). Strong on technical content
+    # and integrates naturally with bge-reranker-v2-m3 as a post-retrieval
+    # step. Switch back to "nomic-ai/nomic-embed-text-v1.5" (768-dim) if
+    # you need the smaller memory footprint.
+    text_embedding_model: str = "BAAI/bge-m3"
+    text_embedding_dim: int = 1024
+    # Cross-encoder reranker — runs over top-K results from hybrid retrieval.
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"
     vlm_name: str = "Qwen/Qwen2.5-VL-7B-Instruct"
 
 

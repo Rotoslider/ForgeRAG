@@ -885,6 +885,165 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
         hits.sort(key=lambda h: h["score"], reverse=True)
         return ForgeResult(success=True, data=hits[: body.limit])
 
+    if body.strategy == "rrf":
+        # Reciprocal Rank Fusion of BM25 (full-text) + dense vector search.
+        # Each retriever returns a ranked list; each document gets a score
+        # of sum(1 / (k + rank_i)) across retrievers that found it. k=60
+        # is the standard constant from the original RRF paper — it
+        # dampens the dominance of the top-ranked item so fusion isn't
+        # pegged to either retriever alone.
+        #
+        # Optionally followed by cross-encoder reranking on the top pool.
+        # This is the default strategy — dense catches semantic matches,
+        # BM25 catches exact designations ("QW-451.1", "6061-T6"),
+        # reranker cleans up ordering.
+        K_RRF = 60
+
+        # Run both retrievers in parallel with over-fetch so the fused
+        # list has enough candidates for the reranker.
+        pool = max(body.rerank_pool, body.limit * 3)
+
+        where = f" WHERE {filter_where}" if filter_where else ""
+
+        dense_cypher = f"""
+            CALL db.index.vector.queryNodes('page_text_embedding', $pool, $vec)
+            YIELD node AS p, score AS dense_score
+            MATCH (d:Document)-[:HAS_PAGE]->(p){where}
+            RETURN p.page_id AS page_id, dense_score,
+                   p.extracted_text AS extracted_text,
+                   p.page_number AS page_number,
+                   d.doc_id AS doc_id, d.title AS document_title,
+                   d.filename AS filename, d.file_hash AS file_hash,
+                   [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
+                   [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+            ORDER BY dense_score DESC
+        """
+        dense_params = {"pool": pool, "vec": qvec.tolist()}
+        dense_params.update(filter_params)
+
+        # Full-text: use a Lucene phrase for short queries, boolean OR for
+        # longer natural-language queries. The Neo4j full-text index we
+        # created is named 'page_text_fulltext' (same index the keyword
+        # endpoint uses).
+        terms = [t for t in body.query.split() if t]
+        if len(terms) <= 3:
+            escaped = body.query.replace('"', '\\"')
+            ft_query = f'"{escaped}"'
+        else:
+            # Boolean OR — matches any term, full-text index scores by tf-idf.
+            escaped_terms = [t.replace('"', '\\"') for t in terms if len(t) >= 2]
+            ft_query = " OR ".join(escaped_terms)
+
+        ft_cypher = f"""
+            CALL db.index.fulltext.queryNodes('page_text_fulltext', $q)
+            YIELD node AS p, score AS ft_score
+            MATCH (d:Document)-[:HAS_PAGE]->(p){where}
+            RETURN p.page_id AS page_id, ft_score
+            ORDER BY ft_score DESC
+            LIMIT $pool
+        """
+        ft_params = {"q": ft_query, "pool": pool}
+        ft_params.update(filter_params)
+
+        # Run both in parallel
+        import asyncio as _asyncio
+        try:
+            dense_rows, ft_rows = await _asyncio.gather(
+                neo4j.run_query(dense_cypher, dense_params),
+                neo4j.run_query(ft_cypher, ft_params),
+            )
+        except Exception as exc:
+            logger.warning("RRF full-text query failed, falling back to dense-only: %s", exc)
+            dense_rows = await neo4j.run_query(dense_cypher, dense_params)
+            ft_rows = []
+
+        # Build a page-id → record map keyed off dense results (carries the
+        # full row we need for the response payload).
+        records: dict[str, dict] = {r["page_id"]: dict(r) for r in dense_rows}
+
+        # RRF: accumulate reciprocal-rank contributions from each retriever.
+        rrf_scores: dict[str, float] = {}
+        for rank, r in enumerate(dense_rows, start=1):
+            rrf_scores[r["page_id"]] = rrf_scores.get(r["page_id"], 0.0) + 1.0 / (K_RRF + rank)
+        for rank, r in enumerate(ft_rows, start=1):
+            pid = r["page_id"]
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (K_RRF + rank)
+            if pid not in records:
+                # Need to hydrate this record — it came in via full-text only.
+                hyd = await neo4j.run_query(
+                    """
+                    MATCH (d:Document)-[:HAS_PAGE]->(p:Page {page_id: $pid})
+                    RETURN p.page_id AS page_id,
+                           p.extracted_text AS extracted_text,
+                           p.page_number AS page_number,
+                           d.doc_id AS doc_id, d.title AS document_title,
+                           d.filename AS filename, d.file_hash AS file_hash,
+                           [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
+                           [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
+                    """,
+                    {"pid": pid},
+                )
+                if hyd:
+                    rec = dict(hyd[0])
+                    rec["dense_score"] = None
+                    records[pid] = rec
+
+        # Fused ranking.
+        fused = sorted(
+            records.values(),
+            key=lambda r: rrf_scores.get(r["page_id"], 0.0),
+            reverse=True,
+        )
+
+        # Cross-encoder reranking (optional).
+        reranker = getattr(request.app.state, "reranker", None)
+        if body.rerank and reranker is not None and fused:
+            rerank_candidates = fused[: body.rerank_pool]
+            # Prefer passing the extracted text; fall back to snippet if empty.
+            passages = [
+                (r.get("extracted_text") or "")[:1800]
+                for r in rerank_candidates
+            ]
+            try:
+                async with gpu.load_scope("reranker"):
+                    import asyncio as _asyncio2
+                    scores = await _asyncio2.to_thread(
+                        reranker.score_pairs, body.query, passages
+                    )
+                # Attach rerank score and re-sort
+                for rec, s in zip(rerank_candidates, scores):
+                    rec["rerank_score"] = float(s)
+                rerank_candidates.sort(
+                    key=lambda r: r.get("rerank_score", float("-inf")),
+                    reverse=True,
+                )
+                # Keep any fused-but-not-reranked candidates behind the reranked set.
+                tail = fused[body.rerank_pool:]
+                fused = rerank_candidates + tail
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Reranker failed, using RRF order: %s", exc)
+
+        hits = []
+        for r in fused[: body.limit]:
+            pid = r["page_id"]
+            hits.append({
+                "page_id": pid,
+                "doc_id": r.get("doc_id"),
+                "document_title": r.get("document_title"),
+                "filename": r.get("filename"),
+                "page_number": r.get("page_number"),
+                "score": float(r.get("rerank_score", rrf_scores.get(pid, 0.0))),
+                "rrf_score": float(rrf_scores.get(pid, 0.0)),
+                "rerank_score": r.get("rerank_score"),
+                "dense_score": r.get("dense_score"),
+                "text_snippet": _snippet(r.get("extracted_text")),
+                "image_url": f"/images/{r.get('file_hash')}/{r.get('page_number')}",
+                "reduced_image_url": f"/images/{r.get('file_hash')}/{r.get('page_number')}/reduced",
+                "categories": r.get("categories") or [],
+                "tags": r.get("tags") or [],
+            })
+        return ForgeResult(success=True, data=hits)
+
     raise HTTPException(400, f"Unknown strategy: {body.strategy}")
 
 

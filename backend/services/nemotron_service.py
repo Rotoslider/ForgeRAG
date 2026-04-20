@@ -42,6 +42,14 @@ class NemotronService:
 
     Implements the same interface as ColPaliService so the pipeline and search
     endpoints can swap between them without code changes.
+
+    Hierarchical token pooling is applied at embed time (same mechanism as
+    ColPali's compression). The raw model emits ~773 tokens per page; with
+    pool_factor=3 that drops to ~250 tokens, cutting both visual storage
+    and MaxSim compute by ~3x with negligible accuracy loss (the pooler
+    clusters semantically similar patches — whitespace, text blocks,
+    figure regions — and keeps one representative vector per cluster).
+    Set pool_factor=1 or None to disable.
     """
 
     def __init__(
@@ -49,10 +57,12 @@ class NemotronService:
         model_name: str = "nvidia/nemotron-colembed-vl-4b-v2",
         device: str = "cuda",
         target_dim: int = TARGET_DIM,
+        pool_factor: int | None = 3,
     ):
         self.model_name = model_name
         self.device = device
         self.target_dim = target_dim
+        self.pool_factor = pool_factor if (pool_factor or 0) > 1 else None
         self._model = None
         self._projection = None  # linear projection layer (2560 → 128)
         self._lock = threading.Lock()
@@ -148,17 +158,42 @@ class NemotronService:
         norms = np.maximum(norms, 1e-8)
         return (projected / norms).astype(np.float32)
 
+    def _pool_embeddings(self, embeddings_list, pool_factor: int):
+        """Apply HierarchicalTokenPooler to a list of (K, D) tensors.
+
+        Semantic clustering — groups patches that are similar in embedding
+        space (whitespace, uniform text, figure regions) and keeps one
+        representative vector per cluster. Works before OR after projection
+        because cosine similarities are approximately preserved; we pool
+        BEFORE projection so clustering happens in the richer native space.
+
+        Import is lazy so the module loads cleanly even if colpali-engine
+        isn't installed (unit tests, etc.).
+        """
+        from colpali_engine.compression.token_pooling import HierarchicalTokenPooler
+
+        pooler = HierarchicalTokenPooler()
+        return pooler.pool_embeddings(
+            embeddings_list,
+            pool_factor=pool_factor,
+        )
+
     # -------------------------------------------------------- embed ops
 
     def embed_images(
         self,
         image_paths: Iterable[Path | str],
         *,
-        pool_factor: int | None = None,  # ignored — Nemotron handles its own tokenization
+        pool_factor: int | None = None,
         progress_cb=None,
     ) -> list[np.ndarray]:
         """Embed page images. Returns list of (K, D) float32 arrays where
-        K is the token count per page (~773) and D is target_dim (128).
+        K is the pooled token count (~250 with pool_factor=3, down from the
+        native ~773) and D is target_dim (128).
+
+        An explicit pool_factor argument overrides the service default;
+        passing 1 or None disables pooling for this call only (useful for
+        the rare "I want the full representation" A/B test path).
 
         Runs synchronously — callers wrap in asyncio.to_thread.
         """
@@ -167,9 +202,17 @@ class NemotronService:
         import torch.nn.functional as F
         from PIL import Image
 
+        # Resolve the pool factor: explicit call arg > service default > none.
+        pf = pool_factor if pool_factor is not None else self.pool_factor
+        if pf is not None and pf <= 1:
+            pf = None
+
         paths = [Path(p) for p in image_paths]
         total = len(paths)
-        logger.info("Nemotron: embedding %d images", total)
+        logger.info(
+            "Nemotron: embedding %d images (pool_factor=%s)",
+            total, pf if pf is not None else "off",
+        )
 
         results: list[np.ndarray] = []
         batch_size = 4  # process in small batches for memory efficiency
@@ -193,6 +236,16 @@ class NemotronService:
             if images:
                 with torch.no_grad():
                     embeddings = self._model.forward_images(images, batch_size=len(images))
+
+                    # Optional pooling — runs on the native-dim tensors BEFORE
+                    # projection so clusters form in the richer embedding space.
+                    if pf is not None:
+                        try:
+                            embeddings = self._pool_embeddings(embeddings, pf)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "Token pooling failed (continuing without): %s", exc,
+                            )
 
                     for emb_tensor in embeddings:
                         # emb_tensor: (K, native_dim) — project to target_dim
@@ -251,10 +304,17 @@ def maxsim_score(query_vecs: np.ndarray, doc_vecs: np.ndarray) -> float:
 # ------------------------------------------------------------- factory
 
 def create_nemotron_service(settings, gpu: GPUManager) -> NemotronService:
+    # Reuse the existing colpali_pool_factor_storage setting as the
+    # cross-visual-model default so users don't have to learn a new knob.
+    # Both visual models now share this single dial for storage pooling.
+    pool_factor = getattr(
+        settings.models, "visual_pool_factor_storage", None,
+    ) or settings.models.colpali_pool_factor_storage
     svc = NemotronService(
         model_name=settings.models.visual_model_name,
         device=settings.gpu.device,
         target_dim=settings.models.visual_embed_dim,
+        pool_factor=pool_factor,
     )
     gpu.register(name="visual_embed", handle=svc, est_vram_bytes=_MODEL_VRAM_ESTIMATE)
     return svc

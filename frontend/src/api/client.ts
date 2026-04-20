@@ -75,6 +75,34 @@ export const extractEntities = (id: string) =>
     `/documents/${id}/extract-entities`,
     { method: "POST" }
   );
+export function rebuildChunks(
+  id: string,
+  opts: { extract_only?: boolean; skip_extract?: boolean } = {}
+) {
+  const q = new URLSearchParams();
+  if (opts.extract_only) q.set("extract_only", "true");
+  if (opts.skip_extract) q.set("skip_extract", "true");
+  return request<{ job_id: string; doc_id: string; status: string }>(
+    `/documents/${id}/rebuild-chunks${q.toString() ? "?" + q : ""}`,
+    { method: "POST" }
+  );
+}
+export function rebuildChunksBulk(body: {
+  doc_ids: string[];
+  extract_only?: boolean;
+  skip_extract?: boolean;
+  only_missing?: boolean;
+}) {
+  return request<{
+    queued: number;
+    skipped: number;
+    not_found: number;
+    jobs: Array<{ doc_id: string; job_id: string; title: string }>;
+  }>(`/admin/rebuild-chunks-bulk`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
 
 // ---- Categories & Tags ----
 export const listCategories = () => request<CategoryRow[]>("/categories");

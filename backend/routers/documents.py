@@ -168,6 +168,61 @@ async def extract_entities(doc_id: str, request: Request) -> ForgeResult:
     )
 
 
+@router.post("/documents/{doc_id}/rebuild-chunks")
+async def rebuild_chunks(
+    doc_id: str, request: Request,
+    extract_only: bool = False,
+    skip_extract: bool = False,
+) -> ForgeResult:
+    """Phase 5 rebuild for an existing document: Docling chunks + per-chunk
+    summaries + BGE-M3 embeddings + Phase 3 entity re-extraction on pages
+    missing topic_tags.
+
+    Query params:
+      extract_only=true  — skip chunk rebuild, only re-extract entities
+                           on pages missing topic_tags (cheap resume).
+      skip_extract=true  — chunks/summaries/embeddings only, no entity work.
+
+    Queues a job visible in /ingest/jobs and the Ingest tab.
+    """
+    import asyncio
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    rows = await neo4j.run_query(
+        "MATCH (d:Document {doc_id: $id}) RETURN d.filename AS f",
+        {"id": doc_id},
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+
+    if not extract_only and pipeline.chunk_summarizer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM service not configured — cannot build chunks",
+        )
+
+    filename = rows[0]["f"]
+    job = await jobs.create(
+        source_path=f"(rebuild-chunks of {doc_id})",
+        filename=filename,
+        categories=[],
+        tags=[],
+    )
+    asyncio.create_task(
+        pipeline.run_rebuild_chunks(
+            job.job_id, doc_id,
+            extract_only=extract_only,
+            skip_extract=skip_extract,
+        )
+    )
+    return ForgeResult(
+        success=True,
+        data={"job_id": job.job_id, "doc_id": doc_id, "status": "queued"},
+    )
+
+
 @router.post("/documents/{doc_id}/reembed")
 async def reembed_document(doc_id: str, request: Request) -> ForgeResult:
     """Re-run only the embedding steps (text + ColPali) for an existing document.

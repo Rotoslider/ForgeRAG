@@ -27,6 +27,7 @@ from backend.services.image_service import ImageHighlighter
 from backend.services.gpu_manager import GPUManager
 from backend.services.llm_service import create_llm_service
 from backend.services.neo4j_service import Neo4jService
+from backend.services.reranker_service import create_reranker_service
 from backend.services.text_embedding_service import create_text_embedding_service
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("Text embedding service not wired: %s", exc)
         app.state.text_embedding = None
+
+    # Reranker (bge-reranker-v2-m3) — post-retrieval cross-encoder.
+    # Optional: hybrid search falls back gracefully if unavailable.
+    try:
+        reranker = create_reranker_service(settings, gpu)
+        app.state.reranker = reranker
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Reranker service not wired: %s", exc)
+        app.state.reranker = None
 
     # Visual retrieval model — Nemotron ColEmbed 4B (default) or ColPali v1.3
     visual_model = None

@@ -24,16 +24,20 @@ Ask a question like *"What is alloy C12000 used for and how do I weld it?"* and 
 
 ## Status
 
-Phases 1–6 complete. Phase 7 (Choom agent integration) next.
+Phases 1–9 complete.
 
 - [x] **Phase 1**: FastAPI service + Neo4j schema
 - [x] **Phase 2**: PDF ingestion (rasterize → text extract → resume-friendly)
-- [x] **Phase 3**: Visual embeddings (Nemotron ColEmbed 4B) + text embeddings (nomic)
+- [x] **Phase 3**: Visual embeddings (Nemotron ColEmbed 4B, hierarchical token pooling)
+      + text embeddings (BGE-M3 1024d; Nomic still supported)
 - [x] **Phase 4**: LLM entity extraction (Qwen3.5 35B) + knowledge graph queries
 - [x] **Phase 5**: GraphRAG communities, hybrid search, page highlighting
 - [x] **Phase 6**: React/Vite frontend (Search, Ingest, Manage, Page Viewer)
-- [x] **Phase 7**: Choom agent skill integration (5 tools: ask, search, query graph, explore, list collections)
-- [x] **Phase 8**: Auto-tagging, entity normalization, bulk re-embed
+- [x] **Phase 7**: Choom agent skill integration (5 tools)
+- [x] **Phase 8**: Auto-tagging, entity canonicalization, bulk re-embed
+- [x] **Phase 9**: Structural chunking (Docling) + per-chunk LLM summaries
+      + RRF hybrid (BM25 + dense) + BGE reranker + Formula/Table/topic-tag
+      extraction + Standards `title` field + data-quality validators
 
 ## Architecture
 
@@ -59,16 +63,22 @@ Phases 1–6 complete. Phase 7 (Choom agent integration) next.
 
 ## Knowledge Graph
 
-Documents are organized into domain-specific **collections** (e.g., `asm_references`, `mechanical_design`, `firearms`). Each collection contains:
+Documents are organized into domain-specific **collections** (e.g., `asm_references`, `mechanical_design`, `firearms`). Each document's pages are further split into **structural chunks** (paragraphs, tables, figures, equations) via Docling, with per-chunk LLM summaries and BGE-M3 embeddings. Entities extracted from page text populate the knowledge graph; chunks carry the retrieval embeddings.
 
 ```
-(:Document)─[:HAS_PAGE]─►(:Page)
-     │                      │
-     ├─[:IN_CATEGORY]─►(:Category)
+(:Document)─[:HAS_PAGE]─►(:Page)─[:HAS_CHUNK]─►(:Chunk)
+     │                      │                      └─ text + summary + embedding
+     ├─[:IN_CATEGORY]─►(:Category)                    chunk_type (text/table/figure/…)
+     ├─[:TAGGED_WITH]─►(:Tag)                         section_path + bbox
+     │
      │                      ├─[:MENTIONS_MATERIAL]─►(:Material)
-     ├─[:TAGGED_WITH]─►(:Tag)   ├─[:DESCRIBES_PROCESS]─►(:Process)
+     │                      ├─[:DESCRIBES_PROCESS]─►(:Process)
      │                      ├─[:REFERENCES_STANDARD]─►(:Standard)
-     └─collection property   └─[:MENTIONS_EQUIPMENT]─►(:Equipment)
+     │                      ├─[:MENTIONS_EQUIPMENT]─►(:Equipment)
+     │                      ├─[:MENTIONS_FORMULA]──►(:Formula)
+     │                      └─[:MENTIONS_TABLE]────►(:RefTable)
+     │
+     └─ Page.topic_tags: ["tap-drill-chart", "fastener-torque", …]
 
 (:Material)─[:GOVERNED_BY]─►(:Standard)
 (:Material)─[:COMPATIBLE_WITH_PROCESS]─►(:Process)
@@ -77,30 +87,52 @@ Documents are organized into domain-specific **collections** (e.g., `asm_referen
 (:Page)─[:IN_COMMUNITY]─►(:Community)  ← GraphRAG summaries
 ```
 
-**Current graph** (after ingesting ASM Handbooks Vol 1 & 6):
-- 3 documents, 4,511 pages
-- 13,556 materials, 5,162 processes, 1,918 standards, 6,046 equipment
-- 40 GraphRAG communities with LLM-generated summaries
+**Node types added in Phase 9:**
+- `Chunk` — paragraph/table/figure-level unit with BGE-M3 embedding + LLM summary. Primary retrieval target (replaces whole-page text as the search granularity).
+- `Formula` — named engineering formulas (`kind`: stress, deflection, torque, power, electrical…) with expression + variable definitions.
+- `RefTable` — design-handbook reference tables (`kind`: dimensions, specifications, conversion, selection…) with title + natural-language description.
+- `Page.topic_tags` — page-level kebab-case topic classifier (`tap-drill-chart`, `conductor-ampacity`, `gear-tooth-geometry`, …) as a fast retrieval filter.
+
+**Entity canonicalization** (Phase 8): Material / Equipment / Process / Standard nodes go through Tier 1 case-fold + singularization + designation-prefix merging at apply time. Existing graphs can be canonicalized retroactively via the scripts below.
+
+**Standard codes vs titles**: `Standard.code` is the short designator (`ASME BPVC IX`, `NFPA 70`, `SEMI S2`); `Standard.title` is the full descriptive title. Both are alias-aware in queries.
 
 ## Search Modes
 
 | Mode | What it does | Best for |
 |------|-------------|----------|
-| **Answer** (default) | Keyword + ColPali visual retrieval + graph traversal → VLM reads page images → synthesized answer with citations | Questions: *"What preheat does ASME IX require for P-1 over 1 inch?"* |
-| **Keyword** | Lucene full-text phrase search on extracted text | Specific codes: *"C12000"*, *"QW-451.1"*, *"ASTM A 709"* |
-| **Visual** | ColPali/Nemotron two-stage retrieval (text vector coarse → MaxSim rerank) | Finding specific charts, tables, diagrams |
-| **Hybrid** | Vector + knowledge graph entity boosting | Broad topics where graph connections matter |
+| **Answer** (default) | RRF hybrid + BGE reranker + graph traversal → VLM reads page images → synthesized answer with citations | Questions: *"What preheat does ASME IX require for P-1 over 1 inch?"* |
+| **Keyword** | Lucene full-text phrase search on extracted text/chunks | Specific codes: *"C12000"*, *"QW-451.1"*, *"ASTM A 709"* |
+| **Visual** | ColPali/Nemotron two-stage retrieval (text-vector coarse → MaxSim rerank) | Finding specific charts, tables, diagrams |
+| **Hybrid** | Strategies: `rrf` (BM25 + dense + bge-reranker, default), `graph_boosted`, `vector_first`, `graph_first`, `community` | Tuned search behaviour per query type |
+
+### RRF Hybrid (default)
+
+`rrf` fuses two independent rankings with Reciprocal Rank Fusion (k=60):
+
+1. **BM25** over chunk text + summary via Neo4j's Lucene full-text index — catches rare exact tokens (`QW-451.1`, `6061-T6`, `ER308LT-1`) that dense embeddings blur.
+2. **Dense vector** similarity over BGE-M3 1024-dim chunk embeddings — catches semantic paraphrases.
+
+The top ~50 fused candidates are then reranked by **`BAAI/bge-reranker-v2-m3`**, a cross-encoder that scores each (query, chunk) pair in one pass. Final top-K is returned to the caller. `rerank: false` on the request skips the cross-encoder if you want to inspect raw RRF order.
 
 Answer mode includes **adjacent pages** (N-1 and N+1) so the VLM can read tables that span page boundaries. It also feeds **knowledge graph context** (relationship chains, related entities, community summaries) into the LLM prompt so it can mention relevant standards and processes the user didn't specifically ask about.
 
-## Visual Retrieval Models
+## Retrieval Models
 
-| Model | Embedding dim | Tokens/page | VRAM | Storage/page |
-|-------|-------------|-------------|------|-------------|
-| **Nemotron ColEmbed 4B** (default) | 128 (projected from 2560) | 773 | ~12 GB | 396 KB |
-| ColPali v1.3 (fallback) | 128 | 1031 | ~24 GB | 175 KB |
+**Text embeddings** — BGE-M3 (1024-dim) is the Phase 9 default; the older Nomic v1.5 (768-dim) is still supported by toggling `text_embedding_model`. Query-time prefix handling is model-aware (Nomic uses `search_query: ` / `search_document: `; BGE-M3 doesn't).
 
-Configured via `visual_model_type` in `config/forgerag.toml`. Both use the same MaxSim late-interaction scoring and binary blob storage format on Neo4j Page nodes.
+**Reranker** — `BAAI/bge-reranker-v2-m3` cross-encoder (~1.2 GB VRAM, fp16). Lazy-loaded, auto-unloaded when idle. Re-scores top-K hybrid candidates.
+
+**Visual embeddings:**
+
+| Model | Embed dim | Native tokens/page | With pool_factor=3 | VRAM | Storage/page |
+|-------|-----------|-------------------|-------------------|------|-------------|
+| **Nemotron ColEmbed 4B** (default) | 128 (projected from 2560) | 773 | ~258 | ~12 GB | ~130 KB pooled |
+| ColPali v1.3 (fallback) | 128 | 1031 | ~343 | ~24 GB | ~175 KB pooled |
+
+Both visual models share a single `visual_pool_factor_storage` config knob (default 3) that applies `HierarchicalTokenPooler` at embed time — semantic clusters of patches (whitespace, uniform text, figure regions) collapse to one representative vector each. 3x reduction in storage and MaxSim compute with negligible accuracy loss. Set to 1 to disable.
+
+Configured via `visual_model_type` in `config/forgerag.toml`. Both use MaxSim late-interaction scoring and the same binary blob storage format on Page nodes.
 
 ## Setup
 
@@ -179,11 +211,39 @@ Web GUI: `http://localhost:8200/app/`
 
 ### Manage
 
-- **Documents table**: edit collection, tags, categories inline. Re-embed, extract entities, or delete.
+- **Documents table**: edit collection, tags, categories inline. Per-row actions: rebuild chunks (Phase 9), extract-only (retry failed pages), re-embed (legacy), extract entities (legacy), delete.
+- **Multi-select + bulk actions**: checkboxes on each row. Select multiple documents, then "rebuild (N)", "extract-only", or "only-missing" (skip docs that already have chunks). Jobs queue sequentially — pick a handful to run now or queue the whole library overnight.
 - **Graph Stats**: live entity counts across the knowledge graph
 - **GPU**: VRAM usage, loaded models, manual unload
 - **Communities**: rebuild GraphRAG summaries from the entity graph
 - **Entities**: browse Materials, Processes, Standards, Equipment with page mention counts
+
+### Rebuild existing documents for Phase 9
+
+Documents ingested before Phase 9 only have Page-level embeddings. To get them onto the new chunked + RRF retrieval path:
+
+**GUI path** — Manage tab, select docs, click "rebuild". Progress in the Ingest tab.
+
+**CLI path**:
+
+```bash
+# Full rebuild of every doc — runs overnight at scale
+NEO4J_PASSWORD=... ./venv/bin/python scripts/rebuild_chunks.py
+
+# Just the docs that don't have chunks yet (resume)
+NEO4J_PASSWORD=... ./venv/bin/python scripts/rebuild_chunks.py --only-missing
+
+# One specific doc
+NEO4J_PASSWORD=... ./venv/bin/python scripts/rebuild_chunks.py --doc-id DOC_XXX
+
+# Cheap retry: only re-extract entities on pages that failed
+NEO4J_PASSWORD=... ./venv/bin/python scripts/rebuild_chunks.py --doc-id DOC_XXX --extract-only
+```
+
+Flags:
+- `--only-missing` — skip docs that already have Chunk nodes
+- `--skip-extract` — chunks + summaries + embeddings only (no entity re-extraction)
+- `--extract-only` — only re-extract entities on pages missing `topic_tags` (inverse of `--skip-extract`)
 
 ## API Endpoints
 
@@ -215,6 +275,7 @@ Web GUI: `http://localhost:8200/app/`
 | DELETE | `/documents/{id}/categories/{name}` | Remove a category |
 | POST | `/documents/{id}/reembed` | Re-run visual + text embeddings |
 | POST | `/documents/{id}/extract-entities` | Re-run LLM entity extraction |
+| POST | `/documents/{id}/rebuild-chunks` | Phase 9 rebuild: chunks + summaries + embeddings + entity re-extraction. Query params: `extract_only=true` (only re-extract pages missing topic_tags), `skip_extract=true` (chunks only) |
 | GET | `/documents/{id}/pages` | List pages |
 | GET | `/documents/{id}/pages/{n}` | Page detail with full text |
 
@@ -250,7 +311,9 @@ Web GUI: `http://localhost:8200/app/`
 ### Admin
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/admin/dedup-pages` | Remove duplicate Page nodes |
+| POST | `/admin/normalize-entities` | Merge duplicate entities that differ only by case/whitespace |
+| POST | `/admin/bulk-reembed` | Queue re-embed jobs for every document |
+| POST | `/admin/rebuild-chunks-bulk` | Queue Phase 9 chunk rebuilds for a list of doc_ids. Body: `{doc_ids, extract_only?, skip_extract?, only_missing?}`. Jobs run sequentially |
 | POST | `/admin/cleanup-uploads` | Delete staged upload files |
 
 ## Configuration
@@ -261,8 +324,8 @@ See `config/forgerag.toml.example` for all settings. Key sections:
 |---------|-------------|
 | `[server]` | port (8200), data_dir |
 | `[neo4j]` | uri, database (neo4j), password_env |
-| `[models]` | visual_model_name, visual_model_type (nemotron/colpali), visual_embed_dim (128), text_embedding_model |
-| `[llm]` | endpoint (LM Studio), model (qwen3.5-35b-a3b), use_json_schema, max_tokens |
+| `[models]` | `visual_model_name`, `visual_model_type` (nemotron/colpali), `visual_embed_dim` (128), `colpali_pool_factor_storage` (3, shared by both visual models), `text_embedding_model` (`BAAI/bge-m3` default), `text_embedding_dim` (1024), `reranker_model` (`BAAI/bge-reranker-v2-m3`) |
+| `[llm]` | endpoint (LM Studio), model (qwen3.5-35b-a3b), use_json_schema, max_tokens (4096; entity extraction internally bumps to 8192 for standards-heavy pages) |
 | `[ingestion]` | pdf_dpi (300), batch sizes, scanned text threshold |
 | `[gpu]` | device, model_idle_unload_seconds (300) |
 
@@ -284,20 +347,26 @@ ForgeRAG/
 │   │   ├── system.py              GPU status + model management
 │   │   └── admin.py               Dedup, cleanup utilities
 │   ├── services/
-│   │   ├── nemotron_service.py    Nemotron ColEmbed 4B (visual retrieval)
+│   │   ├── nemotron_service.py    Nemotron ColEmbed 4B + hierarchical token pooling
 │   │   ├── colpali_service.py     ColPali v1.3 (legacy visual retrieval)
-│   │   ├── text_embedding_service.py  nomic-embed-text (text vectors)
-│   │   ├── llm_service.py         OpenAI-compatible LLM client
+│   │   ├── text_embedding_service.py  BGE-M3 / Nomic (model-aware prefixes)
+│   │   ├── reranker_service.py    bge-reranker-v2-m3 cross-encoder
+│   │   ├── llm_service.py         OpenAI-compatible LLM client (response preview
+│   │   │                           logging on validation failure)
 │   │   ├── gpu_manager.py         VRAM tracking, semaphore, idle unload
 │   │   ├── graph_reasoning.py     Graph traversal for answer context
 │   │   ├── image_service.py       Page highlight overlay (ColPali heatmap)
 │   │   └── neo4j_service.py       Async Neo4j driver wrapper
 │   ├── ingestion/
-│   │   ├── pipeline.py            8-step ingestion orchestrator
+│   │   ├── pipeline.py            Ingestion orchestrator (full + partial runs)
 │   │   ├── pdf_processor.py       PDF → PNGs (chunked, resume-friendly)
 │   │   ├── text_extractor.py      PyMuPDF text extraction
+│   │   ├── chunker.py             Docling structural chunker (para/table/fig/eq)
+│   │   ├── chunk_summarizer.py    Per-chunk LLM summaries (short chunks bypass LLM)
 │   │   ├── entity_extractor.py    LLM structured entity/relationship extraction
-│   │   ├── graph_builder.py       Neo4j MERGE for entities + relationships
+│   │   │                           with content validators (prompt-leak, JSON-debris,
+│   │   │                           prose-as-name, bibliographic-reference filters)
+│   │   ├── graph_builder.py       Neo4j MERGE for entities + relationships + chunks
 │   │   ├── community_detector.py  Leiden clustering + LLM summaries
 │   │   └── job_manager.py         SQLite job queue
 │   └── db/
@@ -316,8 +385,17 @@ ForgeRAG/
 ├── config/forgerag.toml.example   Template
 ├── systemd/forgerag-api.service   systemd unit
 ├── scripts/
-│   ├── install_neo4j.sh           Neo4j Community 5.x installer
-│   └── seed_schema.py             Apply Neo4j schema (idempotent)
+│   ├── install_neo4j.sh                  Neo4j Community 5.x installer
+│   ├── seed_schema.py                    Apply Neo4j schema (idempotent)
+│   ├── rebuild_chunks.py                 Phase 9 CLI rebuild: chunks + summaries
+│   │                                      + BGE-M3 embeddings + entity re-extraction.
+│   │                                      Flags: --doc-id, --only-missing, --skip-extract,
+│   │                                      --extract-only
+│   ├── canonicalize_materials_dryrun.py  Plan Tier 1 Material canonicalization
+│   ├── canonicalize_materials_apply.py   Apply the plan (idempotent, per-group tx)
+│   ├── canonicalize_entity_dryrun.py     Generalized canonicalization for any label
+│   ├── canonicalize_entity_apply.py      (--label Equipment|Process|Standard|Material)
+│   └── cleanup_numeric_garbage.py        Null LLM-debris values in Material numeric fields
 └── data/                          Runtime data (gitignored)
     ├── page_images/{hash}/        Full-resolution PNGs
     ├── reduced_images/{hash}/     Reduced JPGs
@@ -341,4 +419,6 @@ ForgeRAG/
 Code: MIT. Models have their own licenses:
 - Nemotron ColEmbed: CC-BY-NC-4.0 (non-commercial)
 - ColPali v1.3: MIT
+- BGE-M3 / bge-reranker-v2-m3: MIT
 - nomic-embed-text: Apache 2.0
+- Docling + docling-models: MIT / Apache 2.0

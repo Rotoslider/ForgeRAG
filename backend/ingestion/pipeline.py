@@ -19,11 +19,14 @@ import asyncio
 import hashlib
 import logging
 import uuid
+from collections import Counter as _Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.config import Settings
 from backend.ingestion.auto_tagger import AutoTagger
+from backend.ingestion.chunk_summarizer import ChunkSummarizer
+from backend.ingestion.chunker import StructuralChunker, StructuralChunk
 from backend.ingestion.community_detector import CommunityDetector
 from backend.ingestion.entity_extractor import EntityExtractor
 from backend.ingestion.graph_builder import GraphBuilder
@@ -98,6 +101,10 @@ class IngestionPipeline:
         self.llm = llm
         self.entity_extractor = EntityExtractor(llm) if llm is not None else None
         self.auto_tagger = AutoTagger(llm) if llm is not None else None
+        self.chunk_summarizer = ChunkSummarizer(llm) if llm is not None else None
+        # Docling initialization is expensive; keep it lazy via the chunker
+        # class's own lazy-load.
+        self.structural_chunker = StructuralChunker()
         self.graph_builder = GraphBuilder(neo4j)
         self.community_detector = (
             CommunityDetector(neo4j=neo4j, llm=llm, text_embedding=text_embedding)
@@ -161,6 +168,23 @@ class IngestionPipeline:
                 )
                 await self._embed_text(job_id, doc_id)
 
+            # Phase 5: structural chunking + per-chunk summarization + embedding.
+            # Replaces whole-page text as the primary retrieval target. Runs
+            # only if all pieces are wired (chunker, summarizer, embedder).
+            if (
+                self.chunk_summarizer is not None
+                and self.text_embedding is not None
+            ):
+                await self.jobs.update(
+                    job_id, current_step="building_chunks", progress_pct=68.0
+                )
+                try:
+                    await self._build_chunks(job_id, doc_id, file_hash, job.source_path)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Chunking failed for doc %s (continuing): %s", doc_id, exc
+                    )
+
             if self.colpali is not None:
                 await self.jobs.update(
                     job_id, current_step="embedding_visual", progress_pct=75.0
@@ -219,6 +243,204 @@ class IngestionPipeline:
             logger.info("Extraction-only job %s completed for doc %s", job_id, doc_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Extraction-only job %s failed", job_id)
+            await self.jobs.fail(job_id, str(exc))
+
+    async def run_rebuild_chunks(
+        self, job_id: str, doc_id: str, *,
+        extract_only: bool = False,
+        skip_extract: bool = False,
+    ) -> None:
+        """Phase 5 rebuild: structural chunks + summaries + embeddings +
+        Phase 3 entity re-extraction on pages missing topic_tags.
+
+        Modes:
+        - default: chunks + summaries + embeddings + entity re-extraction
+        - extract_only=True: only re-extract entities on pages that need it
+          (cheap resume after an extractor bug fix)
+        - skip_extract=True: chunks/summaries/embeddings only (no entity work)
+
+        Mirrors scripts/rebuild_chunks.py's behavior but uses the long-lived
+        in-process services so the GUI-triggered rebuild doesn't re-download
+        models or re-apply schema on every run.
+        """
+        try:
+            await self.jobs.update(job_id, status="processing", doc_id=doc_id)
+
+            if extract_only and skip_extract:
+                raise ValueError(
+                    "extract_only and skip_extract are mutually exclusive"
+                )
+
+            rows = await self.neo4j.run_query(
+                "MATCH (d:Document {doc_id: $d}) "
+                "RETURN d.title AS title, d.file_hash AS file_hash, "
+                "       d.filename AS filename",
+                {"d": doc_id},
+            )
+            if not rows:
+                raise ValueError(f"Document {doc_id} not found")
+            title = rows[0]["title"] or doc_id
+            file_hash = rows[0]["file_hash"]
+            filename = rows[0]["filename"] or ""
+
+            # Locate source PDF in data/uploads/ by hash prefix
+            upload_dir = Path(self.settings.server.data_dir) / "uploads"
+            candidates = list(upload_dir.glob(f"{file_hash[:32]}_*"))
+            if not candidates and filename:
+                candidates = list(upload_dir.glob(f"*{filename}"))
+            if not candidates:
+                raise ValueError(
+                    f"Source PDF not found in {upload_dir} for doc {doc_id}"
+                )
+            pdf_path = candidates[0]
+
+            if not extract_only:
+                if self.text_embedding is None or self.chunk_summarizer is None:
+                    raise ValueError(
+                        "text_embedding or chunk_summarizer not configured — "
+                        "cannot build chunks"
+                    )
+                await self.jobs.update(
+                    job_id, current_step="chunking", progress_pct=5.0,
+                )
+                chunks = await asyncio.to_thread(
+                    self.structural_chunker.chunk_pdf, pdf_path, file_hash,
+                )
+                if not chunks:
+                    logger.warning(
+                        "Chunker produced no chunks for doc %s", doc_id,
+                    )
+                else:
+                    await self.jobs.update(
+                        job_id, current_step="summarizing",
+                        pages_total=len(chunks), progress_pct=20.0,
+                    )
+                    summaries = await self.chunk_summarizer.summarize_batch(
+                        chunks, concurrency=4,
+                    )
+                    await self.jobs.update(
+                        job_id, current_step="embedding_chunks",
+                        progress_pct=55.0,
+                    )
+                    embed_inputs = [
+                        f"{s}\n\n{c.text[:2000]}"
+                        for s, c in zip(summaries, chunks)
+                    ]
+                    assert self.gpu is not None
+                    async with self.gpu.load_scope("text_embedding"):
+                        vectors = await asyncio.to_thread(
+                            self.text_embedding.embed_documents,
+                            embed_inputs,
+                            batch_size=self.settings.ingestion.text_embedding_batch_size,
+                        )
+                    await self.jobs.update(
+                        job_id, current_step="writing_chunks",
+                        progress_pct=65.0,
+                    )
+                    BATCH = 200
+                    for i in range(0, len(chunks), BATCH):
+                        end = min(i + BATCH, len(chunks))
+                        rows_to_write = []
+                        for ch, summ, vec in zip(
+                            chunks[i:end], summaries[i:end], vectors[i:end]
+                        ):
+                            rows_to_write.append({
+                                "chunk_id": ch.chunk_id,
+                                "page_number": ch.page_number,
+                                "chunk_index": ch.chunk_index,
+                                "chunk_type": ch.chunk_type,
+                                "text": ch.text,
+                                "summary": summ,
+                                "section_path": ch.section_path,
+                                "embedding": vec.tolist(),
+                                "bbox": list(ch.bbox) if ch.bbox is not None else None,
+                            })
+                        await self.neo4j.run_write(
+                            """
+                            UNWIND $rows AS row
+                            MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page {page_number: row.page_number})
+                            MERGE (c:Chunk {chunk_id: row.chunk_id})
+                            ON CREATE SET c.page_number = row.page_number,
+                                          c.chunk_index = row.chunk_index,
+                                          c.chunk_type = row.chunk_type,
+                                          c.text = row.text,
+                                          c.summary = row.summary,
+                                          c.section_path = row.section_path,
+                                          c.embedding = row.embedding,
+                                          c.bbox = row.bbox,
+                                          c.doc_id = $doc_id
+                            ON MATCH SET  c.text = row.text,
+                                          c.summary = row.summary,
+                                          c.section_path = row.section_path,
+                                          c.chunk_type = row.chunk_type,
+                                          c.embedding = row.embedding,
+                                          c.bbox = row.bbox
+                            MERGE (p)-[:HAS_CHUNK]->(c)
+                            """,
+                            {"doc_id": doc_id, "rows": rows_to_write},
+                        )
+
+            if not skip_extract:
+                if self.entity_extractor is None:
+                    logger.warning(
+                        "Entity extractor not configured — skipping re-extraction"
+                    )
+                else:
+                    await self.jobs.update(
+                        job_id, current_step="extracting_entities",
+                        progress_pct=75.0,
+                    )
+                    # Re-extract only pages missing topic_tags — keeps retries cheap
+                    todo = await self.neo4j.run_query(
+                        """
+                        MATCH (d:Document {doc_id: $d})-[:HAS_PAGE]->(p:Page)
+                        WHERE p.extracted_text IS NOT NULL
+                          AND (p.topic_tags IS NULL OR size(p.topic_tags) = 0)
+                          AND coalesce(p.is_blank, false) = false
+                        RETURN p.page_id AS page_id, p.page_number AS page_number,
+                               p.extracted_text AS text
+                        ORDER BY p.page_number
+                        """,
+                        {"d": doc_id},
+                    )
+                    total = len(todo)
+                    await self.jobs.update(
+                        job_id, pages_total=total, pages_processed=0,
+                    )
+                    done = 0
+                    failed = 0
+                    for p in todo:
+                        try:
+                            extraction = await self.entity_extractor.extract_page(
+                                document_title=title,
+                                page_number=p["page_number"],
+                                page_text=p["text"],
+                            )
+                            await self.graph_builder.write_page(
+                                page_id=p["page_id"], extraction=extraction,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(
+                                "rebuild-chunks: page %d extraction failed: %s",
+                                p["page_number"], exc,
+                            )
+                            failed += 1
+                        done += 1
+                        if done % 10 == 0 or done == total:
+                            await self.jobs.update(
+                                job_id, pages_processed=done,
+                                progress_pct=min(99.0, 75.0 + 24.0 * done / max(total, 1)),
+                            )
+                    if failed:
+                        logger.warning(
+                            "rebuild-chunks: %d/%d page extractions failed",
+                            failed, total,
+                        )
+
+            await self.jobs.complete(job_id)
+            logger.info("Rebuild-chunks job %s completed for doc %s", job_id, doc_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Rebuild-chunks job %s failed", job_id)
             await self.jobs.fail(job_id, str(exc))
 
     async def _backfill_blank_flags(self, doc_id: str, file_hash: str) -> int:
@@ -832,3 +1054,101 @@ class IngestionPipeline:
             )
 
         logger.info("Entity extraction complete for doc %s: %s", doc_id, aggregate)
+
+    # --------------------------------------------------------- chunk building
+
+    async def _build_chunks(
+        self, job_id: str, doc_id: str, file_hash: str, pdf_path: str,
+    ) -> dict[str, int]:
+        """Parse the PDF into structural chunks, summarize, embed, write.
+
+        Idempotent per (doc_hash, chunk_id) — re-running on an already-chunked
+        doc updates chunks in place instead of duplicating them. Safe to rerun
+        after a partial failure.
+        """
+        # 1. Docling pass. Runs off the asyncio loop because it's CPU-bound.
+        chunks: list[StructuralChunk] = await asyncio.to_thread(
+            self.structural_chunker.chunk_pdf, pdf_path, file_hash,
+        )
+        if not chunks:
+            logger.warning("Chunker returned no chunks for %s", pdf_path)
+            return {"chunks": 0}
+
+        logger.info(
+            "Chunker produced %d chunks for doc %s; summarizing...",
+            len(chunks), doc_id,
+        )
+
+        # 2. Summaries — bounded-concurrency LLM calls. Short chunks skip
+        # the LLM and reuse their text (see ChunkSummarizer).
+        assert self.chunk_summarizer is not None
+        summaries = await self.chunk_summarizer.summarize_batch(chunks, concurrency=4)
+
+        # 3. Embed (summary + text concatenated produces the retrieval vector).
+        # We embed the pair so a match on either the raw text or the summary
+        # contributes to the dense score. BM25 runs on both fields
+        # independently via the chunk_text_fulltext index.
+        assert self.text_embedding is not None
+        assert self.gpu is not None
+        embed_inputs = [
+            f"{s}\n\n{c.text[:2000]}" for s, c in zip(summaries, chunks)
+        ]
+        async with self.gpu.load_scope("text_embedding"):
+            vectors = await asyncio.to_thread(
+                self.text_embedding.embed_documents, embed_inputs,
+                batch_size=self.settings.ingestion.text_embedding_batch_size,
+            )
+
+        # 4. Map each chunk to its Page node via (file_hash, page_number).
+        # Write in batches to keep Neo4j write latency low.
+        BATCH = 200
+        total_written = 0
+        for i in range(0, len(chunks), BATCH):
+            batch = chunks[i : i + BATCH]
+            rows = []
+            for ch, summ, vec in zip(
+                batch, summaries[i : i + BATCH], vectors[i : i + BATCH]
+            ):
+                rows.append({
+                    "chunk_id": ch.chunk_id,
+                    "page_number": ch.page_number,
+                    "chunk_index": ch.chunk_index,
+                    "chunk_type": ch.chunk_type,
+                    "text": ch.text,
+                    "summary": summ,
+                    "section_path": ch.section_path,
+                    "embedding": vec.tolist(),
+                    "bbox": list(ch.bbox) if ch.bbox is not None else None,
+                })
+            await self.neo4j.run_write(
+                """
+                UNWIND $rows AS row
+                MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page {page_number: row.page_number})
+                MERGE (c:Chunk {chunk_id: row.chunk_id})
+                ON CREATE SET c.page_number = row.page_number,
+                              c.chunk_index = row.chunk_index,
+                              c.chunk_type = row.chunk_type,
+                              c.text = row.text,
+                              c.summary = row.summary,
+                              c.section_path = row.section_path,
+                              c.embedding = row.embedding,
+                              c.bbox = row.bbox,
+                              c.doc_id = $doc_id
+                ON MATCH SET  c.text = row.text,
+                              c.summary = row.summary,
+                              c.section_path = row.section_path,
+                              c.chunk_type = row.chunk_type,
+                              c.embedding = row.embedding,
+                              c.bbox = row.bbox
+                MERGE (p)-[:HAS_CHUNK]->(c)
+                """,
+                {"doc_id": doc_id, "rows": rows},
+            )
+            total_written += len(rows)
+
+        logger.info(
+            "Wrote %d chunks for doc %s (types: %s)",
+            total_written, doc_id,
+            dict(_Counter(c.chunk_type for c in chunks)),
+        )
+        return {"chunks": total_written}

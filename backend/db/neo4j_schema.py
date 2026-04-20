@@ -54,6 +54,20 @@ CONSTRAINTS: list[str] = [
 
     "CREATE CONSTRAINT community_id_unique IF NOT EXISTS "
     "FOR (c:Community) REQUIRE c.community_id IS UNIQUE",
+
+    # Phase 2: structural chunk nodes carry per-paragraph/table/figure
+    # text + summary + embeddings. chunk_id is deterministic per
+    # (doc_hash, page, index, content hash) so re-chunks are idempotent.
+    "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS "
+    "FOR (c:Chunk) REQUIRE c.chunk_id IS UNIQUE",
+
+    # Phase 3: Formula and Table entity types — structured reference
+    # content extracted from design handbooks.
+    "CREATE CONSTRAINT formula_id_unique IF NOT EXISTS "
+    "FOR (f:Formula) REQUIRE f.formula_id IS UNIQUE",
+
+    "CREATE CONSTRAINT ref_table_id_unique IF NOT EXISTS "
+    "FOR (t:RefTable) REQUIRE t.table_id IS UNIQUE",
 ]
 
 # Standard B-tree indexes for common lookup patterns
@@ -72,6 +86,13 @@ INDEXES: list[str] = [
 
     "CREATE INDEX standard_organization IF NOT EXISTS "
     "FOR (s:Standard) ON (s.organization)",
+
+    # Chunk lookup by page for fast "chunks on this page" traversals.
+    "CREATE INDEX chunk_page_number IF NOT EXISTS "
+    "FOR (c:Chunk) ON (c.page_number)",
+
+    "CREATE INDEX chunk_type IF NOT EXISTS "
+    "FOR (c:Chunk) ON (c.chunk_type)",
 ]
 
 
@@ -80,14 +101,33 @@ INDEXES: list[str] = [
 FULLTEXT_INDEXES: list[str] = [
     """CREATE FULLTEXT INDEX page_text_fulltext IF NOT EXISTS
        FOR (p:Page) ON EACH [p.extracted_text]""",
+
+    # Chunk-level fulltext for BM25 in the RRF hybrid strategy. Includes
+    # the LLM-written summary so high-level phrasings ("tap drill table")
+    # match even when the raw chunk text uses different wording.
+    """CREATE FULLTEXT INDEX chunk_text_fulltext IF NOT EXISTS
+       FOR (c:Chunk) ON EACH [c.text, c.summary]""",
 ]
 
 
 def vector_indexes(dim: int) -> list[str]:
     """Vector indexes — parameterized by embedding dimension."""
     return [
+        # Legacy Page-level index (retained for back-compat; Phase 2 moves
+        # search onto Chunks but we don't drop this so old data stays
+        # queryable during the migration).
         f"""CREATE VECTOR INDEX page_text_embedding IF NOT EXISTS
            FOR (p:Page) ON (p.text_embedding)
+           OPTIONS {{ indexConfig: {{
+               `vector.dimensions`: {dim},
+               `vector.similarity_function`: 'cosine'
+           }} }}""",
+
+        # Phase 2 primary retrieval target: one dense vector per structural
+        # chunk. Uses the same dim as Page embeddings so the embedder is
+        # shared; both indexes point at the same model's output.
+        f"""CREATE VECTOR INDEX chunk_embedding IF NOT EXISTS
+           FOR (c:Chunk) ON (c.embedding)
            OPTIONS {{ indexConfig: {{
                `vector.dimensions`: {dim},
                `vector.similarity_function`: 'cosine'

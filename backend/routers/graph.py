@@ -38,10 +38,19 @@ _ENTITY_PK = {
 
 # Predefined query templates. Each template is a (cypher, required_params) pair.
 # Params are substituted via $param syntax — never string-interpolated.
+# Templates use alias-aware lookup: `m.name = $param OR $param IN common_names`.
+# This is essential after canonicalization — "4140 steel" now lives in the
+# common_names list of the "4140" node, not as its own node. Callers can
+# look entities up by any historical spelling. The OR-on-list variant is
+# index-friendly for the .name path and falls back to a list membership
+# check for the alias path.
 _QUERY_TEMPLATES: dict[QueryTemplate, tuple[str, list[str]]] = {
     "material_standards": (
         """
-        MATCH (m:Material {name: $material})-[r:GOVERNED_BY]->(s:Standard)
+        MATCH (m:Material)
+        WHERE m.name = $material
+           OR $material IN coalesce(m.common_names, [])
+        MATCH (m)-[r:GOVERNED_BY]->(s:Standard)
         RETURN m.name AS material, s.code AS standard, s.organization AS org,
                r.support_count AS support_count, r.context AS context
         ORDER BY r.support_count DESC, s.code
@@ -51,7 +60,10 @@ _QUERY_TEMPLATES: dict[QueryTemplate, tuple[str, list[str]]] = {
     ),
     "process_materials": (
         """
-        MATCH (m:Material)-[r:COMPATIBLE_WITH_PROCESS]->(p:Process {name: $process})
+        MATCH (p:Process)
+        WHERE p.name = $process
+           OR $process IN coalesce(p.common_names, [])
+        MATCH (m:Material)-[r:COMPATIBLE_WITH_PROCESS]->(p)
         RETURN p.name AS process, m.name AS material,
                m.material_type AS material_type,
                r.support_count AS support_count, r.context AS context
@@ -62,7 +74,11 @@ _QUERY_TEMPLATES: dict[QueryTemplate, tuple[str, list[str]]] = {
     ),
     "standard_cross_references": (
         """
-        MATCH (s1:Standard {code: $standard})-[r:REFERENCES]->(s2:Standard)
+        MATCH (s1:Standard)
+        WHERE s1.code = $standard
+           OR s1.title = $standard
+           OR $standard IN coalesce(s1.common_names, [])
+        MATCH (s1)-[r:REFERENCES]->(s2:Standard)
         RETURN s1.code AS standard, s2.code AS referenced, s2.organization AS org,
                r.support_count AS support_count, r.context AS context
         ORDER BY r.support_count DESC, s2.code
@@ -72,19 +88,24 @@ _QUERY_TEMPLATES: dict[QueryTemplate, tuple[str, list[str]]] = {
     ),
     "material_properties": (
         """
-        MATCH (m:Material {name: $material})
+        MATCH (m:Material)
+        WHERE m.name = $material
+           OR $material IN coalesce(m.common_names, [])
         RETURN m.name AS name, m.material_type AS material_type,
                m.uns_number AS uns_number, m.common_names AS common_names,
                m.tensile_strength_ksi AS tensile_strength_ksi,
                m.yield_strength_ksi AS yield_strength_ksi,
                m.hardness AS hardness,
                size([(m)<-[:MENTIONS_MATERIAL]-(:Page) | 1]) AS page_mentions
+        LIMIT 1
         """,
         ["material"],
     ),
     "equipment_requirements": (
         """
-        MATCH (e:Equipment {name: $equipment})
+        MATCH (e:Equipment)
+        WHERE e.name = $equipment
+           OR $equipment IN coalesce(e.common_names, [])
         OPTIONAL MATCH (e)-[:GOVERNED_BY]->(s:Standard)
         WITH e, collect(DISTINCT s.code) AS standards
         RETURN e.name AS equipment, e.equipment_type AS equipment_type,
@@ -110,7 +131,11 @@ _QUERY_TEMPLATES: dict[QueryTemplate, tuple[str, list[str]]] = {
     ),
     "entity_pages": (
         """
-        MATCH (t) WHERE t.name = $entity_name OR t.code = $entity_name
+        MATCH (t)
+        WHERE t.name = $entity_name
+           OR t.code = $entity_name
+           OR t.title = $entity_name
+           OR $entity_name IN coalesce(t.common_names, [])
         MATCH (p:Page)-[r]->(t)
         MATCH (d:Document)-[:HAS_PAGE]->(p)
         RETURN d.doc_id AS doc_id, d.title AS document_title,
@@ -162,8 +187,15 @@ async def graph_explore(body: GraphExploreRequest, request: Request) -> ForgeRes
         raise HTTPException(status_code=400, detail=f"Unknown entity_type: {body.entity_type}")
 
     # Safe to interpolate label/pk from whitelist; name goes through a parameter.
+    # Alias-aware: accept the canonical PK value, its title if any, OR any
+    # of the entity's common_names (populated by Tier 1 canonicalization
+    # with merged spellings). The title check is a no-op for labels that
+    # don't have a title property.
     cypher = f"""
-        MATCH (n:{label} {{{pk}: $name}})
+        MATCH (n:{label})
+        WHERE n.{pk} = $name
+           OR n.title = $name
+           OR $name IN coalesce(n.common_names, [])
         OPTIONAL MATCH path = (n)-[*1..{body.depth}]-(neighbor)
         WHERE neighbor <> n
         WITH n, neighbor, relationships(path) AS rels, path

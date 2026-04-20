@@ -219,8 +219,16 @@ class LLMService:
                 return schema_cls.model_validate(data)
             except ValidationError as exc:
                 last_err = exc
-                logger.warning("LLM response failed schema validation (attempts left=%d): %s", attempts_left, exc)
-                # Next iteration: ask the model to fix itself
+                # Log both the validation errors and a preview of what the
+                # model returned. Without the preview we can't diagnose
+                # cases where the model emits structurally-valid JSON with
+                # semantically-wrong content (prompt leaking into fields,
+                # etc.) — the only clue is in the raw response.
+                logger.warning(
+                    "LLM response failed schema validation (attempts left=%d): %s\n"
+                    "Response preview: %.400s",
+                    attempts_left, exc, content,
+                )
                 messages = messages + [
                     {
                         "role": "user",
@@ -232,7 +240,13 @@ class LLMService:
                 ]
                 continue
 
-        raise LLMFatalError(f"Structured JSON call failed after retries: {last_err}")
+        # All retries exhausted. Surface enough detail for a future post-mortem
+        # — the raw `content` from the last attempt (if we have one) plus the
+        # last error. Callers (EntityExtractor) catch this and return an empty
+        # extraction, so ingestion continues.
+        raise LLMFatalError(
+            f"Structured JSON call failed after retries: {last_err}"
+        )
 
 
 def _extract_first_json_object(text: str) -> str | None:

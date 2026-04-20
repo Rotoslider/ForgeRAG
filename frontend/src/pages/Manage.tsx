@@ -14,6 +14,8 @@ import {
   listCommunities,
   listDocuments,
   listEntities,
+  rebuildChunks,
+  rebuildChunksBulk,
   reembedDocument,
   unloadModel,
 } from "../api/client";
@@ -232,6 +234,20 @@ function DocumentsTable() {
     },
     onError: (_err, id) => showFeedback(id, "Extraction failed"),
   });
+  const rebuild = useMutation({
+    mutationFn: (args: { id: string; extractOnly: boolean }) =>
+      rebuildChunks(args.id, { extract_only: args.extractOnly }),
+    onSuccess: (_data, args) => {
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      showFeedback(
+        args.id,
+        args.extractOnly
+          ? "Entity re-extract queued — check Ingest tab"
+          : "Chunk rebuild queued — check Ingest tab"
+      );
+    },
+    onError: (_err, args) => showFeedback(args.id, "Rebuild failed"),
+  });
   const del = useMutation({
     mutationFn: (id: string) => deleteDocument(id),
     onSuccess: () => {
@@ -240,15 +256,98 @@ function DocumentsTable() {
     },
   });
 
+  // Multi-select state for bulk rebuild. Keeps the set of selected doc_ids.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkMsg, setBulkMsg] = useState<string | null>(null);
+
+  const toggle = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  const allSelected = docs.length > 0 && docs.every((d) => selected.has(d.doc_id));
+  const toggleAll = () =>
+    setSelected(allSelected ? new Set() : new Set(docs.map((d) => d.doc_id)));
+
+  const bulkRebuild = useMutation({
+    mutationFn: (opts: { extract_only?: boolean; skip_extract?: boolean; only_missing?: boolean }) =>
+      rebuildChunksBulk({ doc_ids: Array.from(selected), ...opts }),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+      if (res.success && res.data) {
+        const { queued, skipped, not_found } = res.data;
+        setBulkMsg(
+          `Queued ${queued}` +
+            (skipped ? ` (skipped ${skipped} already done)` : "") +
+            (not_found ? ` (${not_found} not found)` : "")
+        );
+        setSelected(new Set());
+      } else {
+        setBulkMsg(`Failed: ${res.reason ?? "unknown error"}`);
+      }
+      setTimeout(() => setBulkMsg(null), 6000);
+    },
+    onError: () => setBulkMsg("Bulk rebuild failed"),
+  });
+
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg overflow-hidden">
-      <div className="px-4 py-3 border-b border-forge-edge flex items-center">
+      <div className="px-4 py-3 border-b border-forge-edge flex items-center gap-3 flex-wrap">
         <h2 className="font-semibold">Documents ({docs.length})</h2>
+        {selected.size > 0 && (
+          <>
+            <span className="text-xs text-forge-muted">{selected.size} selected</span>
+            <button
+              onClick={() => bulkRebuild.mutate({})}
+              disabled={bulkRebuild.isPending}
+              className="px-2 py-1 text-xs rounded border border-forge-edge hover:bg-forge-bg disabled:opacity-50"
+              title="Full chunk rebuild + Phase 3 entity re-extraction"
+            >
+              {bulkRebuild.isPending ? "queuing…" : `rebuild (${selected.size})`}
+            </button>
+            <button
+              onClick={() => bulkRebuild.mutate({ extract_only: true })}
+              disabled={bulkRebuild.isPending}
+              className="px-2 py-1 text-xs rounded border border-forge-edge hover:bg-forge-bg disabled:opacity-50"
+              title="Only re-extract entities on pages missing topic_tags (cheap resume)"
+            >
+              extract-only
+            </button>
+            <button
+              onClick={() => bulkRebuild.mutate({ only_missing: true })}
+              disabled={bulkRebuild.isPending}
+              className="px-2 py-1 text-xs rounded border border-forge-edge hover:bg-forge-bg disabled:opacity-50"
+              title="Only rebuild docs that don't have chunks yet"
+            >
+              only-missing
+            </button>
+            <button
+              onClick={() => setSelected(new Set())}
+              className="px-2 py-1 text-xs rounded border border-forge-edge hover:bg-forge-bg"
+            >
+              clear
+            </button>
+          </>
+        )}
+        {bulkMsg && (
+          <span className="text-xs text-emerald-400 bg-emerald-950/30 rounded px-2 py-1">
+            {bulkMsg}
+          </span>
+        )}
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="bg-forge-bg text-forge-muted text-xs uppercase">
             <tr>
+              <th className="px-3 py-2 w-8">
+                <input
+                  type="checkbox"
+                  checked={allSelected}
+                  onChange={toggleAll}
+                  aria-label="Select all"
+                />
+              </th>
               <th className="text-left px-4 py-2">Title</th>
               <th className="text-right px-4 py-2">Pages</th>
               <th className="text-left px-4 py-2">Collection</th>
@@ -262,20 +361,25 @@ function DocumentsTable() {
               <DocRow
                 key={d.doc_id}
                 doc={d}
+                selected={selected.has(d.doc_id)}
+                onToggle={() => toggle(d.doc_id)}
                 feedback={actionFeedback[d.doc_id]}
                 onReembed={() => reembed.mutate(d.doc_id)}
                 onExtract={() => extract.mutate(d.doc_id)}
+                onRebuild={() => rebuild.mutate({ id: d.doc_id, extractOnly: false })}
+                onExtractOnly={() => rebuild.mutate({ id: d.doc_id, extractOnly: true })}
                 onDelete={() => {
                   if (confirm(`Delete "${d.title}" and all pages?`))
                     del.mutate(d.doc_id);
                 }}
                 reembedPending={reembed.isPending}
                 extractPending={extract.isPending}
+                rebuildPending={rebuild.isPending}
               />
             ))}
             {docs.length === 0 && (
               <tr>
-                <td colSpan={6} className="px-4 py-6 text-center text-forge-muted">
+                <td colSpan={7} className="px-4 py-6 text-center text-forge-muted">
                   No documents. Use the Ingest tab to upload PDFs.
                 </td>
               </tr>
@@ -289,27 +393,45 @@ function DocumentsTable() {
 
 function DocRow({
   doc: d,
+  selected,
+  onToggle,
   feedback,
   onReembed,
   onExtract,
+  onRebuild,
+  onExtractOnly,
   onDelete,
   reembedPending,
   extractPending,
+  rebuildPending,
 }: {
   doc: DocumentRow;
+  selected: boolean;
+  onToggle: () => void;
   feedback?: string;
   onReembed: () => void;
   onExtract: () => void;
+  onRebuild: () => void;
+  onExtractOnly: () => void;
   onDelete: () => void;
   reembedPending: boolean;
   extractPending: boolean;
+  rebuildPending: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const qc = useQueryClient();
 
   return (
     <>
-      <tr>
+      <tr className={selected ? "bg-forge-bg/40" : ""}>
+        <td className="px-3 py-2 text-center">
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggle}
+            aria-label={`Select ${d.title}`}
+          />
+        </td>
         <td className="px-4 py-2 max-w-md truncate" title={d.filename}>
           {d.title}
         </td>
@@ -332,10 +454,16 @@ function DocRow({
             <ActionBtn onClick={() => setEditing(!editing)} title="Edit collection, tags, and categories">
               {editing ? "close" : "edit"}
             </ActionBtn>
-            <ActionBtn onClick={onReembed} title="Re-embed" disabled={reembedPending}>
+            <ActionBtn onClick={onRebuild} title="Rebuild chunks + re-extract entities (Phase 5)" disabled={rebuildPending}>
+              {rebuildPending ? "…" : "rebuild"}
+            </ActionBtn>
+            <ActionBtn onClick={onExtractOnly} title="Only re-extract entities on pages missing topic_tags" disabled={rebuildPending}>
+              extract-only
+            </ActionBtn>
+            <ActionBtn onClick={onReembed} title="Re-embed (legacy)" disabled={reembedPending}>
               {reembedPending ? "…" : "re-embed"}
             </ActionBtn>
-            <ActionBtn onClick={onExtract} title="Extract entities" disabled={extractPending}>
+            <ActionBtn onClick={onExtract} title="Extract entities (legacy, page-level)" disabled={extractPending}>
               {extractPending ? "…" : "extract"}
             </ActionBtn>
             <ActionBtn onClick={onDelete} title="Delete" danger>delete</ActionBtn>
@@ -344,7 +472,7 @@ function DocRow({
       </tr>
       {feedback && (
         <tr>
-          <td colSpan={6} className="px-4 py-1">
+          <td colSpan={7} className="px-4 py-1">
             <div className="text-xs text-emerald-400 bg-emerald-950/30 rounded px-3 py-1.5 inline-block">
               {feedback}
             </div>
@@ -353,7 +481,7 @@ function DocRow({
       )}
       {editing && (
         <tr>
-          <td colSpan={6} className="px-4 py-3 bg-forge-bg/50">
+          <td colSpan={7} className="px-4 py-3 bg-forge-bg/50">
             <DocEditPanel doc={d} onDone={() => { setEditing(false); qc.invalidateQueries({ queryKey: ["documents"] }); }} />
           </td>
         </tr>

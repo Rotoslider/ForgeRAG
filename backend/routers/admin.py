@@ -103,6 +103,102 @@ async def normalize_entities(request: Request) -> ForgeResult:
     )
 
 
+@router.post("/rebuild-chunks-bulk")
+async def rebuild_chunks_bulk(
+    request: Request,
+    payload: dict | None = None,
+) -> ForgeResult:
+    """Queue Phase 5 chunk rebuilds for a list of documents.
+
+    Body:
+      {
+        "doc_ids": ["...", "..."],    # required
+        "extract_only": false,         # optional, default false
+        "skip_extract": false,         # optional, default false
+        "only_missing": false          # optional; when true, skip docs
+                                         that already have Chunk nodes
+      }
+
+    Returns one queued job_id per document. Jobs run sequentially through
+    the existing pipeline queue (one at a time), so you can fire 50 docs
+    at once and let them drain overnight.
+    """
+    import asyncio
+
+    if not isinstance(payload, dict):
+        payload = {}
+    doc_ids = payload.get("doc_ids") or []
+    extract_only = bool(payload.get("extract_only"))
+    skip_extract = bool(payload.get("skip_extract"))
+    only_missing = bool(payload.get("only_missing"))
+
+    if not isinstance(doc_ids, list) or not doc_ids:
+        return ForgeResult(success=False, reason="doc_ids must be a non-empty list",
+                           data={"queued": 0})
+    if extract_only and skip_extract:
+        return ForgeResult(success=False,
+                           reason="extract_only and skip_extract are mutually exclusive",
+                           data={"queued": 0})
+
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    # Pull titles/filenames + chunk counts in one round trip so we can honour
+    # only_missing without N extra queries.
+    rows = await neo4j.run_query(
+        """
+        UNWIND $ids AS id
+        MATCH (d:Document {doc_id: id})
+        OPTIONAL MATCH (d)-[:HAS_PAGE]->(:Page)-[:HAS_CHUNK]->(c:Chunk)
+        RETURN d.doc_id AS doc_id, d.filename AS filename, d.title AS title,
+               count(c) AS chunk_count
+        """,
+        {"ids": doc_ids},
+    )
+    found = {r["doc_id"]: r for r in rows}
+    missing = [i for i in doc_ids if i not in found]
+
+    queued: list[dict] = []
+    skipped: list[dict] = []
+    for doc_id in doc_ids:
+        if doc_id not in found:
+            continue
+        info = found[doc_id]
+        if only_missing and info["chunk_count"] and info["chunk_count"] > 0:
+            skipped.append({"doc_id": doc_id, "reason": "already has chunks"})
+            continue
+        job = await jobs.create(
+            source_path=f"(rebuild-chunks of {doc_id})",
+            filename=info["filename"],
+            categories=[],
+            tags=[],
+        )
+        asyncio.create_task(
+            pipeline.run_rebuild_chunks(
+                job.job_id, doc_id,
+                extract_only=extract_only,
+                skip_extract=skip_extract,
+            )
+        )
+        queued.append({
+            "doc_id": doc_id, "job_id": job.job_id,
+            "title": info["title"],
+        })
+
+    return ForgeResult(
+        success=True,
+        data={
+            "queued": len(queued),
+            "skipped": len(skipped),
+            "not_found": len(missing),
+            "jobs": queued,
+            "skipped_docs": skipped,
+            "missing_ids": missing,
+        },
+    )
+
+
 @router.post("/bulk-reembed")
 async def bulk_reembed(request: Request) -> ForgeResult:
     """Trigger re-embed for ALL documents. Each document gets its own job
