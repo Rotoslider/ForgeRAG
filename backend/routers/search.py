@@ -389,8 +389,20 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         sent_pages.add(key)
         img_bytes = img_path.read_bytes()
         b64 = base64.b64encode(img_bytes).decode("ascii")
+        # Each image is introduced by a distinctive ID token ("#NNN") that
+        # cannot be confused with the printed page number in the PDF
+        # header/footer. The LLM is instructed in the system prompt to
+        # cite using "#NNN" so we get a clean signal independent of the
+        # book's internal page numbering.
         messages_content.append(
-            {"type": "text", "text": f"[{label} — Page {pn} from {title}]"}
+            {
+                "type": "text",
+                "text": (
+                    f"[{label} | IMG_ID #{pn} | {title}] "
+                    f"— cite facts from this image as [#{pn}]. "
+                    f"Do NOT use the page number printed in the header or footer."
+                ),
+            }
         )
         messages_content.append(
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
@@ -502,20 +514,19 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
             "didn't specifically ask about them.\n\n"
         )
     question_text += (
-        "Answer the question based on the source pages and graph context. "
-        "\n\n"
-        "CITATION RULES — CRITICAL:\n"
-        "- Each page image you see is preceded by a text label of the form "
-        "'[Source — Page N from <title>]' or '[Context (prev page) — Page N "
-        "from <title>]'. The number N in that label is the PDF's physical "
-        "page index and is what the user's page viewer uses.\n"
-        "- When citing, ALWAYS use that label's N, not the printed page "
-        "number you see in the page header or footer. The printed number is "
-        "often offset by front matter or chapter-relative numbering and does "
-        "NOT link to the viewer.\n"
-        "- Format citations as [Page N] using the label's N. Never emit "
-        "[Page 3.14] or chapter-qualified forms; use the integer from the "
-        "label.\n"
+        "Answer the question based on the source pages and graph context.\n"
+        "\n"
+        "CITATION RULES — CRITICAL. The user's page viewer only works with "
+        "the IMG_ID tokens below.\n"
+        "- Each page image is introduced by a label like "
+        "'[Source | IMG_ID #98 | Metal Forming Handbook]'.\n"
+        "- When referring to a fact from an image, cite it as '[#98]' using "
+        "that IMG_ID integer — NOT 'Page 80', NOT the number printed in "
+        "the page header or footer. The printed number is usually wrong "
+        "because of front matter or chapter-relative numbering.\n"
+        "- For multiple images, write '[#98, #99]' or '[#98-#99]'.\n"
+        "- Do NOT write 'Page 80' or 'p.80' anywhere — always use the "
+        "'#N' form with the IMG_ID.\n"
         "\n"
         "Be precise with numbers, codes, and specifications. If you notice "
         "relevant cross-references or related considerations (e.g., applicable "
@@ -540,10 +551,11 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
             "context. When you see a relationship chain (e.g., Material → "
             "GOVERNED_BY → Standard), use it to provide comprehensive answers "
             "that connect information across different sections of the handbook. "
-            "CITE PAGES USING ONLY THE NUMBER FROM THE [Source — Page N from "
-            "<title>] LABEL THAT INTRODUCES EACH IMAGE. Never use the printed "
-            "page number shown in the page's header or footer — that number is "
-            "often wrong for the viewer's linking because of front matter and "
+            "CITE IMAGES USING ONLY THE IMG_ID from the label that introduces "
+            "each image (e.g. [Source | IMG_ID #98 | <title>]). Write the "
+            "citation as '[#98]'. Never write 'Page 80' or use the number "
+            "printed in the page's header or footer — that number is usually "
+            "wrong for the viewer's linking because of front matter and "
             "chapter-relative numbering.",
         },
         {"role": "user", "content": messages_content},

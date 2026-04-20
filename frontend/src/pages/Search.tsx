@@ -524,12 +524,17 @@ function CommunityResults({ hits }: { hits: CommunityHit[] }) {
   );
 }
 
-// Render the VLM answer with inline [Page N] citations turned into
-// clickable anchors that open the page viewer. Matches both singular
-// "[Page 81]" and plural "[Pages 97, 252]" / "[Pages 510-519]" forms.
-// For a bracket containing multiple page numbers, we link to the first
-// one that has a matching source — the user still sees the original
-// text (e.g. "[Pages 97, 252]") so the multiple-page context isn't lost.
+// Render the VLM answer with inline citations turned into clickable
+// anchors that open the page viewer.
+//
+// The backend prompt asks the VLM to cite as [#98] using the IMG_ID we
+// prepend to each image. When the VLM follows that rule we get an exact
+// match. When it slips and uses the printed page number (common on
+// books with chapter-relative numbering), we infer the book's
+// printed→physical offset from citations that DID match, then apply
+// that offset to the unmatched ones. Falling back to numeric-nearest
+// can go badly wrong when a book has a large offset, so we only
+// fall back when we can't find a consistent offset.
 function AnswerText({
   answer,
   sources,
@@ -555,10 +560,10 @@ function AnswerText({
     }
   }
 
-  // Split on bracketed page refs. Keep the bracket text so the UI reads
-  // naturally; wrap the whole bracket in a link if any contained page
-  // matches a source.
-  const re = /\[Pages?\s+([^\]]+)\]/g;
+  // Accept both citation forms:
+  //   [#98]                         — new IMG_ID form (preferred)
+  //   [Page 98]  [Pages 97, 252]    — legacy printed-number form
+  const re = /\[(?:#\s*\d+(?:\s*[,\-–]\s*#?\s*\d+)*|Pages?\s+[^\]]+)\]/g;
   const segments: Array<{ kind: "text"; text: string }
                       | { kind: "cite"; text: string; pages: number[] }> = [];
   let lastIdx = 0;
@@ -567,7 +572,7 @@ function AnswerText({
     if (m.index > lastIdx) {
       segments.push({ kind: "text", text: answer.slice(lastIdx, m.index) });
     }
-    const pages = [...m[1].matchAll(/\d+/g)].map((n) => parseInt(n[0], 10));
+    const pages = [...m[0].matchAll(/\d+/g)].map((n) => parseInt(n[0], 10));
     segments.push({ kind: "cite", text: m[0], pages });
     lastIdx = m.index + m[0].length;
   }
@@ -575,31 +580,112 @@ function AnswerText({
     segments.push({ kind: "text", text: answer.slice(lastIdx) });
   }
 
-  // Fallback — if a citation references a page not in sources (e.g.
-  // the VLM used the printed page number instead of the physical
-  // index), still try to open SOMETHING useful. Pick the nearest page
-  // from the most-frequent source document; better than a dead
-  // plain-text citation.
   const sourcePages = Array.from(pageMap.entries())
     .map(([page, meta]) => ({ page, ...meta }))
     .sort((a, b) => a.page - b.page);
 
-  function fallbackTarget(pages: number[]): { url: string; title: string; note: string } | null {
-    if (sourcePages.length === 0 || pages.length === 0) return null;
-    const want = pages[0];
-    let closest = sourcePages[0];
-    let bestDiff = Math.abs(closest.page - want);
-    for (const sp of sourcePages) {
-      const d = Math.abs(sp.page - want);
-      if (d < bestDiff) {
-        bestDiff = d;
-        closest = sp;
+  // Infer the VLM's printed→physical offset. For each cited page,
+  // compute the offset to the nearest source page. The mode (most
+  // common offset) across citations is the book's likely offset.
+  // Only applied when at least 2 citations vote for the same offset —
+  // a single match isn't statistically convincing.
+  let inferredOffset: number | null = null;
+  {
+    const allCited: number[] = [];
+    for (const s of segments) {
+      if (s.kind === "cite") allCited.push(...s.pages);
+    }
+    if (sourcePages.length > 0 && allCited.length > 0) {
+      const offsetVotes = new Map<number, number>();
+      for (const cp of allCited) {
+        let bestDiff = Infinity;
+        let bestOffset = 0;
+        for (const sp of sourcePages) {
+          const d = Math.abs(sp.page - cp);
+          if (d < bestDiff) {
+            bestDiff = d;
+            bestOffset = sp.page - cp;
+          }
+        }
+        offsetVotes.set(bestOffset, (offsetVotes.get(bestOffset) ?? 0) + 1);
+      }
+      // Winner = offset with the highest vote count, breaking ties in
+      // favor of smaller |offset|.
+      let bestVotes = 0;
+      for (const [offset, votes] of offsetVotes) {
+        if (
+          votes > bestVotes ||
+          (votes === bestVotes &&
+            inferredOffset != null &&
+            Math.abs(offset) < Math.abs(inferredOffset))
+        ) {
+          bestVotes = votes;
+          inferredOffset = offset;
+        }
+      }
+      // Require at least 2 votes for an offset before trusting it.
+      if (bestVotes < 2) inferredOffset = null;
+    }
+  }
+
+  function resolveLink(pages: number[]): {
+    url: string;
+    title: string;
+    exact: boolean;
+    note: string;
+  } | null {
+    if (pages.length === 0 || sourcePages.length === 0) return null;
+    // 1. Exact match: any page in the bracket matches a source.
+    for (const p of pages) {
+      if (pageMap.has(p)) {
+        const meta = pageMap.get(p)!;
+        return {
+          url: meta.url,
+          title: meta.title,
+          exact: true,
+          note: `${meta.title} — page ${p}`,
+        };
       }
     }
+    // 2. Offset-corrected match: apply inferred offset and look again.
+    if (inferredOffset != null) {
+      for (const p of pages) {
+        const adjusted = p + inferredOffset;
+        if (pageMap.has(adjusted)) {
+          const meta = pageMap.get(adjusted)!;
+          return {
+            url: meta.url,
+            title: meta.title,
+            exact: false,
+            note: `cite [#${p}] — opens physical page ${adjusted} of ${meta.title} (inferred offset ${inferredOffset >= 0 ? "+" : ""}${inferredOffset})`,
+          };
+        }
+      }
+    }
+    // 3. Top source fallback: link to the highest-ranked source rather
+    //    than numeric-nearest (which snaps to the wrong section on
+    //    books with uneven offsets).
+    const top = sourcePages[0]; // sorted ascending; pick first source from response order instead
+    // Re-find the first source in original (response) order.
+    const firstInOrder = sources.find((s) => {
+      const parts = (s.image_url || "").split("/");
+      return parts[2];
+    });
+    if (firstInOrder) {
+      const parts = (firstInOrder.image_url || "").split("/");
+      const hash = parts[2];
+      return {
+        url: `/app/view/${hash}/${firstInOrder.page_number}?from=/search`,
+        title: firstInOrder.document_title,
+        exact: false,
+        note: `citation doesn't match any source — opening top result (${firstInOrder.document_title} p.${firstInOrder.page_number})`,
+      };
+    }
     return {
-      url: closest.url,
-      title: closest.title,
-      note: `printed page ${want} — opens physical page ${closest.page} of ${closest.title}`,
+      url: top.url,
+      title: top.title,
+      exact: false,
+      note: `unmatched citation — opening ${top.title} p.${top.page}`,
     };
   }
 
@@ -607,39 +693,23 @@ function AnswerText({
     <div className="text-forge-fg whitespace-pre-wrap leading-relaxed">
       {segments.map((seg, i) => {
         if (seg.kind === "text") return <span key={i}>{seg.text}</span>;
-        const linked = seg.pages.find((p) => pageMap.has(p));
-        if (linked !== undefined) {
-          const target = pageMap.get(linked)!;
-          return (
-            <a
-              key={i}
-              href={target.url}
-              target="_blank"
-              rel="noopener"
-              className="text-forge-accent hover:underline"
-              title={`${target.title} — open page ${linked} in viewer`}
-            >
-              {seg.text}
-            </a>
-          );
-        }
-        // Fallback: approximate link to nearest source page.
-        const fb = fallbackTarget(seg.pages);
-        if (fb) {
-          return (
-            <a
-              key={i}
-              href={fb.url}
-              target="_blank"
-              rel="noopener"
-              className="text-forge-accent/70 hover:underline hover:text-forge-accent italic"
-              title={fb.note}
-            >
-              {seg.text}
-            </a>
-          );
-        }
-        return <span key={i}>{seg.text}</span>;
+        const link = resolveLink(seg.pages);
+        if (!link) return <span key={i}>{seg.text}</span>;
+        const cls = link.exact
+          ? "text-forge-accent hover:underline"
+          : "text-forge-accent/70 hover:underline hover:text-forge-accent italic";
+        return (
+          <a
+            key={i}
+            href={link.url}
+            target="_blank"
+            rel="noopener"
+            className={cls}
+            title={link.note}
+          >
+            {seg.text}
+          </a>
+        );
       })}
     </div>
   );
