@@ -202,6 +202,36 @@ export const removeDocumentTag = (docId: string, tag: string) =>
     { method: "DELETE" }
   );
 
+export interface TagSuggestion {
+  doc_id: string;
+  collection: string;
+  categories: string[];
+  tags: string[];
+}
+
+export const suggestTags = (docId: string) =>
+  request<TagSuggestion>(`/documents/${docId}/suggest-tags`, { method: "POST" });
+
+export const applyTags = (
+  docId: string,
+  body: {
+    collection?: string;
+    categories?: string[];
+    tags?: string[];
+    mode?: "merge" | "replace";
+  }
+) =>
+  request<{
+    doc_id: string;
+    mode: string;
+    collection: string | null;
+    categories: string[];
+    tags: string[];
+  }>(`/documents/${docId}/apply-tags`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
 export interface DuplicateInfo {
   file_hash: string;
   doc_id: string;

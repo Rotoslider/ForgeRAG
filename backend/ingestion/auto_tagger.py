@@ -149,3 +149,67 @@ class AutoTagger:
         except Exception as exc:
             logger.warning("Auto-tagger failed (using defaults): %s", exc)
             return AutoTagResult()
+
+    async def suggest_for_doc(
+        self,
+        neo4j: Any,
+        doc_id: str,
+    ) -> AutoTagResult | None:
+        """Fetch title + sample text from Neo4j, then call `suggest()`.
+
+        Returns None if the document has literally no text anywhere — in
+        that case the caller should report "no suggestion possible" rather
+        than silently writing defaults.
+
+        Sample source preference:
+          1. :Chunk.text  — populated by the Phase 5 rebuild, covers docs
+             whose :Page.extracted_text was never filled or is all below
+             the text_char_count threshold. Always reliable if chunks exist.
+          2. :Page.extracted_text — fallback for docs without chunks yet.
+             No char-count threshold; the LLM can handle short samples.
+        """
+        doc_rows = await neo4j.run_query(
+            "MATCH (d:Document {doc_id: $id}) "
+            "RETURN d.title AS title, d.filename AS filename",
+            {"id": doc_id},
+        )
+        if not doc_rows:
+            return None
+        title = doc_rows[0]["title"] or ""
+        filename = doc_rows[0]["filename"] or ""
+
+        # Prefer chunks — always have text, always present for rebuilt docs.
+        chunk_rows = await neo4j.run_query(
+            """
+            MATCH (d:Document {doc_id: $id})-[:HAS_PAGE]->(p:Page)-[:HAS_CHUNK]->(c:Chunk)
+            WHERE c.text IS NOT NULL AND size(c.text) > 100
+            RETURN c.text AS text
+            ORDER BY c.page_number, c.chunk_index
+            LIMIT 10
+            """,
+            {"id": doc_id},
+        )
+        sample_texts = [r["text"] for r in chunk_rows if r["text"]]
+
+        if not sample_texts:
+            # Fallback: whole-page text, no char threshold.
+            page_rows = await neo4j.run_query(
+                """
+                MATCH (d:Document {doc_id: $id})-[:HAS_PAGE]->(p:Page)
+                WHERE p.extracted_text IS NOT NULL
+                  AND size(p.extracted_text) > 100
+                  AND (p.is_blank IS NULL OR p.is_blank = false)
+                RETURN p.extracted_text AS text
+                ORDER BY p.page_number
+                LIMIT 10
+                """,
+                {"id": doc_id},
+            )
+            sample_texts = [r["text"] for r in page_rows if r["text"]]
+
+        if not sample_texts:
+            return None
+
+        return await self.suggest(
+            title=title, filename=filename, sample_pages_text=sample_texts
+        )

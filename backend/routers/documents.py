@@ -9,7 +9,7 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from backend.models.common import ForgeResult
-from backend.models.documents import CategoryCreate, TagCreate
+from backend.models.documents import ApplyTagsRequest, CategoryCreate, TagCreate
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +293,143 @@ async def delete_document(doc_id: str, request: Request) -> ForgeResult:
     return ForgeResult(
         success=True,
         data={"doc_id": doc_id, "folders_removed": removed},
+    )
+
+
+@router.post("/documents/{doc_id}/suggest-tags")
+async def suggest_tags(doc_id: str, request: Request) -> ForgeResult:
+    """Ask the LLM to propose collection/categories/tags for a doc.
+
+    Does NOT write to the graph — the caller previews and decides what to
+    apply via /apply-tags. Requires the LLM-backed auto-tagger to be
+    configured.
+    """
+    neo4j = request.app.state.neo4j
+    pipeline = request.app.state.pipeline
+
+    if pipeline.auto_tagger is None:
+        raise HTTPException(
+            status_code=503,
+            detail="LLM service not configured — cannot suggest tags",
+        )
+
+    rows = await neo4j.run_query(
+        "MATCH (d:Document {doc_id: $id}) RETURN d.doc_id", {"id": doc_id}
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+
+    result = await pipeline.auto_tagger.suggest_for_doc(neo4j, doc_id)
+    if result is None:
+        # Diagnose *why* the helper came up dry so the caller sees something
+        # useful instead of a generic error. Counts the three conditions the
+        # helper filters on.
+        diag = await neo4j.run_query(
+            """
+            MATCH (d:Document {doc_id: $id})
+            OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
+            OPTIONAL MATCH (p)-[:HAS_CHUNK]->(c:Chunk)
+            RETURN count(DISTINCT p) AS pages,
+                   count(DISTINCT CASE WHEN p.extracted_text IS NOT NULL
+                                       AND size(p.extracted_text) > 100
+                                       THEN p END) AS pages_with_text,
+                   count(DISTINCT c) AS chunks,
+                   count(DISTINCT CASE WHEN coalesce(p.is_blank, false) THEN p END) AS pages_flagged_blank
+            """,
+            {"id": doc_id},
+        )
+        d = diag[0] if diag else {}
+        return ForgeResult(
+            success=False,
+            reason=(
+                f"No usable text found: {d.get('pages', 0)} pages, "
+                f"{d.get('pages_with_text', 0)} with extracted text, "
+                f"{d.get('chunks', 0)} chunks, "
+                f"{d.get('pages_flagged_blank', 0)} flagged blank. "
+                f"If chunks=0 the doc needs a rebuild; if pages_with_text=0 "
+                f"the doc needs extract-only or re-ingest."
+            ),
+        )
+    return ForgeResult(
+        success=True,
+        data={
+            "doc_id": doc_id,
+            "collection": result.collection,
+            "categories": result.categories,
+            "tags": result.tags,
+        },
+    )
+
+
+@router.post("/documents/{doc_id}/apply-tags")
+async def apply_tags(
+    doc_id: str, body: ApplyTagsRequest, request: Request
+) -> ForgeResult:
+    """Write user-confirmed collection/categories/tags to a document.
+
+    mode="merge" (default): additive. Existing tags/categories remain.
+    mode="replace": detaches every Tag/Category edge on this doc before
+      writing the new set. Collection is only changed when body.collection
+      is provided.
+    """
+    neo4j = request.app.state.neo4j
+
+    rows = await neo4j.run_query(
+        "MATCH (d:Document {doc_id: $id}) RETURN d.doc_id", {"id": doc_id}
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
+
+    if body.mode == "replace":
+        await neo4j.run_write(
+            """
+            MATCH (d:Document {doc_id: $id})
+            OPTIONAL MATCH (d)-[r1:TAGGED_WITH]->(:Tag)
+            OPTIONAL MATCH (d)-[r2:IN_CATEGORY]->(:Category)
+            DELETE r1, r2
+            """,
+            {"id": doc_id},
+        )
+
+    if body.collection is not None:
+        await neo4j.run_write(
+            "MATCH (d:Document {doc_id: $id}) SET d.collection = $col",
+            {"id": doc_id, "col": body.collection},
+        )
+
+    if body.categories:
+        await neo4j.run_write(
+            """
+            UNWIND $cats AS cat
+            MERGE (c:Category {name: cat})
+            WITH c
+            MATCH (d:Document {doc_id: $id})
+            MERGE (d)-[:IN_CATEGORY]->(c)
+            """,
+            {"id": doc_id, "cats": body.categories},
+        )
+
+    if body.tags:
+        await neo4j.run_write(
+            """
+            UNWIND $tags AS tag
+            MERGE (t:Tag {name: tag})
+            WITH t
+            MATCH (d:Document {doc_id: $id})
+            MERGE (d)-[:TAGGED_WITH]->(t)
+            """,
+            {"id": doc_id, "tags": body.tags},
+        )
+
+    return ForgeResult(
+        success=True,
+        data={
+            "doc_id": doc_id,
+            "mode": body.mode,
+            "collection": body.collection,
+            "categories": body.categories,
+            "tags": body.tags,
+        },
     )
 
 

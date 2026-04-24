@@ -19,20 +19,23 @@ export default function Layout({ children }: PropsWithChildren) {
 
   return (
     <div className="flex min-h-screen bg-forge-bg text-forge-fg">
-      <aside className="w-56 bg-forge-panel border-r border-forge-edge flex flex-col">
-        <div className="px-5 py-4 border-b border-forge-edge">
+      {/* Sidebar: narrower than before (12rem vs 14rem), pinned to the
+          viewport height so the nav can scroll independently if it ever
+          grows, while the bottom stats stay visible at the foot. */}
+      <aside className="w-48 bg-forge-panel border-r border-forge-edge flex flex-col h-screen sticky top-0">
+        <div className="px-4 py-4 border-b border-forge-edge">
           <div className="text-lg font-bold text-forge-accent">ForgeRAG</div>
           <div className="text-xs text-forge-muted">
-            Engineering knowledge graph
+            Engineering Knowledge Graph
           </div>
         </div>
-        <nav className="py-4">
+        <nav className="py-4 flex-1 overflow-y-auto">
           {navItems.map((n) => (
             <NavLink
               key={n.to}
               to={n.to}
               className={({ isActive }) =>
-                `block px-5 py-2 text-sm hover:bg-forge-edge transition ${
+                `block px-4 py-2 text-sm hover:bg-forge-edge transition ${
                   isActive ? "bg-forge-edge text-forge-accent" : ""
                 }`
               }
@@ -41,7 +44,9 @@ export default function Layout({ children }: PropsWithChildren) {
             </NavLink>
           ))}
         </nav>
-        <div className="mt-auto px-5 py-4 border-t border-forge-edge text-xs space-y-1">
+        {/* Stats stay at the bottom of the viewport — flex-shrink-0 keeps
+            them from collapsing when the nav above scrolls. */}
+        <div className="shrink-0 px-4 py-3 border-t border-forge-edge text-xs space-y-1">
           <StatusDot label="Neo4j" ok={!!h?.neo4j_connected} />
           <StatusDot label="GPU" ok={!!h?.gpu_available} />
           {h?.details?.vram_free_gb != null && (
@@ -54,7 +59,7 @@ export default function Layout({ children }: PropsWithChildren) {
           </div>
         </div>
       </aside>
-      <main className="flex-1 overflow-y-auto">{children}</main>
+      <main className="flex-1 min-w-0">{children}</main>
     </div>
   );
 }

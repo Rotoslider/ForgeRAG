@@ -77,6 +77,19 @@ class TagCreate(BaseModel):
     name: str
 
 
+class ApplyTagsRequest(BaseModel):
+    """Body for POST /documents/{doc_id}/apply-tags.
+
+    mode="merge" adds the given items on top of whatever the doc already
+    has. mode="replace" detaches every existing Tag/Category edge before
+    writing, and only overwrites the collection if one is provided.
+    """
+    collection: str | None = None
+    categories: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+    mode: Literal["merge", "replace"] = "merge"
+
+
 class DocumentListFilter(BaseModel):
     """Query filter for GET /documents."""
 

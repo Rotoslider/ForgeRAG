@@ -211,7 +211,8 @@ Web GUI: `http://localhost:8200/app/`
 
 ### Manage
 
-- **Documents table**: edit collection, tags, categories inline. Per-row actions: rebuild chunks (Phase 9), extract-only (retry failed pages), re-embed (legacy), extract entities (legacy), delete.
+- **Documents table**: edit collection, tags, categories inline. Sticky header row + bulk-action bar stay pinned as you scroll. Sticky-right "Actions" column so controls are always reachable on wide rows. Per-row actions: **edit** (inline collection/tag/category edit), **suggest** (LLM proposes collection/categories/tags, review-and-apply with merge/replace), **rebuild** (Phase 9 chunks + entity re-extraction), **⋯ overflow menu** (extract-only, re-embed, extract, delete).
+- **Suggest tags (LLM auto-tagger)**: click **suggest** on any doc to have the LLM read the document's first 10 chunks (falls back to page text if the doc has no chunks yet) and propose a collection, 2–4 categories, and 5–10 tags. The panel shows the suggestion as editable chips — drop what you don't like, add your own, choose **merge** (keep existing) or **replace** (drop existing first), then **apply**. No re-embedding, just metadata writes.
 - **Multi-select + bulk actions**: checkboxes on each row. Select multiple documents, then "rebuild (N)", "extract-only", or "only-missing" (skip docs that already have chunks). Jobs queue sequentially — pick a handful to run now or queue the whole library overnight.
 - **Graph Stats**: live entity counts across the knowledge graph
 - **GPU**: VRAM usage, loaded models, manual unload
@@ -245,6 +246,27 @@ Flags:
 - `--skip-extract` — chunks + summaries + embeddings only (no entity re-extraction)
 - `--extract-only` — only re-extract entities on pages missing `topic_tags` (inverse of `--skip-extract`)
 
+### Backfill tags/categories on older documents
+
+Documents ingested before the auto-tagger existed — or ingested with manual tags that were later deleted — can be backfilled without a full rebuild. Per-doc via the Manage UI's **suggest** button, or bulk via the script:
+
+```bash
+# Preview only — no writes
+NEO4J_PASSWORD=... ./venv/bin/python scripts/bulk_autotag.py --dry-run
+
+# Apply to every doc that has no categories AND no tags
+NEO4J_PASSWORD=... ./venv/bin/python scripts/bulk_autotag.py
+
+# Specific docs, or limit
+NEO4J_PASSWORD=... ./venv/bin/python scripts/bulk_autotag.py --doc-ids DOC_a,DOC_b
+NEO4J_PASSWORD=... ./venv/bin/python scripts/bulk_autotag.py --limit 5
+
+# Replace existing tags/categories (default is merge)
+NEO4J_PASSWORD=... ./venv/bin/python scripts/bulk_autotag.py --overwrite
+```
+
+Default is `merge` — never overwrites a non-default collection and never detaches existing Tag/Category edges. `--overwrite` widens the selection to every doc and detaches existing edges before writing the suggestion.
+
 ## API Endpoints
 
 ### Core
@@ -276,6 +298,8 @@ Flags:
 | POST | `/documents/{id}/reembed` | Re-run visual + text embeddings |
 | POST | `/documents/{id}/extract-entities` | Re-run LLM entity extraction |
 | POST | `/documents/{id}/rebuild-chunks` | Phase 9 rebuild: chunks + summaries + embeddings + entity re-extraction. Query params: `extract_only=true` (only re-extract pages missing topic_tags), `skip_extract=true` (chunks only) |
+| POST | `/documents/{id}/suggest-tags` | LLM suggests collection, categories, and tags from chunk/page text. Read-only; returns `{collection, categories, tags}`. 503 if LLM is unconfigured; `success=false` with a diagnostic reason if the doc has no usable text |
+| POST | `/documents/{id}/apply-tags` | Write confirmed tags/categories/collection. Body: `{collection?, categories?, tags?, mode: "merge"|"replace"}`. `merge` preserves existing edges; `replace` detaches all Tag/Category edges first |
 | GET | `/documents/{id}/pages` | List pages |
 | GET | `/documents/{id}/pages/{n}` | Page detail with full text |
 
@@ -391,6 +415,8 @@ ForgeRAG/
 │   │                                      + BGE-M3 embeddings + entity re-extraction.
 │   │                                      Flags: --doc-id, --only-missing, --skip-extract,
 │   │                                      --extract-only
+│   ├── bulk_autotag.py                   LLM auto-tag/categorize docs missing tags.
+│   │                                      Flags: --dry-run, --limit, --doc-ids, --overwrite
 │   ├── canonicalize_materials_dryrun.py  Plan Tier 1 Material canonicalization
 │   ├── canonicalize_materials_apply.py   Apply the plan (idempotent, per-group tx)
 │   ├── canonicalize_entity_dryrun.py     Generalized canonicalization for any label

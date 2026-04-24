@@ -671,38 +671,9 @@ class IngestionPipeline:
         """Use the LLM to suggest collection, categories, and tags from page text."""
         assert self.auto_tagger is not None
 
-        # Get document title
-        doc_rows = await self.neo4j.run_query(
-            "MATCH (d:Document {doc_id: $id}) RETURN d.title AS title, d.filename AS filename",
-            {"id": doc_id},
-        )
-        if not doc_rows:
+        result = await self.auto_tagger.suggest_for_doc(self.neo4j, doc_id)
+        if result is None:
             return
-        title = doc_rows[0]["title"] or ""
-        filename = doc_rows[0]["filename"] or ""
-
-        # Get text from first meaningful pages. The >500 char threshold skips
-        # covers, blank frontmatter, and dense-but-uninformative TOC pages; the
-        # LIMIT 10 widens the window so books with long front-matter (preface
-        # starting past page 10) still reach real body text for tagging.
-        page_rows = await self.neo4j.run_query(
-            """
-            MATCH (d:Document {doc_id: $id})-[:HAS_PAGE]->(p:Page)
-            WHERE p.text_char_count > 500
-              AND (p.is_blank IS NULL OR p.is_blank = false)
-            RETURN p.extracted_text AS text
-            ORDER BY p.page_number
-            LIMIT 10
-            """,
-            {"id": doc_id},
-        )
-        sample_texts = [r["text"] for r in page_rows if r["text"]]
-        if not sample_texts:
-            return
-
-        result = await self.auto_tagger.suggest(
-            title=title, filename=filename, sample_pages_text=sample_texts
-        )
 
         # Apply collection if suggested and currently default
         if result.collection and result.collection != "default" and current_collection == "default":

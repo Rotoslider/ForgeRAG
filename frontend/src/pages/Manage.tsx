@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addDocumentTag,
+  applyTags,
   buildCommunities,
   deleteDocument,
   listCollections,
@@ -17,6 +18,7 @@ import {
   rebuildChunks,
   rebuildChunksBulk,
   reembedDocument,
+  suggestTags,
   unloadModel,
 } from "../api/client";
 import type { DocumentRow } from "../api/types";
@@ -151,7 +153,7 @@ function CommunitiesCard() {
   const qc = useQueryClient();
   const { data } = useQuery({
     queryKey: ["communities"],
-    queryFn: () => listCommunities(undefined, 5),
+    queryFn: () => listCommunities(undefined, 100),
     refetchInterval: 10000,
   });
   const build = useMutation({
@@ -293,8 +295,11 @@ function DocumentsTable() {
   });
 
   return (
-    <div className="bg-forge-panel border border-forge-edge rounded-lg overflow-hidden">
-      <div className="px-4 py-3 border-b border-forge-edge flex items-center gap-3 flex-wrap">
+    <div className="bg-forge-panel border border-forge-edge rounded-lg">
+      {/* Bulk-action bar is sticky to the top of the viewport so it stays
+          usable as the document list scrolls. Sits just above the sticky
+          table header row. */}
+      <div className="sticky top-0 z-30 bg-forge-panel px-4 py-3 border-b border-forge-edge rounded-t-lg flex items-center gap-3 flex-wrap">
         <h2 className="font-semibold">Documents ({docs.length})</h2>
         {selected.size > 0 && (
           <>
@@ -337,26 +342,31 @@ function DocumentsTable() {
           </span>
         )}
       </div>
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead className="bg-forge-bg text-forge-muted text-xs uppercase">
-            <tr>
-              <th className="px-3 py-2 w-8">
-                <input
-                  type="checkbox"
-                  checked={allSelected}
-                  onChange={toggleAll}
-                  aria-label="Select all"
-                />
-              </th>
-              <th className="text-left px-4 py-2">Title</th>
-              <th className="text-right px-4 py-2">Pages</th>
-              <th className="text-left px-4 py-2">Collection</th>
-              <th className="text-left px-4 py-2">Categories</th>
-              <th className="text-left px-4 py-2">Tags</th>
-              <th className="text-right px-4 py-2">Actions</th>
-            </tr>
-          </thead>
+      {/* No overflow-x wrapper: CSS makes `overflow-x: auto` imply a
+          vertical scroll container too, which breaks sticky-top-to-window
+          for the thead. The Actions column is sticky-right and the
+          tag/category cells wrap, so we don't need horizontal scroll. */}
+      <table className="w-full text-sm">
+        <thead className="text-forge-muted text-xs uppercase">
+          <tr>
+            <th className="px-3 py-2 w-8 sticky top-[3.25rem] z-10 bg-forge-bg">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={toggleAll}
+                aria-label="Select all"
+              />
+            </th>
+            <th className="text-left px-4 py-2 sticky top-[3.25rem] z-10 bg-forge-bg">Title</th>
+            <th className="text-right px-4 py-2 sticky top-[3.25rem] z-10 bg-forge-bg">Pages</th>
+            <th className="text-left px-4 py-2 sticky top-[3.25rem] z-10 bg-forge-bg">Collection</th>
+            <th className="text-left px-4 py-2 sticky top-[3.25rem] z-10 bg-forge-bg">Categories</th>
+            <th className="text-left px-4 py-2 sticky top-[3.25rem] z-10 bg-forge-bg">Tags</th>
+            <th className="text-right px-4 py-2 sticky top-[3.25rem] right-0 z-20 bg-forge-bg shadow-[-8px_0_8px_-8px_rgba(0,0,0,0.6)]">
+              Actions
+            </th>
+          </tr>
+        </thead>
           <tbody className="divide-y divide-forge-edge">
             {docs.map((d) => (
               <DocRow
@@ -387,7 +397,6 @@ function DocumentsTable() {
             )}
           </tbody>
         </table>
-      </div>
     </div>
   );
 }
@@ -420,6 +429,7 @@ function DocRow({
   rebuildPending: boolean;
 }) {
   const [editing, setEditing] = useState(false);
+  const [suggesting, setSuggesting] = useState(false);
   const qc = useQueryClient();
 
   return (
@@ -440,34 +450,45 @@ function DocRow({
         <td className="px-4 py-2 text-xs text-forge-muted">
           {d.collection || "default"}
         </td>
-        <td className="px-4 py-2 text-xs text-forge-muted">
+        <td className="px-4 py-2 text-xs text-forge-muted align-top max-w-[12rem] break-words">
           {d.categories.length > 0
             ? d.categories.join(", ")
             : <span className="text-forge-muted/50 italic">none</span>}
         </td>
-        <td className="px-4 py-2 text-xs text-forge-muted">
+        <td className="px-4 py-2 text-xs text-forge-muted align-top max-w-[16rem] break-words leading-relaxed">
           {d.tags.length > 0
             ? d.tags.map((t) => `#${t}`).join(" ")
             : <span className="text-forge-muted/50 italic">none</span>}
         </td>
-        <td className="px-4 py-2 text-right">
-          <div className="flex gap-1 justify-end">
+        <td
+          className={`px-4 py-2 text-right align-top whitespace-nowrap sticky right-0 shadow-[-8px_0_8px_-8px_rgba(0,0,0,0.5)] ${
+            selected ? "bg-forge-bg" : "bg-forge-panel"
+          }`}
+        >
+          <div className="inline-flex gap-1 justify-end items-center">
             <ActionBtn onClick={() => setEditing(!editing)} title="Edit collection, tags, and categories">
               {editing ? "close" : "edit"}
+            </ActionBtn>
+            <ActionBtn onClick={() => setSuggesting(!suggesting)} title="LLM-suggest collection, categories, and tags">
+              {suggesting ? "close" : "suggest"}
             </ActionBtn>
             <ActionBtn onClick={onRebuild} title="Rebuild chunks + re-extract entities (Phase 5)" disabled={rebuildPending}>
               {rebuildPending ? "…" : "rebuild"}
             </ActionBtn>
-            <ActionBtn onClick={onExtractOnly} title="Only re-extract entities on pages missing topic_tags" disabled={rebuildPending}>
-              extract-only
-            </ActionBtn>
-            <ActionBtn onClick={onReembed} title="Re-embed (legacy)" disabled={reembedPending}>
-              {reembedPending ? "…" : "re-embed"}
-            </ActionBtn>
-            <ActionBtn onClick={onExtract} title="Extract entities (legacy, page-level)" disabled={extractPending}>
-              {extractPending ? "…" : "extract"}
-            </ActionBtn>
-            <ActionBtn onClick={onDelete} title="Delete" danger>delete</ActionBtn>
+            <OverflowMenu>
+              <MenuItem onClick={onExtractOnly} disabled={rebuildPending}>
+                extract-only · re-run entity extraction on untagged pages
+              </MenuItem>
+              <MenuItem onClick={onReembed} disabled={reembedPending}>
+                re-embed · legacy Phase 3 re-embed
+              </MenuItem>
+              <MenuItem onClick={onExtract} disabled={extractPending}>
+                extract · legacy page-level entity extraction
+              </MenuItem>
+              <MenuItem onClick={onDelete} danger>
+                delete · remove document and all pages
+              </MenuItem>
+            </OverflowMenu>
           </div>
         </td>
       </tr>
@@ -482,12 +503,264 @@ function DocRow({
       )}
       {editing && (
         <tr>
-          <td colSpan={7} className="px-4 py-3 bg-forge-bg/50">
-            <DocEditPanel doc={d} onDone={() => { setEditing(false); qc.invalidateQueries({ queryKey: ["documents"] }); }} />
+          <td colSpan={7} className="px-0 py-0 bg-forge-bg/50">
+            <div className="sticky left-0 px-4 py-3 max-w-[min(100vw,80rem)]">
+              <DocEditPanel doc={d} onDone={() => { setEditing(false); qc.invalidateQueries({ queryKey: ["documents"] }); }} />
+            </div>
+          </td>
+        </tr>
+      )}
+      {suggesting && (
+        <tr>
+          <td colSpan={7} className="px-0 py-0 bg-forge-bg/50">
+            {/* sticky-left keeps the panel anchored to the visible viewport
+                when the table has scrolled horizontally (long tag lists can
+                push the table wider than the window). */}
+            <div className="sticky left-0 px-4 py-3 max-w-[min(100vw,80rem)]">
+              <SuggestTagsPanel
+                doc={d}
+                onDone={() => {
+                  setSuggesting(false);
+                  qc.invalidateQueries({ queryKey: ["documents"] });
+                  qc.invalidateQueries({ queryKey: ["collections"] });
+                  qc.invalidateQueries({ queryKey: ["tags"] });
+                  qc.invalidateQueries({ queryKey: ["categories"] });
+                }}
+              />
+            </div>
           </td>
         </tr>
       )}
     </>
+  );
+}
+
+function SuggestTagsPanel({
+  doc,
+  onDone,
+}: {
+  doc: DocumentRow;
+  onDone: () => void;
+}) {
+  // Load suggestion on mount — there's nothing to tweak before asking.
+  const suggest = useMutation({
+    mutationFn: () => suggestTags(doc.doc_id),
+  });
+  const [collection, setCollection] = useState<string>("");
+  const [categories, setCategories] = useState<string[]>([]);
+  const [tags, setTags] = useState<string[]>([]);
+  const [newCat, setNewCat] = useState("");
+  const [newTag, setNewTag] = useState("");
+  const [mode, setMode] = useState<"merge" | "replace">("merge");
+
+  // Fire the suggestion exactly once when the panel opens. useRef is the
+  // standard "run once even under StrictMode double-invoke" guard for
+  // effect-kicked async work.
+  const firedRef = useRef(false);
+  useEffect(() => {
+    if (firedRef.current) return;
+    firedRef.current = true;
+    suggest.mutate(undefined, {
+      onSuccess: (res) => {
+        if (res.success && res.data) {
+          setCollection(res.data.collection || "");
+          setCategories(res.data.categories || []);
+          setTags(res.data.tags || []);
+        }
+      },
+    });
+    // suggest is stable across renders for react-query; lint disabled
+    // intentionally.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const apply = useMutation({
+    mutationFn: () =>
+      applyTags(doc.doc_id, {
+        // Only send collection if it's non-empty AND differs from current
+        // (or we're replacing). Avoids overwriting a manually-set collection.
+        collection:
+          collection && (mode === "replace" || collection !== doc.collection)
+            ? collection
+            : undefined,
+        categories,
+        tags,
+        mode,
+      }),
+    onSuccess: (res) => {
+      if (res.success) onDone();
+    },
+  });
+
+  const removeCat = (c: string) =>
+    setCategories((xs) => xs.filter((x) => x !== c));
+  const removeTag = (t: string) => setTags((xs) => xs.filter((x) => x !== t));
+  const addCat = () => {
+    const v = newCat.trim();
+    if (!v) return;
+    if (!categories.includes(v)) setCategories([...categories, v]);
+    setNewCat("");
+  };
+  const addTag = () => {
+    const v = newTag.trim().toLowerCase().replace(/\s+/g, "-");
+    if (!v) return;
+    if (!tags.includes(v)) setTags([...tags, v]);
+    setNewTag("");
+  };
+
+  if (suggest.isPending) {
+    return (
+      <div className="text-xs text-forge-muted">Asking the LLM for suggestions…</div>
+    );
+  }
+  if (suggest.isError || (suggest.data && !suggest.data.success)) {
+    const reason =
+      suggest.data && !suggest.data.success
+        ? suggest.data.reason
+        : suggest.error instanceof Error
+        ? suggest.error.message
+        : "unknown error";
+    return (
+      <div className="text-xs text-rose-400">
+        Suggestion failed: {reason}
+      </div>
+    );
+  }
+
+  const hasChanges =
+    collection !== (doc.collection || "default") ||
+    categories.length > 0 ||
+    tags.length > 0;
+
+  return (
+    <div className="grid md:grid-cols-3 gap-4 text-sm">
+      {/* Collection */}
+      <div>
+        <div className="text-xs text-forge-muted mb-1 font-semibold">
+          Collection
+        </div>
+        <input
+          value={collection}
+          onChange={(e) =>
+            setCollection(e.target.value.replace(/\s+/g, "_").toLowerCase())
+          }
+          placeholder="collection_name"
+          className="bg-forge-panel border border-forge-edge rounded px-2 py-1 text-xs w-full"
+        />
+        <div className="text-xs text-forge-muted/60 mt-1">
+          Current: {doc.collection || "default"}
+        </div>
+      </div>
+
+      {/* Categories */}
+      <div>
+        <div className="text-xs text-forge-muted mb-1 font-semibold">
+          Categories
+        </div>
+        <div className="flex flex-wrap gap-1 mb-1">
+          {categories.map((c) => (
+            <span
+              key={c}
+              className="text-xs bg-forge-edge rounded px-2 py-0.5 cursor-pointer hover:bg-forge-danger/20 group"
+              onClick={() => removeCat(c)}
+              title="Click to remove"
+            >
+              {c} <span className="text-forge-danger opacity-0 group-hover:opacity-100">×</span>
+            </span>
+          ))}
+          {categories.length === 0 && (
+            <span className="text-xs text-forge-muted/50 italic">none</span>
+          )}
+        </div>
+        <div className="flex gap-1">
+          <input
+            value={newCat}
+            onChange={(e) => setNewCat(e.target.value)}
+            placeholder="add category"
+            className="bg-forge-panel border border-forge-edge rounded px-2 py-1 text-xs flex-1"
+            onKeyDown={(e) => { if (e.key === "Enter") addCat(); }}
+          />
+          <button
+            onClick={addCat}
+            disabled={!newCat.trim()}
+            className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge disabled:opacity-30"
+          >
+            add
+          </button>
+        </div>
+      </div>
+
+      {/* Tags */}
+      <div>
+        <div className="text-xs text-forge-muted mb-1 font-semibold">Tags</div>
+        <div className="flex flex-wrap gap-1 mb-1">
+          {tags.map((t) => (
+            <span
+              key={t}
+              className="text-xs bg-forge-edge rounded px-2 py-0.5 cursor-pointer hover:bg-forge-danger/20 group"
+              onClick={() => removeTag(t)}
+              title="Click to remove"
+            >
+              #{t} <span className="text-forge-danger opacity-0 group-hover:opacity-100">×</span>
+            </span>
+          ))}
+          {tags.length === 0 && (
+            <span className="text-xs text-forge-muted/50 italic">none</span>
+          )}
+        </div>
+        <div className="flex gap-1">
+          <input
+            value={newTag}
+            onChange={(e) => setNewTag(e.target.value)}
+            placeholder="add tag"
+            className="bg-forge-panel border border-forge-edge rounded px-2 py-1 text-xs flex-1"
+            onKeyDown={(e) => { if (e.key === "Enter") addTag(); }}
+          />
+          <button
+            onClick={addTag}
+            disabled={!newTag.trim()}
+            className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge disabled:opacity-30"
+          >
+            add
+          </button>
+        </div>
+      </div>
+
+      {/* Apply row spans all three columns. Stays left-aligned (no
+          ml-auto) so the table's horizontal overflow can't push apply off
+          the right edge of the viewport. */}
+      <div className="md:col-span-3 flex flex-wrap items-center gap-x-4 gap-y-2 pt-2 border-t border-forge-edge/60">
+        <button
+          onClick={() => apply.mutate()}
+          disabled={apply.isPending || !hasChanges}
+          className="text-xs bg-forge-primary/20 text-forge-primary border border-forge-primary/30 rounded px-3 py-1 hover:bg-forge-primary/30 disabled:opacity-30"
+        >
+          {apply.isPending ? "applying…" : "apply"}
+        </button>
+        <button
+          onClick={() => onDone()}
+          className="text-xs border border-forge-edge rounded px-3 py-1 hover:bg-forge-edge"
+        >
+          cancel
+        </button>
+        <label className="text-xs flex items-center gap-2 ml-2">
+          <input
+            type="radio"
+            checked={mode === "merge"}
+            onChange={() => setMode("merge")}
+          />
+          merge (keep existing)
+        </label>
+        <label className="text-xs flex items-center gap-2">
+          <input
+            type="radio"
+            checked={mode === "replace"}
+            onChange={() => setMode("replace")}
+          />
+          replace (drop existing first)
+        </label>
+      </div>
+    </div>
   );
 }
 
@@ -706,6 +979,81 @@ function ActionBtn({
         danger
           ? "border-rose-800 hover:bg-rose-900/40 text-rose-300"
           : "border-forge-edge hover:bg-forge-edge"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function OverflowMenu({ children }: { children: React.ReactNode }) {
+  // Dropdown with the less-frequently-used row actions tucked out of the
+  // primary button row. Closes on outside click and on Escape — the menu
+  // body is intentionally not auto-closed on item click; child MenuItem
+  // uses setOpen(false) via onClick composition below.
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        title="More actions"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge"
+      >
+        ⋯
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 top-full mt-1 min-w-[14rem] bg-forge-panel border border-forge-edge rounded shadow-lg z-20 py-1 text-left"
+          onClick={() => setOpen(false)}
+        >
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MenuItem({
+  children,
+  onClick,
+  disabled,
+  danger,
+}: {
+  children: React.ReactNode;
+  onClick: () => void;
+  disabled?: boolean;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      role="menuitem"
+      className={`w-full text-left text-xs px-3 py-1.5 disabled:opacity-40 disabled:cursor-not-allowed ${
+        danger
+          ? "text-rose-300 hover:bg-rose-900/30"
+          : "hover:bg-forge-edge text-forge-fg"
       }`}
     >
       {children}
