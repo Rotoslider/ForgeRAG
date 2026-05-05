@@ -943,6 +943,7 @@ async def trigger_full_backup(request: Request) -> ForgeResult:
 
     include_images = backup_settings.get("include_images", True)
     include_pdfs = backup_settings.get("include_pdfs", True)
+    gdrive_enabled = backup_settings.get("gdrive_enabled", True)
 
     # Initialize progress
     request.app.state.backup_progress = {
@@ -954,7 +955,10 @@ async def trigger_full_backup(request: Request) -> ForgeResult:
     }
 
     asyncio.create_task(
-        _run_full_backup(request.app, settings, dest_path, include_images, include_pdfs)
+        _run_full_backup(
+            request.app, settings, dest_path,
+            include_images, include_pdfs, gdrive_enabled,
+        )
     )
 
     return ForgeResult(
@@ -968,12 +972,25 @@ async def trigger_full_backup(request: Request) -> ForgeResult:
     )
 
 
+def _needs_copy(src: Path, dst: Path) -> bool:
+    """Return True if src needs copying (dst missing, size differs, or older)."""
+    if not dst.exists():
+        return True
+    try:
+        ss = src.stat()
+        ds = dst.stat()
+        return ss.st_size != ds.st_size or ss.st_mtime > ds.st_mtime
+    except OSError:
+        return True
+
+
 async def _run_full_backup(
     app: Any,
     settings: Any,
     dest_path: Path,
     include_images: bool,
     include_pdfs: bool,
+    gdrive_enabled: bool = False,
 ) -> None:
     """Background task that performs the full backup."""
     data_dir = Path(settings.server.data_dir)
@@ -1064,73 +1081,85 @@ async def _run_full_backup(
         progress["bytes_copied"] = total_bytes
         progress["percent"] = 10
 
-        # Step 2: Copy page images
+        # Step 2: Copy page images (incremental — shared dir, skip existing)
+        copied_files = 0
+        skipped_files = 0
         if include_images:
-            progress["current_file"] = "Copying page images..."
+            progress["current_file"] = "Scanning page images..."
             images_src = data_dir / "page_images"
             reduced_src = data_dir / "reduced_images"
 
-            if images_src.exists():
-                # Count files for progress tracking
-                image_files = list(images_src.rglob("*"))
-                image_files = [f for f in image_files if f.is_file()]
-                total_image_files = len(image_files)
+            # Images go into a shared dir at dest root (not per-timestamp)
+            # so subsequent backups only copy new/changed files
+            images_dest = dest_path / "page_images"
+            images_dest.mkdir(parents=True, exist_ok=True)
 
-                images_dest = backup_dir / "page_images"
-                images_dest.mkdir(parents=True, exist_ok=True)
+            if images_src.exists():
+                image_files = [f for f in images_src.rglob("*") if f.is_file()]
+                total_image_files = len(image_files)
 
                 for idx, src_file in enumerate(image_files):
                     rel = src_file.relative_to(images_src)
                     dst = images_dest / rel
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src_file, dst)
-                    file_size = src_file.stat().st_size
-                    total_bytes += file_size
+                    if _needs_copy(src_file, dst):
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dst)
+                        total_bytes += src_file.stat().st_size
+                        copied_files += 1
+                    else:
+                        skipped_files += 1
                     progress["bytes_copied"] = total_bytes
                     if total_image_files > 0:
                         img_pct = (idx + 1) / total_image_files
                         progress["percent"] = int(10 + img_pct * 40)
-                    progress["current_file"] = str(rel)
-                    # Yield to event loop periodically
+                    progress["current_file"] = f"{rel} ({copied_files} new, {skipped_files} skipped)"
                     if idx % 50 == 0:
                         await asyncio.sleep(0)
 
             if reduced_src.exists():
-                progress["current_file"] = "Copying reduced images..."
+                progress["current_file"] = "Scanning reduced images..."
                 reduced_files = [f for f in reduced_src.rglob("*") if f.is_file()]
-                reduced_dest = backup_dir / "reduced_images"
+                reduced_dest = dest_path / "reduced_images"
                 reduced_dest.mkdir(parents=True, exist_ok=True)
                 for idx, src_file in enumerate(reduced_files):
                     rel = src_file.relative_to(reduced_src)
                     dst = reduced_dest / rel
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src_file, dst)
-                    total_bytes += src_file.stat().st_size
+                    if _needs_copy(src_file, dst):
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dst)
+                        total_bytes += src_file.stat().st_size
+                        copied_files += 1
+                    else:
+                        skipped_files += 1
                     progress["bytes_copied"] = total_bytes
                     progress["percent"] = int(50 + (idx + 1) / max(1, len(reduced_files)) * 20)
-                    progress["current_file"] = str(rel)
+                    progress["current_file"] = f"{rel} ({copied_files} new, {skipped_files} skipped)"
                     if idx % 50 == 0:
                         await asyncio.sleep(0)
         else:
             progress["percent"] = 70
 
-        # Step 3: Copy source PDFs
+        # Step 3: Copy source PDFs (incremental)
         if include_pdfs:
-            progress["current_file"] = "Copying source PDFs..."
+            progress["current_file"] = "Scanning source PDFs..."
             uploads_src = data_dir / "uploads"
             if uploads_src.exists():
                 pdf_files = [f for f in uploads_src.rglob("*.pdf") if f.is_file()]
-                pdfs_dest = backup_dir / "pdfs"
+                pdfs_dest = dest_path / "pdfs"
                 pdfs_dest.mkdir(parents=True, exist_ok=True)
                 for idx, src_file in enumerate(pdf_files):
                     rel = src_file.relative_to(uploads_src)
                     dst = pdfs_dest / rel
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(src_file, dst)
-                    total_bytes += src_file.stat().st_size
+                    if _needs_copy(src_file, dst):
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(src_file, dst)
+                        total_bytes += src_file.stat().st_size
+                        copied_files += 1
+                    else:
+                        skipped_files += 1
                     progress["bytes_copied"] = total_bytes
                     progress["percent"] = int(70 + (idx + 1) / max(1, len(pdf_files)) * 20)
-                    progress["current_file"] = str(rel)
+                    progress["current_file"] = f"{rel} ({copied_files} new, {skipped_files} skipped)"
                     if idx % 10 == 0:
                         await asyncio.sleep(0)
         else:
@@ -1141,7 +1170,9 @@ async def _run_full_backup(
         manifest = {
             "timestamp": ts,
             "exported_at": datetime.now(timezone.utc).isoformat(),
-            "total_bytes": total_bytes,
+            "total_bytes_copied": total_bytes,
+            "files_copied": copied_files,
+            "files_skipped": skipped_files,
             "include_images": include_images,
             "include_pdfs": include_pdfs,
             "document_count": len(export["documents"]),
@@ -1150,15 +1181,39 @@ async def _run_full_backup(
         manifest_file = backup_dir / "manifest.json"
         manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
+        # Step 5: Upload to Google Drive if enabled
+        if gdrive_enabled:
+            progress["current_file"] = "Uploading to Google Drive..."
+            progress["percent"] = 95
+            try:
+                import subprocess
+                project_root = Path(__file__).resolve().parent.parent.parent
+                gdrive_script = project_root / "scripts" / "gdrive_backup.py"
+                venv_python = project_root / "venv" / "bin" / "python3"
+                python_cmd = str(venv_python) if venv_python.exists() else "python3"
+                result = await asyncio.to_thread(
+                    subprocess.run,
+                    [python_cmd, str(gdrive_script)],
+                    capture_output=True, text=True, timeout=600,
+                    cwd=str(project_root),
+                )
+                if result.returncode == 0:
+                    logger.info("Google Drive upload succeeded")
+                else:
+                    logger.warning("Google Drive upload failed: %s", result.stderr[:500])
+            except Exception as gdrive_exc:
+                logger.warning("Google Drive upload error: %s", gdrive_exc)
+
         progress["percent"] = 100
-        progress["current_file"] = "Complete"
+        progress["current_file"] = f"Complete ({copied_files} copied, {skipped_files} unchanged)"
         progress["running"] = False
         progress["finished_at"] = datetime.now(timezone.utc).isoformat()
         progress["total_bytes"] = total_bytes
         progress["backup_path"] = str(backup_dir)
 
         logger.info(
-            "Full backup complete: %s (%d bytes)", backup_dir, total_bytes
+            "Full backup complete: %s (%d bytes, %d copied, %d skipped)",
+            backup_dir, total_bytes, copied_files, skipped_files,
         )
 
     except Exception as exc:
