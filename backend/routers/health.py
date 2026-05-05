@@ -43,6 +43,19 @@ async def health(request: Request) -> ForgeResult:
         except Exception as exc:
             logger.warning("Neo4j health check failed: %s", exc)
             payload.details["neo4j_error"] = str(exc)
+        # Include the background health-loop status
+        payload.details["neo4j_healthy"] = getattr(neo4j_svc, "is_healthy", None)
+
+    # LLM circuit breaker status
+    llm_svc = getattr(request.app.state, "llm", None)
+    if llm_svc is not None:
+        cb = getattr(llm_svc, "circuit_breaker", None)
+        if cb is not None:
+            payload.details["llm_circuit_breaker"] = {
+                "state": cb.state,
+                "consecutive_failures": cb.consecutive_failures,
+                "is_open": cb.is_open,
+            }
 
     # GPU availability — prefer the GPU manager which also reports VRAM + models
     gpu = getattr(request.app.state, "gpu", None)

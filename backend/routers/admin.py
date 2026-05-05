@@ -6,7 +6,10 @@ Currently: dedupe Page nodes when re-ingestion before the fix created them.
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Request
 
@@ -343,5 +346,196 @@ async def dedup_pages(request: Request) -> ForgeResult:
             "extras_found": extras,
             "deleted": deleted_total,
             "pages_after_dedup": remaining,
+        },
+    )
+
+
+# ------------------------------------------------------------------ backup
+
+
+@router.get("/backup/manifest")
+async def backup_manifest(request: Request) -> ForgeResult:
+    """Return a lightweight document manifest for backup verification.
+
+    Lists every Document with its doc_id, file_hash, title, page_count,
+    categories, and tags. No embeddings, no heavy data — just metadata.
+    """
+    neo4j = request.app.state.neo4j
+
+    rows = await neo4j.run_query(
+        """
+        MATCH (d:Document)
+        OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
+        WITH d, count(p) AS page_count
+        OPTIONAL MATCH (d)-[:IN_CATEGORY]->(cat:Category)
+        WITH d, page_count, collect(DISTINCT cat.name) AS categories
+        OPTIONAL MATCH (d)-[:HAS_TAG]->(tag:Tag)
+        RETURN d.doc_id       AS doc_id,
+               d.file_hash    AS file_hash,
+               d.title        AS title,
+               d.filename     AS filename,
+               page_count,
+               categories,
+               collect(DISTINCT tag.name) AS tags
+        ORDER BY d.title
+        """
+    )
+
+    documents = [
+        {
+            "doc_id": r["doc_id"],
+            "file_hash": r["file_hash"],
+            "title": r["title"],
+            "filename": r["filename"],
+            "page_count": r["page_count"],
+            "categories": r["categories"],
+            "tags": r["tags"],
+        }
+        for r in rows
+    ]
+
+    return ForgeResult(
+        success=True,
+        data={
+            "document_count": len(documents),
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "documents": documents,
+        },
+    )
+
+
+@router.post("/backup")
+async def backup_graph(request: Request) -> ForgeResult:
+    """Hot backup: export the graph as a JSON file while Neo4j is running.
+
+    Exports:
+      - All Document nodes (full properties)
+      - All Page nodes (metadata only — no embeddings or extracted_text blobs)
+      - All entity nodes (Material, Process, Standard, Equipment) and their
+        relationships to Pages
+      - Category and Tag nodes with their Document relationships
+
+    The output file is written to data/backups/graph_<timestamp>.json and
+    the response includes the file path and size.
+    """
+    neo4j = request.app.state.neo4j
+    settings = request.app.state.settings
+    backup_dir = Path(settings.server.data_dir) / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_path = backup_dir / f"graph_{ts}.json"
+
+    export: dict = {
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "format_version": 1,
+    }
+
+    # Documents
+    docs = await neo4j.run_query(
+        """
+        MATCH (d:Document)
+        RETURN d {.*} AS doc
+        """
+    )
+    export["documents"] = [r["doc"] for r in docs]
+
+    # Pages — metadata only (skip embeddings and large text)
+    pages = await neo4j.run_query(
+        """
+        MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
+        RETURN d.doc_id AS doc_id,
+               p.page_id AS page_id,
+               p.page_number AS page_number,
+               p.text_char_count AS text_char_count,
+               p.is_blank AS is_blank,
+               p.colpali_vector_count AS colpali_vector_count,
+               p.colpali_vector_dim AS colpali_vector_dim,
+               (p.text_embedding IS NOT NULL) AS has_text_embedding
+        ORDER BY d.doc_id, p.page_number
+        """
+    )
+    export["pages"] = pages
+
+    # Entity nodes and their Page relationships
+    entity_labels = ["Material", "Process", "Standard", "Equipment"]
+    export["entities"] = {}
+    export["entity_relationships"] = []
+
+    for label in entity_labels:
+        pk = "code" if label == "Standard" else "name"
+
+        # Nodes
+        nodes = await neo4j.run_query(
+            f"MATCH (e:{label}) RETURN e {{.*}} AS entity"
+        )
+        export["entities"][label] = [r["entity"] for r in nodes]
+
+        # Relationships to Pages
+        rels = await neo4j.run_query(
+            f"""
+            MATCH (p:Page)-[r]->(e:{label})
+            RETURN p.page_id AS page_id,
+                   type(r)   AS rel_type,
+                   e.{pk}    AS entity_key,
+                   '{label}' AS entity_label
+            """
+        )
+        export["entity_relationships"].extend(rels)
+
+    # Categories and Tags with Document relationships
+    cats = await neo4j.run_query(
+        """
+        MATCH (d:Document)-[:IN_CATEGORY]->(c:Category)
+        RETURN d.doc_id AS doc_id, c.name AS category
+        """
+    )
+    export["document_categories"] = cats
+
+    tags = await neo4j.run_query(
+        """
+        MATCH (d:Document)-[:HAS_TAG]->(t:Tag)
+        RETURN d.doc_id AS doc_id, t.name AS tag
+        """
+    )
+    export["document_tags"] = tags
+
+    # Collections
+    collections = await neo4j.run_query(
+        """
+        MATCH (d:Document)-[:IN_COLLECTION]->(col:Collection)
+        RETURN d.doc_id AS doc_id, col.name AS collection
+        """
+    )
+    export["document_collections"] = collections
+
+    # Summary counts
+    export["counts"] = {
+        "documents": len(export["documents"]),
+        "pages": len(export["pages"]),
+        "entity_relationships": len(export["entity_relationships"]),
+        "categories": len(export["document_categories"]),
+        "tags": len(export["document_tags"]),
+        "collections": len(export["document_collections"]),
+    }
+    for label in entity_labels:
+        export["counts"][label.lower() + "s"] = len(export["entities"].get(label, []))
+
+    # Write file
+    out_path.write_text(json.dumps(export, indent=2, default=str), encoding="utf-8")
+    file_size = out_path.stat().st_size
+
+    logger.info(
+        "Graph backup exported to %s (%d bytes, %d docs, %d pages)",
+        out_path, file_size, len(export["documents"]), len(export["pages"]),
+    )
+
+    return ForgeResult(
+        success=True,
+        data={
+            "path": str(out_path),
+            "file_size_bytes": file_size,
+            "file_size_mb": round(file_size / 1e6, 1),
+            "counts": export["counts"],
         },
     )

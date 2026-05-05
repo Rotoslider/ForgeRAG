@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from typing import Any, Type, TypeVar
 
 import httpx
@@ -43,12 +44,114 @@ class LLMFatalError(LLMError):
     """Schema mismatch, invalid response, auth — don't retry."""
 
 
+class CircuitBreaker:
+    """Circuit breaker for the LLM HTTP endpoint.
+
+    States:
+    - CLOSED: requests flow normally, failures are counted.
+    - OPEN: after `failure_threshold` consecutive failures, all requests
+      are rejected immediately without making the HTTP call.
+    - HALF-OPEN: after `recovery_timeout` seconds, one probe request is
+      allowed through. If it succeeds the circuit closes; if it fails
+      the circuit stays open for another timeout period.
+    """
+
+    STATE_CLOSED = "closed"
+    STATE_OPEN = "open"
+    STATE_HALF_OPEN = "half-open"
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout: float = 60.0,
+    ):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self._consecutive_failures: int = 0
+        self._state: str = self.STATE_CLOSED
+        self._opened_at: float = 0.0
+
+    @property
+    def is_open(self) -> bool:
+        """True when the circuit is open (rejecting requests)."""
+        return self._state == self.STATE_OPEN
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @property
+    def consecutive_failures(self) -> int:
+        return self._consecutive_failures
+
+    def allow_request(self) -> bool:
+        """Check whether a request should be allowed through.
+
+        Returns True if the request may proceed, False if the circuit is
+        open and the caller should fail fast.
+        """
+        if self._state == self.STATE_CLOSED:
+            return True
+
+        if self._state == self.STATE_OPEN:
+            elapsed = time.monotonic() - self._opened_at
+            if elapsed >= self.recovery_timeout:
+                # Transition to half-open: allow one probe request
+                self._state = self.STATE_HALF_OPEN
+                logger.info(
+                    "LLM circuit breaker half-open — allowing probe request "
+                    "after %.0fs timeout",
+                    elapsed,
+                )
+                return True
+            return False
+
+        # HALF-OPEN: only one request is in flight (the probe). Block
+        # additional requests until the probe resolves.
+        return False
+
+    def record_success(self) -> None:
+        """Record a successful response. Resets the circuit to closed."""
+        if self._state != self.STATE_CLOSED:
+            logger.info(
+                "LLM circuit breaker closed — probe succeeded, "
+                "resetting after %d consecutive failures",
+                self._consecutive_failures,
+            )
+        self._consecutive_failures = 0
+        self._state = self.STATE_CLOSED
+
+    def record_failure(self) -> None:
+        """Record a failed response. Opens the circuit after threshold."""
+        self._consecutive_failures += 1
+        if self._state == self.STATE_HALF_OPEN:
+            # Probe failed — reopen the circuit for another timeout period
+            self._state = self.STATE_OPEN
+            self._opened_at = time.monotonic()
+            logger.warning(
+                "LLM circuit breaker re-opened — probe failed "
+                "(%d consecutive failures)",
+                self._consecutive_failures,
+            )
+        elif (
+            self._state == self.STATE_CLOSED
+            and self._consecutive_failures >= self.failure_threshold
+        ):
+            self._state = self.STATE_OPEN
+            self._opened_at = time.monotonic()
+            logger.warning(
+                "LLM circuit breaker OPEN — %d consecutive failures",
+                self._consecutive_failures,
+            )
+
+
 class LLMService:
     """Async OpenAI-compatible client. One instance per app."""
 
     def __init__(self, settings: LLMSettings):
         self.settings = settings
         self._client: httpx.AsyncClient | None = None
+        self.circuit_breaker = CircuitBreaker()
 
     async def start(self) -> None:
         self._client = httpx.AsyncClient(
@@ -104,12 +207,21 @@ class LLMService:
         if getattr(self.settings, "disable_thinking", False):
             payload["chat_template_kwargs"] = {"enable_thinking": False}
 
+        # Circuit breaker: fail fast if LM Studio is down
+        if not self.circuit_breaker.allow_request():
+            raise LLMTransientError(
+                f"LLM service circuit breaker open — "
+                f"{self.circuit_breaker.consecutive_failures} consecutive failures"
+            )
+
         try:
             r = await self._client.post("/chat/completions", json=payload)
         except httpx.RequestError as exc:
+            self.circuit_breaker.record_failure()
             raise LLMTransientError(f"Request failed: {exc}") from exc
 
         if r.status_code >= 500:
+            self.circuit_breaker.record_failure()
             raise LLMTransientError(f"Server {r.status_code}: {r.text[:200]}")
         if r.status_code >= 400:
             raise LLMFatalError(f"HTTP {r.status_code}: {r.text[:400]}")
@@ -126,6 +238,7 @@ class LLMService:
                 reasoning = message.get("reasoning_content") or ""
                 if reasoning.strip():
                     content = reasoning
+            self.circuit_breaker.record_success()
             return content
         except (KeyError, ValueError, TypeError) as exc:
             raise LLMFatalError(f"Malformed response: {r.text[:400]}") from exc

@@ -60,6 +60,26 @@ def _filter_clauses(filters: SearchFilters | None) -> tuple[str, dict]:
     return " AND ".join(parts), params
 
 
+def _apply_lucene_fuzzy(tokens: list[str]) -> list[str]:
+    """Append Lucene ~1 (edit distance 1) to tokens >= 5 characters.
+
+    Short tokens (< 5 chars) are left unchanged to avoid false positives
+    on codes and abbreviations like "QW-451" or "SMAW".
+
+    Example: ["shielded", "metal", "arc", "welding"]
+           -> ["shielded~1", "metal", "arc", "welding~1"]
+    """
+    result = []
+    for t in tokens:
+        # Only fuzz tokens that are long enough for typo tolerance to be useful
+        # and that don't already have Lucene modifiers
+        if len(t) >= 5 and "~" not in t and "^" not in t and '"' not in t:
+            result.append(f"{t}~1")
+        else:
+            result.append(t)
+    return result
+
+
 # ============================================================================
 # Keyword search — the missing Ctrl+F equivalent
 # ============================================================================
@@ -67,6 +87,13 @@ def _filter_clauses(filters: SearchFilters | None) -> tuple[str, dict]:
 class KeywordSearchRequest(BaseModel):
     query: str = Field(..., description="Exact text to search for (case-insensitive)")
     limit: int = Field(default=20, ge=1, le=100)
+    fuzzy: bool = Field(
+        default=False,
+        description="Enable OCR typo tolerance: appends Lucene ~1 (edit distance 1) "
+        "to query terms >= 5 characters. Useful for scanned documents with OCR "
+        "errors (e.g. 'weldlng' matches 'welding'). Default off to preserve "
+        "exact matching for code lookups like 'QW-451'.",
+    )
 
 
 @router.post("/keyword")
@@ -90,12 +117,22 @@ async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeR
     escaped = body.query.replace('"', '\\"')
     tokens = [t for t in body.query.split() if t]
     escaped_tokens = [t.replace('"', '\\"') for t in tokens if len(t) >= 2]
-    # Phrase match ^4 (higher weight) OR any-of-terms
-    if escaped_tokens:
-        or_clause = " OR ".join(escaped_tokens)
-        phrase_query = f'"{escaped}"^4 OR ({or_clause})'
+
+    # When fuzzy mode is enabled, apply Lucene edit-distance syntax to
+    # individual terms for OCR typo tolerance ("weldlng" -> "welding").
+    # Phrase match is skipped in fuzzy mode because Lucene doesn't support
+    # fuzzy inside quoted phrases.
+    if body.fuzzy:
+        fuzzy_tokens = _apply_lucene_fuzzy(escaped_tokens)
+        or_clause = " OR ".join(fuzzy_tokens)
+        phrase_query = f"({or_clause})" if fuzzy_tokens else f'"{escaped}"'
     else:
-        phrase_query = f'"{escaped}"'
+        # Phrase match ^4 (higher weight) OR any-of-terms
+        if escaped_tokens:
+            or_clause = " OR ".join(escaped_tokens)
+            phrase_query = f'"{escaped}"^4 OR ({or_clause})'
+        else:
+            phrase_query = f'"{escaped}"'
     try:
         rows = await neo4j.run_query(
             """
@@ -1041,26 +1078,36 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
     filter_where, filter_params = _filter_clauses(body.filters)
 
     if body.strategy == "community":
-        # Search community summaries
+        # Search community summaries, boosted by community size so that
+        # larger, better-attested communities rank slightly higher than
+        # tiny ones at similar vector-similarity scores.
         cypher = """
             CALL db.index.vector.queryNodes('community_summary_embedding', $topk, $vec)
             YIELD node AS c, score
             OPTIONAL MATCH (p:Page)-[:IN_COMMUNITY]->(c)
             OPTIONAL MATCH (d:Document)-[:HAS_PAGE]->(p)
+            WITH c, score,
+                 count(DISTINCT p) AS actual_page_count,
+                 collect(DISTINCT {doc_id: d.doc_id, title: d.title,
+                                   page_number: p.page_number,
+                                   file_hash: d.file_hash})[..10] AS sample_pages
             RETURN c.community_id AS community_id,
                    c.level AS level,
                    c.summary AS summary,
                    c.member_count AS member_count,
+                   actual_page_count,
                    score,
-                   collect(DISTINCT {doc_id: d.doc_id, title: d.title,
-                                     page_number: p.page_number,
-                                     file_hash: d.file_hash})[..10] AS sample_pages
-            ORDER BY score DESC
+                   score * (1.0 + log(coalesce(c.member_count, 0) + 1) * 0.1) AS boosted_score,
+                   sample_pages
+            ORDER BY boosted_score DESC
             LIMIT $limit
         """
         rows = await neo4j.run_query(
             cypher, {"topk": body.limit, "vec": qvec.tolist(), "limit": body.limit}
         )
+        # Expose the boosted score as the primary score for consumers
+        for row in rows:
+            row["score"] = row.pop("boosted_score", row.get("score"))
         return ForgeResult(success=True, data=rows)
 
     where = f" WHERE {filter_where}" if filter_where else ""
@@ -1072,6 +1119,22 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
         # page_text_embedding index and returned nothing post-BGE-M3
         # migration — rewritten to go through chunk_embedding.
         query_terms = [t.lower() for t in body.query.split() if len(t) >= 3]
+
+        # Fuzzy entity matching: expand query_terms with names of known
+        # entities that fuzzy-match the query (catches "inconel 625" vs
+        # "Inconel® 625", "IN625", spacing/special-char mismatches).
+        fuzzy_matched: list[str] = []
+        entity_matcher = getattr(request.app.state, "entity_matcher", None)
+        if entity_matcher is not None:
+            try:
+                matches = await entity_matcher.find_matches_async(body.query)
+                for m in matches:
+                    term = m.name.lower()
+                    if term not in query_terms:
+                        query_terms.append(term)
+                        fuzzy_matched.append(m.name)
+            except Exception as exc:
+                logger.warning("EntityMatcher failed in graph_boosted: %s", exc)
 
         cypher = f"""
             CALL db.index.vector.queryNodes('chunk_embedding', $pool, $vec)
@@ -1120,6 +1183,9 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
         params.update(filter_params)
         rows = await neo4j.run_query(cypher, params)
         hits = [_format_hit_with_boost(r) for r in rows]
+        if fuzzy_matched:
+            for h in hits:
+                h["fuzzy_matched"] = fuzzy_matched
         return ForgeResult(success=True, data=hits)
 
     if body.strategy == "vector_first":
@@ -1180,6 +1246,23 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
         # Find entity nodes whose names or common_names contain any query
         # term, then pages that mention them.
         query_terms = [t.lower() for t in body.query.split() if len(t) >= 3]
+
+        # Fuzzy entity matching: expand query_terms with names of known
+        # entities that fuzzy-match the query (catches "inconel 625" vs
+        # "Inconel® 625", "IN625", spacing/special-char mismatches).
+        fuzzy_matched: list[str] = []
+        entity_matcher = getattr(request.app.state, "entity_matcher", None)
+        if entity_matcher is not None:
+            try:
+                matches = await entity_matcher.find_matches_async(body.query)
+                for m in matches:
+                    term = m.name.lower()
+                    if term not in query_terms:
+                        query_terms.append(term)
+                        fuzzy_matched.append(m.name)
+            except Exception as exc:
+                logger.warning("EntityMatcher failed in graph_first: %s", exc)
+
         cypher = f"""
             MATCH (e)
             WHERE any(l IN labels(e) WHERE l IN ['Material','Process','Standard','Equipment'])
@@ -1241,7 +1324,11 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
                 "tags": r["tags"],
             })
         hits.sort(key=lambda h: h["score"], reverse=True)
-        return ForgeResult(success=True, data=hits[: body.limit])
+        hits = hits[: body.limit]
+        if fuzzy_matched:
+            for h in hits:
+                h["fuzzy_matched"] = fuzzy_matched
+        return ForgeResult(success=True, data=hits)
 
     if body.strategy == "rrf":
         # Reciprocal Rank Fusion over THREE retrievers:

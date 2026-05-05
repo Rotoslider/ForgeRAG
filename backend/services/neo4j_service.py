@@ -7,6 +7,7 @@ and exposes helper methods for common operations used across the app.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -16,6 +17,10 @@ from neo4j.exceptions import ServiceUnavailable
 from backend.config import Neo4jSettings
 
 logger = logging.getLogger(__name__)
+
+_HEALTH_INTERVAL: float = 30.0
+_BACKOFF_INITIAL: float = 30.0
+_BACKOFF_MAX: float = 300.0
 
 
 class Neo4jService:
@@ -28,6 +33,9 @@ class Neo4jService:
     def __init__(self, settings: Neo4jSettings):
         self.settings = settings
         self._driver: AsyncDriver | None = None
+        self._healthy: bool = False
+        self._health_task: asyncio.Task[None] | None = None
+        self._backoff: float = _BACKOFF_INITIAL
 
     async def connect(self) -> None:
         """Initialize the driver. Does not fail if Neo4j is not yet reachable —
@@ -72,6 +80,102 @@ class Neo4jService:
         except (ServiceUnavailable, Exception) as exc:  # noqa: BLE001
             logger.debug("Neo4j connectivity check failed: %s", exc)
             return False
+
+    # ------------------------------------------------------------------
+    # Health loop
+    # ------------------------------------------------------------------
+
+    @property
+    def is_healthy(self) -> bool:
+        """Whether the last health ping succeeded."""
+        return self._healthy
+
+    async def start_health_loop(self) -> None:
+        """Start the background task that pings Neo4j periodically.
+
+        Safe to call multiple times — a second call is a no-op while the
+        task is already running.
+        """
+        if self._health_task is not None and not self._health_task.done():
+            return
+        # Run an initial check so is_healthy is set before the first interval
+        self._healthy = await self.verify_connectivity()
+        if self._healthy:
+            logger.info("Neo4j health loop starting — initial check passed")
+        else:
+            logger.warning("Neo4j health loop starting — initial check FAILED")
+        self._health_task = asyncio.create_task(
+            self._health_loop(), name="neo4j-health-loop"
+        )
+
+    async def stop_health_loop(self) -> None:
+        """Cancel the background health task (called on shutdown)."""
+        if self._health_task is not None:
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
+            self._health_task = None
+
+    async def _health_loop(self) -> None:
+        """Background loop: ping Neo4j, track health, reconnect on failure."""
+        while True:
+            try:
+                await asyncio.sleep(
+                    _HEALTH_INTERVAL if self._healthy else self._backoff
+                )
+                reachable = await self.verify_connectivity()
+
+                if reachable:
+                    if not self._healthy:
+                        logger.info(
+                            "Neo4j recovered — marking healthy, "
+                            "resetting backoff"
+                        )
+                        self._backoff = _BACKOFF_INITIAL
+                    self._healthy = True
+                else:
+                    if self._healthy:
+                        logger.warning("Neo4j health check failed — marking unhealthy")
+                    self._healthy = False
+                    # Attempt reconnect
+                    await self._attempt_reconnect()
+
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                logger.exception("Unexpected error in Neo4j health loop")
+                self._healthy = False
+
+    async def _attempt_reconnect(self) -> None:
+        """Close and re-create the driver, then verify connectivity."""
+        logger.info(
+            "Neo4j attempting reconnect (backoff=%.0fs)", self._backoff
+        )
+        try:
+            if self._driver is not None:
+                await self._driver.close()
+                self._driver = None
+            # Re-create the driver
+            self._driver = AsyncGraphDatabase.driver(
+                self.settings.uri,
+                auth=(self.settings.user, self.settings.password),
+                max_connection_pool_size=self.settings.max_connection_pool_size,
+                connection_acquisition_timeout=self.settings.connection_acquisition_timeout,
+            )
+            reachable = await self.verify_connectivity()
+            if reachable:
+                logger.info("Neo4j reconnect succeeded")
+                self._healthy = True
+                self._backoff = _BACKOFF_INITIAL
+            else:
+                logger.warning("Neo4j reconnect — driver created but not reachable")
+                # Increase backoff for next attempt
+                self._backoff = min(self._backoff * 2, _BACKOFF_MAX)
+        except Exception:  # noqa: BLE001
+            logger.exception("Neo4j reconnect failed")
+            self._backoff = min(self._backoff * 2, _BACKOFF_MAX)
 
     async def run_query(
         self,

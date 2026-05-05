@@ -509,19 +509,22 @@ class IngestionPipeline:
 
             await self.jobs.update(job_id, status="processing", doc_id=doc_id, file_hash=file_hash)
 
-            # Clear existing visual embeddings so the new model re-processes them.
-            # Without this, switching from ColPali to Nemotron would skip all pages
-            # because colpali_vector_count > 0 from the old model.
+            # Clear existing embeddings so the new model re-processes them.
+            # Without this, switching models (e.g. ColPali to Nemotron, or
+            # nomic 768-d to bge-m3 1024-d) would skip all pages because
+            # _embed_text filters on "text_embedding IS NULL" and
+            # _embed_visual checks colpali_vector_count > 0.
             await self.neo4j.run_write(
                 """
                 MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
                 SET p.colpali_vectors = NULL,
                     p.colpali_vector_count = NULL,
-                    p.colpali_vector_dim = NULL
+                    p.colpali_vector_dim = NULL,
+                    p.text_embedding = NULL
                 """,
                 {"doc_id": doc_id},
             )
-            logger.info("Cleared existing visual embeddings for doc %s", doc_id)
+            logger.info("Cleared existing embeddings (visual + text) for doc %s", doc_id)
 
             # Ensure is_blank is populated before re-embedding so we don't
             # waste GPU cycles on pages that are visually empty.

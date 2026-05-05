@@ -20,9 +20,10 @@ from fastapi.staticfiles import StaticFiles
 from backend.config import DEFAULT_CONFIG_PATH, get_settings
 from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pipeline import IngestionPipeline
-from backend.routers import admin, documents, graph, health, images, ingestion, search, system
+from backend.routers import admin, documents, graph, health, images, ingestion, search, skills, system
 from backend.services.colpali_service import create_colpali_service
 from backend.services.nemotron_service import create_nemotron_service
+from backend.services.entity_matcher import EntityMatcher
 from backend.services.image_service import ImageHighlighter
 from backend.services.gpu_manager import GPUManager
 from backend.services.llm_service import create_llm_service
@@ -50,17 +51,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     neo4j = Neo4jService(settings.neo4j)
     await neo4j.connect()
     app.state.neo4j = neo4j
-    try:
-        connected = await neo4j.verify_connectivity()
-        if connected:
-            logger.info("Neo4j reachable at %s", settings.neo4j.uri)
-        else:
-            logger.warning(
-                "Neo4j unreachable at %s — service will start but DB operations will fail.",
-                settings.neo4j.uri,
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Neo4j connectivity check raised: %s", exc)
+    await neo4j.start_health_loop()
+    if neo4j.is_healthy:
+        logger.info("Neo4j reachable at %s", settings.neo4j.uri)
+    else:
+        logger.warning(
+            "Neo4j unreachable at %s — service will start but DB operations will fail.",
+            settings.neo4j.uri,
+        )
 
     # Job manager (SQLite-backed) for tracking ingestion progress
     job_manager = JobManager(data_dir / "jobs.sqlite")
@@ -130,6 +128,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("LLM health check raised: %s", exc)
 
+    # Entity matcher — in-memory fuzzy matcher for entity names used by
+    # graph_first / graph_boosted search strategies. Initial load deferred
+    # to first query (via _ensure_loaded), so startup isn't blocked.
+    entity_matcher = EntityMatcher(neo4j)
+    app.state.entity_matcher = entity_matcher
+
     # Ingestion pipeline (one instance, processes one job at a time via asyncio)
     pipeline = IngestionPipeline(
         settings=settings,
@@ -154,6 +158,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await gpu.stop()
         except Exception as exc:  # noqa: BLE001
             logger.warning("gpu.stop failed: %s", exc)
+        await neo4j.stop_health_loop()
         await neo4j.close()
         logger.info("ForgeRAG shutdown complete")
 
@@ -185,6 +190,7 @@ def create_app() -> FastAPI:
     app.include_router(system.router)
     app.include_router(graph.router)
     app.include_router(admin.router)
+    app.include_router(skills.router)
 
     # Frontend static mount (production build). Skipped if not built yet.
     # We register a SPA fallback route that returns index.html for any /app/*
