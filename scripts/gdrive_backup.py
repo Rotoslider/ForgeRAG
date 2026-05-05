@@ -310,7 +310,10 @@ def main() -> int:
 
     # Find the most recent neo4j dump file from timestamped subdirectories
     dump_path: Optional[Path] = None
-    for subdir in subdirs:
+    dump_subdirs = sorted(BACKUP_DIR.glob("[0-9]*"), reverse=True)
+    for subdir in dump_subdirs:
+        if not subdir.is_dir():
+            continue
         dumps = sorted(subdir.glob("*.dump"), reverse=True)
         if dumps:
             dump_path = dumps[0]
