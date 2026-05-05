@@ -54,7 +54,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await neo4j.start_health_loop()
     if neo4j.is_healthy:
         logger.info("Neo4j reachable at %s", settings.neo4j.uri)
+        # First-run detection: check if the database is empty
+        try:
+            counts = await neo4j.get_counts()
+            doc_count = counts.get("documents", 0)
+            page_count = counts.get("pages", 0)
+            if doc_count == 0 and page_count == 0:
+                app.state.needs_restore = True
+                logger.warning("")
+                logger.warning("=" * 60)
+                logger.warning("  DATABASE IS EMPTY (0 documents, 0 pages)")
+                logger.warning("")
+                logger.warning("  To restore from backup, run:")
+                logger.warning("    ./scripts/restore.sh --from-drive")
+                logger.warning("")
+                logger.warning("  Or from a local backup:")
+                logger.warning("    ./scripts/restore.sh --from-local data/backups/<timestamp>/")
+                logger.warning("")
+                logger.warning("  Check available backups:")
+                logger.warning("    curl http://localhost:8200/admin/restore/status")
+                logger.warning("=" * 60)
+                logger.warning("")
+            else:
+                app.state.needs_restore = False
+                logger.info("Database has %d documents, %d pages", doc_count, page_count)
+        except Exception as exc:
+            logger.warning("Could not check database contents: %s", exc)
+            app.state.needs_restore = False
     else:
+        app.state.needs_restore = False
         logger.warning(
             "Neo4j unreachable at %s — service will start but DB operations will fail.",
             settings.neo4j.uri,

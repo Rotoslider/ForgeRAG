@@ -46,6 +46,12 @@ async def health(request: Request) -> ForgeResult:
         # Include the background health-loop status
         payload.details["neo4j_healthy"] = getattr(neo4j_svc, "is_healthy", None)
 
+    # First-run / empty-database flag
+    needs_restore = getattr(request.app.state, "needs_restore", False)
+    if needs_restore:
+        payload.details["needs_restore"] = True
+        payload.details["restore_hint"] = "Run: ./scripts/restore.sh --from-drive"
+
     # LLM circuit breaker status
     llm_svc = getattr(request.app.state, "llm", None)
     if llm_svc is not None:

@@ -3,8 +3,9 @@
 
 Authenticates using the shared Choom OAuth credentials/token (with a fallback
 to a local google_auth/ directory), creates a "ForgeRAG Backup" folder on
-Drive if it doesn't exist, uploads the most recent graph backup JSON and
-manifest, and rotates to keep the last 5 backups on Drive.
+Drive if it doesn't exist, uploads the most recent graph backup JSON,
+manifest, and neo4j dump file, and rotates to keep the last 5 backup sets
+on Drive (grouped by date prefix).
 
 Can be called standalone or from scripts/backup.sh.
 
@@ -135,19 +136,44 @@ def find_or_create_folder(service, folder_name: str) -> str:
     return folder_id
 
 
-def upload_file(service, local_path: Path, folder_id: str) -> dict:
+def upload_file(
+    service,
+    local_path: Path,
+    folder_id: str,
+    mimetype: str = "application/json",
+    display_name: str | None = None,
+) -> dict:
     """Upload a single file to the specified Drive folder.
+
+    Uses resumable upload, which is required for files over 5 MB and
+    recommended for all uploads.  For large files (neo4j dumps) progress
+    is logged every 10%.
 
     Returns metadata dict with id, name, size.
     """
-    media = MediaFileUpload(str(local_path), mimetype="application/json", resumable=True)
+    media = MediaFileUpload(
+        str(local_path),
+        mimetype=mimetype,
+        resumable=True,
+        chunksize=50 * 1024 * 1024,  # 50 MB chunks for large dumps
+    )
+    file_name = display_name or local_path.name
     body = {
-        "name": local_path.name,
+        "name": file_name,
         "parents": [folder_id],
     }
-    result = service.files().create(
+    request = service.files().create(
         body=body, media_body=media, fields="id, name, size, webViewLink"
-    ).execute()
+    )
+
+    result = None
+    while result is None:
+        status, result = request.next_chunk()
+        if status:
+            pct = int(status.progress() * 100)
+            if pct % 10 == 0:
+                logger.info("  Upload %s: %d%%", file_name, pct)
+
     return result
 
 
@@ -162,24 +188,62 @@ def list_folder_files(service, folder_id: str) -> list[dict]:
     return results.get("files", [])
 
 
+def _extract_date_prefix(name: str) -> str:
+    """Extract the YYYYMMDD_HHMMSS date prefix from a backup filename.
+
+    Expected patterns:
+      graph_20260505_143017.json  -> 20260505_143017
+      manifest.json               -> '' (no date, kept separately)
+      neo4j_20260505_143017.dump  -> 20260505_143017
+      manifest_20260505_143017.json -> 20260505_143017
+    """
+    import re
+
+    m = re.search(r"(\d{8}_\d{6})", name)
+    return m.group(1) if m else ""
+
+
 def rotate_backups(service, folder_id: str, keep: int = KEEP_ON_DRIVE) -> int:
-    """Delete the oldest backups in the folder, keeping only the last `keep`.
+    """Delete the oldest backup *sets* in the folder, keeping only the last
+    ``keep`` sets.  A set is a group of files sharing the same YYYYMMDD_HHMMSS
+    date prefix (e.g. graph, manifest, and neo4j dump from the same run).
+    Files without a date prefix are left untouched.
 
     Returns the number of files deleted.
     """
+    from collections import defaultdict
+
     files = list_folder_files(service, folder_id)
-    if len(files) <= keep:
+    if not files:
         return 0
 
-    to_delete = files[keep:]
+    # Group by date prefix
+    groups: dict[str, list[dict]] = defaultdict(list)
+    undated: list[dict] = []
+    for f in files:
+        prefix = _extract_date_prefix(f["name"])
+        if prefix:
+            groups[prefix].append(f)
+        else:
+            undated.append(f)
+
+    # Sort date prefixes newest-first
+    sorted_prefixes = sorted(groups.keys(), reverse=True)
+
+    if len(sorted_prefixes) <= keep:
+        return 0
+
+    # Delete all files in the oldest sets beyond the keep count
+    to_delete_prefixes = sorted_prefixes[keep:]
     deleted = 0
-    for f in to_delete:
-        try:
-            service.files().delete(fileId=f["id"]).execute()
-            logger.info("  Deleted old backup: %s (id=%s)", f["name"], f["id"])
-            deleted += 1
-        except HttpError as e:
-            logger.warning("  Failed to delete %s: %s", f["name"], e)
+    for prefix in to_delete_prefixes:
+        for f in groups[prefix]:
+            try:
+                service.files().delete(fileId=f["id"]).execute()
+                logger.info("  Deleted old backup: %s (id=%s)", f["name"], f["id"])
+                deleted += 1
+            except HttpError as e:
+                logger.warning("  Failed to delete %s: %s", f["name"], e)
     return deleted
 
 
@@ -189,8 +253,10 @@ def _human_size(size_bytes: int) -> str:
         return f"{size_bytes} B"
     elif size_bytes < 1024 * 1024:
         return f"{size_bytes / 1024:.1f} KB"
-    else:
+    elif size_bytes < 1024 * 1024 * 1024:
         return f"{size_bytes / (1024 * 1024):.1f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +275,11 @@ def main() -> int:
     latest_graph = graph_files[0]
     logger.info("Latest graph backup: %s (%s)",
                 latest_graph.name, _human_size(latest_graph.stat().st_size))
+
+    # Extract timestamp from the graph filename for consistent naming
+    import re
+    ts_match = re.search(r"(\d{8}_\d{6})", latest_graph.name)
+    backup_ts = ts_match.group(1) if ts_match else ""
 
     # Find manifest if it exists (may be in a timestamped subdirectory or at top level)
     manifest_path: Optional[Path] = None
@@ -230,6 +301,25 @@ def main() -> int:
                      manifest_path.name, _human_size(manifest_path.stat().st_size))
     else:
         logger.info("No manifest.json found (will upload graph backup only)")
+
+    # Find the most recent neo4j dump file from timestamped subdirectories
+    dump_path: Optional[Path] = None
+    for subdir in subdirs:
+        dumps = sorted(subdir.glob("*.dump"), reverse=True)
+        if dumps:
+            dump_path = dumps[0]
+            break
+    # Also check top-level backup dir
+    if dump_path is None:
+        top_level_dumps = sorted(BACKUP_DIR.glob("*.dump"), reverse=True)
+        if top_level_dumps:
+            dump_path = top_level_dumps[0]
+
+    if dump_path:
+        logger.info("Neo4j dump found: %s (%s)",
+                     dump_path.name, _human_size(dump_path.stat().st_size))
+    else:
+        logger.info("No neo4j dump file found (will upload graph backup only)")
 
     # Authenticate
     try:
@@ -258,10 +348,16 @@ def main() -> int:
         logger.error("Failed to upload graph backup: %s", e)
         return 1
 
-    # Upload manifest if it exists
+    # Upload manifest if it exists (rename to include timestamp for grouping)
     if manifest_path:
         try:
-            result = upload_file(service, manifest_path, folder_id)
+            manifest_display = (
+                f"manifest_{backup_ts}.json" if backup_ts else manifest_path.name
+            )
+            result = upload_file(
+                service, manifest_path, folder_id,
+                display_name=manifest_display,
+            )
             size = int(result.get("size", 0))
             logger.info("Uploaded manifest: %s (%s) -> %s",
                          result["name"], _human_size(size),
@@ -270,14 +366,36 @@ def main() -> int:
         except HttpError as e:
             logger.warning("Failed to upload manifest (non-fatal): %s", e)
 
-    # Rotate old backups
+    # Upload neo4j dump if it exists
+    if dump_path:
+        try:
+            dump_display = (
+                f"neo4j_{backup_ts}.dump" if backup_ts else dump_path.name
+            )
+            logger.info("Starting neo4j dump upload (%s) — this may take a while...",
+                         _human_size(dump_path.stat().st_size))
+            result = upload_file(
+                service, dump_path, folder_id,
+                mimetype="application/octet-stream",
+                display_name=dump_display,
+            )
+            size = int(result.get("size", 0))
+            logger.info("Uploaded neo4j dump: %s (%s) -> %s",
+                         result["name"], _human_size(size),
+                         result.get("webViewLink", ""))
+            uploaded += 1
+        except HttpError as e:
+            logger.error("Failed to upload neo4j dump: %s", e)
+            # Non-fatal — graph backup is already uploaded
+
+    # Rotate old backups (by date-prefix sets)
     try:
         deleted = rotate_backups(service, folder_id, keep=KEEP_ON_DRIVE)
         if deleted:
-            logger.info("Rotated %d old backup(s) from Drive (keeping last %d)",
+            logger.info("Rotated %d old backup file(s) from Drive (keeping last %d sets)",
                          deleted, KEEP_ON_DRIVE)
         else:
-            logger.info("No rotation needed (at or under %d files)", KEEP_ON_DRIVE)
+            logger.info("No rotation needed (at or under %d backup sets)", KEEP_ON_DRIVE)
     except HttpError as e:
         logger.warning("Backup rotation failed (non-fatal): %s", e)
 

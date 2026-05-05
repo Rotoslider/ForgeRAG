@@ -597,3 +597,164 @@ async def backup_graph(request: Request) -> ForgeResult:
             "counts": export["counts"],
         },
     )
+
+
+# ------------------------------------------------------------------ restore
+
+
+@router.get("/restore/status")
+async def restore_status(request: Request) -> ForgeResult:
+    """Check whether a database restore is needed.
+
+    Returns ``needs_restore: true`` when the Neo4j database is empty
+    (0 documents and 0 pages), which typically means this is a fresh
+    install or the data was wiped.
+
+    Also lists any local backup directories and their dump files so the
+    caller knows what's available for a local restore.
+    """
+    neo4j = request.app.state.neo4j
+    needs_restore = getattr(request.app.state, "needs_restore", False)
+
+    doc_count = 0
+    page_count = 0
+    neo4j_connected = False
+
+    try:
+        connected = await neo4j.verify_connectivity()
+        neo4j_connected = connected
+        if connected:
+            counts = await neo4j.get_counts()
+            doc_count = counts.get("documents", 0)
+            page_count = counts.get("pages", 0)
+            needs_restore = doc_count == 0 and page_count == 0
+    except Exception:
+        needs_restore = True
+
+    # List local backups
+    settings = request.app.state.settings
+    backup_dir = Path(settings.server.data_dir) / "backups"
+    local_backups: list[dict] = []
+    if backup_dir.exists():
+        for subdir in sorted(backup_dir.glob("[0-9]*"), reverse=True):
+            if subdir.is_dir():
+                dumps = list(subdir.glob("*.dump"))
+                entry: dict = {
+                    "directory": str(subdir),
+                    "timestamp": subdir.name,
+                    "has_dump": len(dumps) > 0,
+                }
+                if dumps:
+                    dump_file = dumps[0]
+                    entry["dump_file"] = str(dump_file)
+                    entry["dump_size_mb"] = round(
+                        dump_file.stat().st_size / 1e6, 1
+                    )
+                manifests = list(subdir.glob("manifest.json"))
+                entry["has_manifest"] = len(manifests) > 0
+                local_backups.append(entry)
+
+    return ForgeResult(
+        success=True,
+        data={
+            "needs_restore": needs_restore,
+            "neo4j_connected": neo4j_connected,
+            "document_count": doc_count,
+            "page_count": page_count,
+            "local_backups": local_backups,
+        },
+    )
+
+
+@router.post("/restore")
+async def restore_instructions(
+    request: Request,
+    payload: dict | None = None,
+) -> ForgeResult:
+    """Return CLI commands for restoring the database.
+
+    The actual restore requires stopping Neo4j, which cannot be done from
+    within the running FastAPI service. This endpoint validates the request
+    and returns the exact shell commands the user needs to run.
+
+    Body:
+      {"source": "local", "dump_path": "/path/to/file.dump"}
+      {"source": "drive"}
+    """
+    if not isinstance(payload, dict):
+        payload = {}
+
+    source = payload.get("source", "").lower()
+    project_root = Path(__file__).resolve().parent.parent.parent
+
+    if source == "local":
+        dump_path = payload.get("dump_path", "")
+        if not dump_path:
+            return ForgeResult(
+                success=False,
+                reason="dump_path is required when source is 'local'",
+            )
+
+        dump_file = Path(dump_path)
+        if not dump_file.exists():
+            return ForgeResult(
+                success=False,
+                reason=f"Dump file not found: {dump_path}",
+            )
+        if not dump_file.suffix == ".dump":
+            return ForgeResult(
+                success=False,
+                reason=f"File does not appear to be a neo4j dump (expected .dump extension): {dump_path}",
+            )
+
+        dump_size_mb = round(dump_file.stat().st_size / 1e6, 1)
+        dump_dir = str(dump_file.parent)
+
+        return ForgeResult(
+            success=True,
+            data={
+                "source": "local",
+                "dump_path": str(dump_file),
+                "dump_size_mb": dump_size_mb,
+                "instructions": (
+                    "The restore must be run from the command line because it "
+                    "requires stopping the Neo4j service and this running API server."
+                ),
+                "commands": [
+                    f"cd {project_root}",
+                    f"./scripts/restore.sh --from-local {dump_dir}",
+                ],
+                "one_liner": (
+                    f"cd {project_root} && ./scripts/restore.sh --from-local {dump_dir}"
+                ),
+            },
+        )
+
+    elif source == "drive":
+        return ForgeResult(
+            success=True,
+            data={
+                "source": "drive",
+                "instructions": (
+                    "The restore will download the latest dump from Google Drive "
+                    "and load it into Neo4j. This requires stopping the Neo4j "
+                    "service and this running API server."
+                ),
+                "commands": [
+                    f"cd {project_root}",
+                    "./scripts/restore.sh --from-drive",
+                ],
+                "one_liner": (
+                    f"cd {project_root} && ./scripts/restore.sh --from-drive"
+                ),
+            },
+        )
+
+    else:
+        return ForgeResult(
+            success=False,
+            reason=(
+                "Invalid source. Use {\"source\": \"local\", \"dump_path\": \"...\"} "
+                "or {\"source\": \"drive\"}"
+            ),
+        )
