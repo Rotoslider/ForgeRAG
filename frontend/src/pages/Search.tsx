@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { Component, useEffect, useState } from "react";
+import type { ErrorInfo, ReactNode } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import {
@@ -38,11 +39,43 @@ function lsSet(key: string, value: string): void {
   }
 }
 
+class SearchErrorBoundary extends Component<{ children: ReactNode }, { error: Error | null }> {
+  state: { error: Error | null } = { error: null };
+  static getDerivedStateFromError(error: Error) { return { error }; }
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    console.error("Search render error:", error, info);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="p-6 max-w-7xl">
+          <h1 className="text-2xl font-bold mb-1">Search</h1>
+          <div className="bg-rose-950 border border-rose-700 text-rose-200 rounded p-4 mt-4">
+            <p className="font-semibold mb-2">Something went wrong rendering results.</p>
+            <p className="text-sm mb-3">{this.state.error.message}</p>
+            <button
+              className="bg-forge-accent text-black font-semibold rounded px-4 py-2 hover:brightness-110"
+              onClick={() => this.setState({ error: null })}
+            >
+              Try again
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 export default function Search() {
-  // Query, mode, and strategy are persisted in the URL (so back/forward
-  // and bookmarking work) AND in localStorage (so clicking the sidebar
-  // Search link after navigating away restores the last search even
-  // though the link URL carries no params).
+  return (
+    <SearchErrorBoundary>
+      <SearchInner />
+    </SearchErrorBoundary>
+  );
+}
+
+function SearchInner() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [query, setQuery] = useState(
     searchParams.get("q") || lsGet(LS_QUERY) || "",
@@ -59,6 +92,10 @@ export default function Search() {
   );
   const [limit, setLimit] = useState(10);
   const [expanded, setExpanded] = useState<string | null>(null);
+
+  // Track which mode+strategy produced the current results so we never
+  // render stale data from a different search type (which would crash).
+  const [resultsKey, setResultsKey] = useState<string | null>(null);
 
   const searchMutation = useMutation({
     mutationFn: async (): Promise<Array<SearchHit | CommunityHit>> => {
@@ -78,6 +115,9 @@ export default function Search() {
       if (!result.success) throw new Error(result.reason || "Search failed");
       return (result.data ?? []) as Array<SearchHit | CommunityHit>;
     },
+    onSuccess: () => {
+      setResultsKey(`${mode}:${strategy}`);
+    },
   });
 
   const answerMutation = useMutation({
@@ -87,31 +127,35 @@ export default function Search() {
       if (!result.success) throw new Error(result.reason || "Answer failed");
       return result.data ?? null;
     },
+    onSuccess: () => {
+      setResultsKey(`answer:`);
+    },
   });
 
-  const hits = searchMutation.data ?? [];
+  const currentKey = `${mode}:${strategy}`;
+  const resultsMatch = resultsKey === currentKey;
+  const hits = resultsMatch ? (searchMutation.data ?? []) : [];
   const isCommunity = mode === "hybrid" && strategy === "community";
-  const answerData = answerMutation.data;
+  const answerData = (resultsKey === "answer:") ? answerMutation.data : null;
 
-  // Switching mode or strategy mid-session leaves stale results in the
-  // mutation cache whose shape doesn't match the new view. Example: a
-  // previous "keyword" search left SearchHit rows in `hits`; the user
-  // switches to hybrid/community; CommunityResults tries to render
-  // c.community_id.slice() on a SearchHit and the whole page crashes
-  // into a black screen. Reset both mutations so the view falls back
-  // to the empty state until the next search runs.
-  useEffect(() => {
+  const handleModeChange = (next: Mode) => {
+    setMode(next);
+    setExpanded(null);
+    setResultsKey(null);
     searchMutation.reset();
     answerMutation.reset();
+  };
+
+  const handleStrategyChange = (next: HybridStrategy) => {
+    setStrategy(next);
     setExpanded(null);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [mode, strategy]);
+    setResultsKey(null);
+    searchMutation.reset();
+  };
 
   const onSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setExpanded(null);
-    // Persist current state to URL (same-tab nav) AND localStorage
-    // (survives sidebar-link re-mounts).
     const next = new URLSearchParams();
     if (query.trim()) next.set("q", query.trim());
     next.set("m", mode);
@@ -151,7 +195,7 @@ export default function Search() {
           <label className="block text-xs text-forge-muted mb-1">Mode</label>
           <select
             value={mode}
-            onChange={(e) => setMode(e.target.value as Mode)}
+            onChange={(e) => handleModeChange(e.target.value as Mode)}
             className="bg-forge-panel border border-forge-edge rounded px-2 py-2"
           >
             <option value="answer">Answer (reads pages, cites sources)</option>
@@ -168,7 +212,7 @@ export default function Search() {
             <label className="block text-xs text-forge-muted mb-1">Strategy</label>
             <select
               value={strategy}
-              onChange={(e) => setStrategy(e.target.value as HybridStrategy)}
+              onChange={(e) => handleStrategyChange(e.target.value as HybridStrategy)}
               className="bg-forge-panel border border-forge-edge rounded px-2 py-2"
             >
               <option value="rrf">rrf (BM25 + dense + reranker)</option>
@@ -261,13 +305,13 @@ export default function Search() {
         </div>
       )}
 
-      {mode !== "answer" && !searchMutation.isPending && hits.length === 0 && searchMutation.isSuccess && (
+      {mode !== "answer" && !searchMutation.isPending && resultsMatch && hits.length === 0 && (
         <div className="text-forge-muted text-sm">No results.</div>
       )}
 
-      {isCommunity ? (
+      {isCommunity && resultsMatch ? (
         <CommunityResults hits={hits as CommunityHit[]} />
-      ) : mode !== "answer" ? (
+      ) : mode !== "answer" && resultsMatch ? (
         <div className="space-y-4">
           {(hits as SearchHit[]).map((h) => (
             <HitCard

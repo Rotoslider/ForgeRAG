@@ -1014,6 +1014,19 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
                        community summaries + their member pages for broad
                        "what do we know about X" queries.
     """
+    try:
+        return await _hybrid_search_impl(body, request)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("hybrid_search strategy=%s failed", body.strategy)
+        return ForgeResult(
+            success=False,
+            reason=f"Search failed ({body.strategy}): {exc}",
+        )
+
+
+async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> ForgeResult:
     text_emb = getattr(request.app.state, "text_embedding", None)
     neo4j = request.app.state.neo4j
     gpu = request.app.state.gpu
@@ -1203,9 +1216,10 @@ async def hybrid_search(body: HybridSearchRequest, request: Request) -> ForgeRes
         # Score each candidate by cosine similarity between query and text embedding
         import numpy as np
         hits = []
+        qvec_dim = len(qvec) if hasattr(qvec, '__len__') else qvec.shape[0]
         for r in rows:
             emb = r.get("emb")
-            if emb:
+            if emb and len(emb) == qvec_dim:
                 v = np.asarray(emb, dtype=np.float32)
                 sim = float(np.dot(qvec, v))
             else:

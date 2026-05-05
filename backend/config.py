@@ -73,8 +73,8 @@ class ModelSettings(BaseModel):
 
 
 class LLMSettings(BaseModel):
-    endpoint: str = "http://localhost:8300/v1"
-    model: str = "qwen2.5-72b-instruct-q4_k_m"
+    endpoint: str = "http://localhost:1234/v1"
+    model: str = "qwen/qwen3.6-35b-a3b"
     max_tokens: int = 4096
     temperature: float = 0.1
     timeout_seconds: int = 120
@@ -82,6 +82,12 @@ class LLMSettings(BaseModel):
     # enforcement and produce repetitive junk. Others (GLM reasoning
     # variants) work great with it. Toggle per model.
     use_json_schema: bool = True
+    # Qwen3.6 disables thinking via chat_template_kwargs.enable_thinking
+    # rather than the legacy "/no_think" prompt directive. LM Studio
+    # forwards this kwarg to llama.cpp's chat-template renderer; models
+    # that don't recognize it (DeepSeek, GLM, Llama, Gemma) ignore it
+    # silently, so leaving it on is safe across the board.
+    disable_thinking: bool = True
 
 
 class IngestionSettings(BaseModel):

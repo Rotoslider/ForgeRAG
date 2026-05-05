@@ -97,6 +97,12 @@ class LLMService:
         }
         if response_format is not None:
             payload["response_format"] = response_format
+        # Qwen3.6 dropped the "/no_think" soft directive — thinking is
+        # disabled via chat_template_kwargs.enable_thinking, which LM Studio
+        # forwards to llama.cpp's chat-template renderer. Other models that
+        # don't recognize the kwarg ignore it silently.
+        if getattr(self.settings, "disable_thinking", False):
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
 
         try:
             r = await self._client.post("/chat/completions", json=payload)
