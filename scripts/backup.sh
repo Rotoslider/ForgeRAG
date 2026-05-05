@@ -20,6 +20,7 @@ BACKUP_DIR="${PROJECT_ROOT}/data/backups"
 NEO4J_DATABASE="neo4j"
 API_BASE="http://localhost:8200"
 KEEP_COUNT=5
+GDRIVE_ENABLED=true
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 BACKUP_SUBDIR="${BACKUP_DIR}/${TIMESTAMP}"
 
@@ -101,3 +102,18 @@ if [ -f "${MANIFEST_FILE}" ]; then
     log "  Manifest:       $(du -sh "${MANIFEST_FILE}" 2>/dev/null | cut -f1) (${DOC_COUNT} docs)"
 fi
 log "--------------------------------------------"
+
+# ---- Step 5: Upload to Google Drive (optional) ----
+if [ "${GDRIVE_ENABLED}" = "true" ]; then
+    GDRIVE_SCRIPT="${PROJECT_ROOT}/scripts/gdrive_backup.py"
+    if [ -f "${GDRIVE_SCRIPT}" ]; then
+        log "Uploading backup to Google Drive..."
+        if "${PROJECT_ROOT}/venv/bin/python3" "${GDRIVE_SCRIPT}"; then
+            log "Google Drive upload succeeded"
+        else
+            log "WARNING: Google Drive upload failed (local backup is still intact)"
+        fi
+    else
+        log "WARNING: GDRIVE_ENABLED=true but ${GDRIVE_SCRIPT} not found"
+    fi
+fi

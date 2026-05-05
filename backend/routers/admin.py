@@ -236,6 +236,64 @@ async def bulk_reembed(request: Request) -> ForgeResult:
     )
 
 
+@router.post("/reembed-text")
+async def reembed_text(request: Request, payload: dict | None = None) -> ForgeResult:
+    """Re-embed text only (no visual embeddings, no entity extraction).
+
+    Clears p.text_embedding and re-runs _embed_text() for every page.
+    Visual embeddings (colpali_vectors) are left untouched, saving hours
+    of GPU time when only the text embedding model has changed (e.g.,
+    switching from a 768-d to a 1024-d model).
+
+    Body (optional):
+      {"doc_id": "..."}   -- re-embed a single document
+      {}  or omitted      -- re-embed ALL documents
+
+    Each document gets its own job for trackable progress.
+    """
+    import asyncio
+
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    if not isinstance(payload, dict):
+        payload = {}
+    doc_id = payload.get("doc_id")
+
+    if doc_id:
+        # Single document
+        rows = await neo4j.run_query(
+            "MATCH (d:Document {doc_id: $id}) RETURN d.doc_id AS doc_id, d.filename AS filename",
+            {"id": doc_id},
+        )
+        if not rows:
+            return ForgeResult(success=False, reason=f"Document {doc_id} not found")
+    else:
+        # All documents
+        rows = await neo4j.run_query(
+            "MATCH (d:Document) RETURN d.doc_id AS doc_id, d.filename AS filename"
+        )
+        if not rows:
+            return ForgeResult(success=True, data={"queued": 0})
+
+    job_ids = []
+    for r in rows:
+        job = await jobs.create(
+            source_path=f"(text-reembed of {r['doc_id']})",
+            filename=r["filename"],
+            categories=[],
+            tags=[],
+        )
+        asyncio.create_task(pipeline.run_text_reembed_only(job.job_id, r["doc_id"]))
+        job_ids.append({"doc_id": r["doc_id"], "job_id": job.job_id})
+
+    return ForgeResult(
+        success=True,
+        data={"queued": len(job_ids), "jobs": job_ids},
+    )
+
+
 @router.post("/cleanup-uploads")
 async def cleanup_uploads(request: Request) -> ForgeResult:
     """Delete staged upload files from data/uploads/.

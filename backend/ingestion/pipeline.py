@@ -548,6 +548,54 @@ class IngestionPipeline:
             logger.exception("Reembed job %s failed", job_id)
             await self.jobs.fail(job_id, str(exc))
 
+    async def run_text_reembed_only(self, job_id: str, doc_id: str) -> None:
+        """Re-run ONLY text embedding for an already-ingested document.
+
+        Unlike run_embeddings_only() which clears both text and visual
+        embeddings, this method:
+          - Only clears p.text_embedding (leaves colpali_vectors untouched)
+          - Only calls _embed_text() (no visual embedding, no entity extraction)
+
+        Use this when only the text embedding model changed (e.g., switching
+        from nomic 768-d to bge-m3 1024-d) to avoid hours of GPU time
+        re-generating visual embeddings that haven't changed.
+        """
+        try:
+            # Look up file_hash from Neo4j
+            rows = await self.neo4j.run_query(
+                "MATCH (d:Document {doc_id: $id}) RETURN d.file_hash AS h",
+                {"id": doc_id},
+            )
+            if not rows:
+                raise ValueError(f"Document {doc_id} not found")
+            file_hash = rows[0]["h"]
+
+            await self.jobs.update(job_id, status="processing", doc_id=doc_id, file_hash=file_hash)
+
+            # Clear ONLY text embeddings — leave visual embeddings intact
+            await self.neo4j.run_write(
+                """
+                MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
+                SET p.text_embedding = NULL
+                """,
+                {"doc_id": doc_id},
+            )
+            logger.info("Cleared text embeddings (visual untouched) for doc %s", doc_id)
+
+            if self.text_embedding is None:
+                raise ValueError("Text embedding service not configured")
+
+            await self.jobs.update(
+                job_id, current_step="embedding_text", progress_pct=10.0
+            )
+            await self._embed_text(job_id, doc_id)
+
+            await self.jobs.complete(job_id)
+            logger.info("Text-only reembed job %s completed for doc %s", job_id, doc_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Text-only reembed job %s failed", job_id)
+            await self.jobs.fail(job_id, str(exc))
+
     # ------------------------------------------------------------------ step 1
 
     async def _register(self, job, collection: str = "default") -> tuple[str, str, int]:
