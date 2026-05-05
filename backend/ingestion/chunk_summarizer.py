@@ -59,7 +59,6 @@ Rules:
 - Do NOT copy the chunk verbatim.
 
 Output ONLY the summary text. No JSON, no prose wrapper, no code fences.
-/no_think
 """
 
 

@@ -568,7 +568,7 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         "Be precise with numbers, codes, and specifications. If you notice "
         "relevant cross-references or related considerations (e.g., applicable "
         "standards, compatible processes, known limitations), mention them "
-        "proactively.\n\n/no_think"
+        "proactively."
     )
 
     messages_content.append({"type": "text", "text": question_text})

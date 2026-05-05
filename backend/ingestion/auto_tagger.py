@@ -74,8 +74,6 @@ Tag rules:
   "ASME", "pressure-vessels"
 
 Output JSON only. No prose, no code fences.
-
-/no_think
 """
 
 USER_PROMPT_TEMPLATE = """\
