@@ -46,6 +46,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     (data_dir / "page_images").mkdir(parents=True, exist_ok=True)
     (data_dir / "reduced_images").mkdir(parents=True, exist_ok=True)
     (data_dir / "uploads").mkdir(parents=True, exist_ok=True)
+    (data_dir / "backups").mkdir(parents=True, exist_ok=True)
+
+    # Load backup settings from config/backup_settings.json (if exists)
+    backup_settings_path = Path(settings.server.data_dir).parent / "config" / "backup_settings.json"
+    if backup_settings_path.exists():
+        try:
+            import json
+            bs = json.loads(backup_settings_path.read_text(encoding="utf-8"))
+            app.state.backup_settings = bs
+            logger.info("Loaded backup settings from %s", backup_settings_path)
+        except Exception as exc:
+            logger.warning("Could not load backup_settings.json: %s", exc)
+            app.state.backup_settings = None
+    else:
+        app.state.backup_settings = None
+    app.state.backup_progress = None
 
     # Neo4j — connect but don't fail if unreachable (service can serve health)
     neo4j = Neo4jService(settings.neo4j)

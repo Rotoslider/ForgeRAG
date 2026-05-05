@@ -5,6 +5,9 @@ import {
   applyTags,
   buildCommunities,
   deleteDocument,
+  getBackupProgress,
+  getBackupSettings,
+  listBackups,
   listCollections,
   moveDocument,
   removeDocumentTag,
@@ -19,8 +22,11 @@ import {
   rebuildChunksBulk,
   reembedDocument,
   suggestTags,
+  triggerFullBackup,
   unloadModel,
+  updateBackupSettings,
 } from "../api/client";
+import type { BackupSettingsData } from "../api/client";
 import type { DocumentRow } from "../api/types";
 
 export default function Manage() {
@@ -32,6 +38,7 @@ export default function Manage() {
         <GpuCard />
         <CommunitiesCard />
       </div>
+      <BackupRestoreCard />
       <DocumentsTable />
       <EntitiesPanel />
     </div>
@@ -196,6 +203,250 @@ function CommunitiesCard() {
           </li>
         ))}
       </ol>
+    </div>
+  );
+}
+
+function BackupRestoreCard() {
+  const qc = useQueryClient();
+
+  // Load settings
+  const { data: settingsResp } = useQuery({
+    queryKey: ["backup-settings"],
+    queryFn: getBackupSettings,
+  });
+  const currentSettings = settingsResp?.data;
+
+  // Load backup list
+  const { data: backupsResp } = useQuery({
+    queryKey: ["backup-list"],
+    queryFn: listBackups,
+    refetchInterval: 15000,
+  });
+  const backups = backupsResp?.data?.backups || [];
+
+  // Poll progress when a backup is running
+  const { data: progressResp } = useQuery({
+    queryKey: ["backup-progress"],
+    queryFn: getBackupProgress,
+    refetchInterval: 2000,
+  });
+  const progress = progressResp?.data;
+
+  // Local state for editable fields
+  const [destination, setDestination] = useState("");
+  const [includeImages, setIncludeImages] = useState(true);
+  const [includePdfs, setIncludePdfs] = useState(true);
+  const [gdriveEnabled, setGdriveEnabled] = useState(true);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+
+  // Sync local state when settings load for the first time
+  useEffect(() => {
+    if (currentSettings && !settingsLoaded) {
+      setDestination(currentSettings.destination || "");
+      setIncludeImages(currentSettings.include_images);
+      setIncludePdfs(currentSettings.include_pdfs);
+      setGdriveEnabled(currentSettings.gdrive_enabled);
+      setSettingsLoaded(true);
+    }
+  }, [currentSettings, settingsLoaded]);
+
+  const saveMutation = useMutation({
+    mutationFn: (body: BackupSettingsData) => updateBackupSettings(body),
+    onSuccess: (res) => {
+      if (res.success) {
+        qc.invalidateQueries({ queryKey: ["backup-settings"] });
+        setSaveMsg("Settings saved");
+        setTimeout(() => setSaveMsg(null), 3000);
+      } else {
+        setSaveMsg(`Error: ${res.reason}`);
+        setTimeout(() => setSaveMsg(null), 5000);
+      }
+    },
+  });
+
+  const backupMutation = useMutation({
+    mutationFn: triggerFullBackup,
+    onSuccess: (res) => {
+      if (res.success) {
+        qc.invalidateQueries({ queryKey: ["backup-progress"] });
+      } else {
+        setSaveMsg(`Backup failed: ${res.reason}`);
+        setTimeout(() => setSaveMsg(null), 5000);
+      }
+    },
+  });
+
+  const handleSave = () => {
+    saveMutation.mutate({
+      destination,
+      include_images: includeImages,
+      include_pdfs: includePdfs,
+      gdrive_enabled: gdriveEnabled,
+    });
+  };
+
+  const isRunning = progress?.running === true;
+
+  return (
+    <div className="bg-forge-panel border border-forge-edge rounded-lg p-4">
+      <h2 className="font-semibold mb-4">Backup & Restore</h2>
+
+      <div className="grid md:grid-cols-3 gap-6">
+        {/* Column 1: Destination + Options */}
+        <div className="space-y-3">
+          <div>
+            <label className="text-xs text-forge-muted font-semibold block mb-1">
+              Backup Destination
+            </label>
+            <div className="flex gap-1">
+              <input
+                value={destination}
+                onChange={(e) => setDestination(e.target.value)}
+                placeholder="/mnt/nas/forgerag-backups"
+                className="bg-forge-bg border border-forge-edge rounded px-2 py-1 text-xs flex-1 font-mono"
+              />
+              <button
+                onClick={handleSave}
+                disabled={saveMutation.isPending}
+                className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge disabled:opacity-50"
+              >
+                {saveMutation.isPending ? "..." : "save"}
+              </button>
+            </div>
+            {!destination && (
+              <div className="text-xs text-forge-muted/60 mt-1 italic">
+                Not configured — set a path to enable backups
+              </div>
+            )}
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-xs text-forge-muted font-semibold block">
+              Options
+            </label>
+            <label className="flex items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={includeImages}
+                onChange={(e) => setIncludeImages(e.target.checked)}
+              />
+              Include page images
+            </label>
+            <label className="flex items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={includePdfs}
+                onChange={(e) => setIncludePdfs(e.target.checked)}
+              />
+              Include source PDFs
+            </label>
+            <label className="flex items-center gap-2 text-xs">
+              <input
+                type="checkbox"
+                checked={gdriveEnabled}
+                onChange={(e) => setGdriveEnabled(e.target.checked)}
+              />
+              Upload to Google Drive
+            </label>
+          </div>
+
+          {saveMsg && (
+            <div className="text-xs text-emerald-400">{saveMsg}</div>
+          )}
+        </div>
+
+        {/* Column 2: Backup action + progress */}
+        <div className="space-y-3">
+          <button
+            onClick={() => backupMutation.mutate()}
+            disabled={!destination || isRunning || backupMutation.isPending}
+            className="w-full text-sm bg-forge-primary/20 text-forge-primary border border-forge-primary/30 rounded px-3 py-2 hover:bg-forge-primary/30 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {isRunning ? "Backup Running..." : backupMutation.isPending ? "Starting..." : "Start Full Backup"}
+          </button>
+
+          {isRunning && progress && (
+            <div className="space-y-1.5">
+              <div className="h-2 bg-forge-bg rounded overflow-hidden">
+                <div
+                  className="h-full bg-forge-accent transition-all duration-300"
+                  style={{ width: `${progress.percent || 0}%` }}
+                />
+              </div>
+              <div className="flex justify-between text-xs text-forge-muted">
+                <span className="truncate max-w-[12rem]" title={progress.current_file}>
+                  {progress.current_file}
+                </span>
+                <span>{progress.percent || 0}%</span>
+              </div>
+              {progress.bytes_copied != null && (
+                <div className="text-xs text-forge-muted">
+                  {(progress.bytes_copied / 1e9).toFixed(2)} GB copied
+                </div>
+              )}
+            </div>
+          )}
+
+          {!isRunning && progress?.finished_at && !progress.error && (
+            <div className="text-xs text-emerald-400 bg-emerald-950/30 rounded px-2 py-1.5">
+              Last backup complete: {(progress.total_bytes || 0 / 1e9).toFixed?.(2) || "?"} GB
+              {progress.backup_path && (
+                <div className="font-mono mt-0.5 text-forge-muted truncate" title={progress.backup_path}>
+                  {progress.backup_path}
+                </div>
+              )}
+            </div>
+          )}
+
+          {!isRunning && progress?.error && (
+            <div className="text-xs text-rose-400 bg-rose-950/30 rounded px-2 py-1.5">
+              Backup failed: {progress.error}
+            </div>
+          )}
+        </div>
+
+        {/* Column 3: Backup history */}
+        <div>
+          <div className="text-xs text-forge-muted font-semibold mb-2">
+            Backup History ({backups.length})
+          </div>
+          {backups.length === 0 ? (
+            <div className="text-xs text-forge-muted/50 italic">No backups found.</div>
+          ) : (
+            <div className="max-h-48 overflow-y-auto space-y-1.5 pr-1">
+              {backups.slice(0, 10).map((b, i) => (
+                <div
+                  key={i}
+                  className="text-xs border border-forge-edge/50 rounded px-2 py-1.5 bg-forge-bg/30"
+                >
+                  <div className="flex justify-between items-baseline">
+                    <span className="font-mono text-forge-fg">
+                      {b.timestamp.length > 15
+                        ? b.timestamp.slice(0, 15)
+                        : b.timestamp}
+                    </span>
+                    <span className="text-forge-muted">{b.size_mb} MB</span>
+                  </div>
+                  <div className="flex gap-2 mt-0.5 text-forge-muted/70">
+                    <span>{b.source}</span>
+                    {b.has_dump && <span>dump</span>}
+                    {b.has_images && <span>images</span>}
+                    {b.has_manifest && <span>manifest</span>}
+                    <span className="ml-auto">{b.type === "full_backup" ? "full" : "graph"}</span>
+                  </div>
+                  {b.type === "full_backup" && (
+                    <div className="mt-1 text-forge-muted/60 font-mono text-[10px] truncate" title={b.path}>
+                      restore: ./scripts/restore.sh --from-local {b.path}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

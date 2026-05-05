@@ -6,12 +6,18 @@ Currently: dedupe Page nodes when re-ingestion before the fix created them.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
+import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Request
+from pydantic import BaseModel
 
 from backend.models.common import ForgeResult
 
@@ -758,3 +764,405 @@ async def restore_instructions(
                 "or {\"source\": \"drive\"}"
             ),
         )
+
+
+# ------------------------------------------------------------------ backup settings & full backup
+
+
+class BackupSettingsPayload(BaseModel):
+    destination: str = ""
+    include_images: bool = True
+    include_pdfs: bool = True
+    gdrive_enabled: bool = True
+
+
+def _backup_settings_path(settings: Any) -> Path:
+    """Path to the persistent backup_settings.json file."""
+    return Path(settings.server.data_dir).parent / "config" / "backup_settings.json"
+
+
+def _load_backup_settings(settings: Any) -> dict:
+    """Load backup settings from disk or return defaults."""
+    path = _backup_settings_path(settings)
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "destination": settings.backup.destination,
+        "include_images": settings.backup.include_images,
+        "include_pdfs": settings.backup.include_pdfs,
+        "gdrive_enabled": settings.backup.gdrive_enabled,
+    }
+
+
+def _save_backup_settings(settings: Any, data: dict) -> None:
+    """Persist backup settings to config/backup_settings.json."""
+    path = _backup_settings_path(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+@router.get("/backup/settings")
+async def get_backup_settings(request: Request) -> ForgeResult:
+    """Return current backup settings."""
+    settings = request.app.state.settings
+    data = _load_backup_settings(settings)
+    return ForgeResult(success=True, data=data)
+
+
+@router.post("/backup/settings")
+async def update_backup_settings(
+    request: Request, payload: BackupSettingsPayload
+) -> ForgeResult:
+    """Update backup settings and persist to config/backup_settings.json."""
+    settings = request.app.state.settings
+    data = payload.model_dump()
+    _save_backup_settings(settings, data)
+    return ForgeResult(success=True, data=data)
+
+
+@router.get("/backup/list")
+async def list_backups(request: Request) -> ForgeResult:
+    """List available backups from data/backups/ and the configured destination."""
+    settings = request.app.state.settings
+    backup_settings = _load_backup_settings(settings)
+    backups: list[dict] = []
+
+    def _scan_dir(base: Path, source_label: str) -> None:
+        if not base.exists():
+            return
+        # Scan for graph JSON files (hot backups)
+        for f in sorted(base.glob("graph_*.json"), reverse=True):
+            try:
+                stat = f.stat()
+                backups.append({
+                    "path": str(f),
+                    "source": source_label,
+                    "timestamp": datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).isoformat(),
+                    "size_bytes": stat.st_size,
+                    "size_mb": round(stat.st_size / 1e6, 1),
+                    "has_dump": False,
+                    "has_images": False,
+                    "has_manifest": False,
+                    "type": "graph_json",
+                })
+            except OSError:
+                pass
+        # Scan for timestamped subdirectories (full backups)
+        for subdir in sorted(base.glob("[0-9]*"), reverse=True):
+            if not subdir.is_dir():
+                continue
+            try:
+                dumps = list(subdir.glob("*.dump"))
+                manifests = list(subdir.glob("manifest.json"))
+                images_dir = subdir / "page_images"
+                pdfs_dir = subdir / "pdfs"
+                # Compute total size
+                total_size = 0
+                for root, _dirs, files in os.walk(subdir):
+                    for fname in files:
+                        try:
+                            total_size += os.path.getsize(os.path.join(root, fname))
+                        except OSError:
+                            pass
+                backups.append({
+                    "path": str(subdir),
+                    "source": source_label,
+                    "timestamp": subdir.name,
+                    "size_bytes": total_size,
+                    "size_mb": round(total_size / 1e6, 1),
+                    "has_dump": len(dumps) > 0,
+                    "has_images": images_dir.exists() and any(images_dir.iterdir()) if images_dir.exists() else False,
+                    "has_manifest": len(manifests) > 0,
+                    "type": "full_backup",
+                })
+            except OSError:
+                pass
+
+    # Local data/backups/
+    local_backup_dir = Path(settings.server.data_dir) / "backups"
+    _scan_dir(local_backup_dir, "local")
+
+    # Configured destination
+    dest = backup_settings.get("destination", "")
+    if dest and Path(dest).exists() and str(Path(dest).resolve()) != str(local_backup_dir.resolve()):
+        _scan_dir(Path(dest), "destination")
+
+    return ForgeResult(success=True, data={"backups": backups})
+
+
+@router.get("/backup/progress")
+async def backup_progress(request: Request) -> ForgeResult:
+    """Return progress of any running backup job."""
+    progress = getattr(request.app.state, "backup_progress", None)
+    if progress is None:
+        return ForgeResult(success=True, data={"running": False})
+    return ForgeResult(success=True, data=progress)
+
+
+@router.post("/backup/full")
+async def trigger_full_backup(request: Request) -> ForgeResult:
+    """Trigger a full backup to the configured destination.
+
+    Copies: graph JSON export, page images (if enabled), source PDFs (if enabled).
+    Runs in background via asyncio.create_task.
+    """
+    settings = request.app.state.settings
+    backup_settings = _load_backup_settings(settings)
+    destination = backup_settings.get("destination", "")
+
+    if not destination:
+        return ForgeResult(
+            success=False,
+            reason="No backup destination configured. Set a destination path first via POST /admin/backup/settings.",
+        )
+
+    dest_path = Path(destination)
+    if not dest_path.exists():
+        return ForgeResult(
+            success=False,
+            reason=f"Destination path does not exist: {destination}",
+        )
+    if not os.access(dest_path, os.W_OK):
+        return ForgeResult(
+            success=False,
+            reason=f"Destination path is not writable: {destination}",
+        )
+
+    # Check if a backup is already running
+    progress = getattr(request.app.state, "backup_progress", None)
+    if progress and progress.get("running"):
+        return ForgeResult(
+            success=False,
+            reason="A backup is already in progress.",
+        )
+
+    include_images = backup_settings.get("include_images", True)
+    include_pdfs = backup_settings.get("include_pdfs", True)
+
+    # Initialize progress
+    request.app.state.backup_progress = {
+        "running": True,
+        "percent": 0,
+        "current_file": "starting...",
+        "bytes_copied": 0,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    asyncio.create_task(
+        _run_full_backup(request.app, settings, dest_path, include_images, include_pdfs)
+    )
+
+    return ForgeResult(
+        success=True,
+        data={
+            "message": "Full backup started",
+            "destination": str(dest_path),
+            "include_images": include_images,
+            "include_pdfs": include_pdfs,
+        },
+    )
+
+
+async def _run_full_backup(
+    app: Any,
+    settings: Any,
+    dest_path: Path,
+    include_images: bool,
+    include_pdfs: bool,
+) -> None:
+    """Background task that performs the full backup."""
+    data_dir = Path(settings.server.data_dir)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_dir = dest_path / ts
+    backup_dir.mkdir(parents=True, exist_ok=True)
+
+    progress = app.state.backup_progress
+    total_bytes = 0
+
+    try:
+        # Step 1: Export graph JSON (hot backup)
+        progress["current_file"] = "Exporting graph JSON..."
+        progress["percent"] = 5
+
+        neo4j = app.state.neo4j
+        export: dict = {
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "format_version": 1,
+        }
+
+        docs = await neo4j.run_query("MATCH (d:Document) RETURN d {.*} AS doc")
+        export["documents"] = [r["doc"] for r in docs]
+
+        pages = await neo4j.run_query(
+            """
+            MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
+            RETURN d.doc_id AS doc_id,
+                   p.page_id AS page_id,
+                   p.page_number AS page_number,
+                   p.text_char_count AS text_char_count,
+                   p.is_blank AS is_blank,
+                   p.colpali_vector_count AS colpali_vector_count,
+                   p.colpali_vector_dim AS colpali_vector_dim,
+                   (p.text_embedding IS NOT NULL) AS has_text_embedding
+            ORDER BY d.doc_id, p.page_number
+            """
+        )
+        export["pages"] = pages
+
+        entity_labels = ["Material", "Process", "Standard", "Equipment"]
+        export["entities"] = {}
+        export["entity_relationships"] = []
+        for label in entity_labels:
+            pk = "code" if label == "Standard" else "name"
+            nodes = await neo4j.run_query(
+                f"MATCH (e:{label}) RETURN e {{.*}} AS entity"
+            )
+            export["entities"][label] = [r["entity"] for r in nodes]
+            rels = await neo4j.run_query(
+                f"""
+                MATCH (p:Page)-[r]->(e:{label})
+                RETURN p.page_id AS page_id,
+                       type(r)   AS rel_type,
+                       e.{pk}    AS entity_key,
+                       '{label}' AS entity_label
+                """
+            )
+            export["entity_relationships"].extend(rels)
+
+        cats = await neo4j.run_query(
+            "MATCH (d:Document)-[:IN_CATEGORY]->(c:Category) RETURN d.doc_id AS doc_id, c.name AS category"
+        )
+        export["document_categories"] = cats
+        tags = await neo4j.run_query(
+            "MATCH (d:Document)-[:HAS_TAG]->(t:Tag) RETURN d.doc_id AS doc_id, t.name AS tag"
+        )
+        export["document_tags"] = tags
+        collections = await neo4j.run_query(
+            "MATCH (d:Document)-[:IN_COLLECTION]->(col:Collection) RETURN d.doc_id AS doc_id, col.name AS collection"
+        )
+        export["document_collections"] = collections
+        export["counts"] = {
+            "documents": len(export["documents"]),
+            "pages": len(export["pages"]),
+            "entity_relationships": len(export["entity_relationships"]),
+            "categories": len(export["document_categories"]),
+            "tags": len(export["document_tags"]),
+            "collections": len(export["document_collections"]),
+        }
+        for label in entity_labels:
+            export["counts"][label.lower() + "s"] = len(export["entities"].get(label, []))
+
+        graph_file = backup_dir / f"graph_{ts}.json"
+        graph_content = json.dumps(export, indent=2, default=str)
+        graph_file.write_text(graph_content, encoding="utf-8")
+        total_bytes += len(graph_content.encode())
+        progress["bytes_copied"] = total_bytes
+        progress["percent"] = 10
+
+        # Step 2: Copy page images
+        if include_images:
+            progress["current_file"] = "Copying page images..."
+            images_src = data_dir / "page_images"
+            reduced_src = data_dir / "reduced_images"
+
+            if images_src.exists():
+                # Count files for progress tracking
+                image_files = list(images_src.rglob("*"))
+                image_files = [f for f in image_files if f.is_file()]
+                total_image_files = len(image_files)
+
+                images_dest = backup_dir / "page_images"
+                images_dest.mkdir(parents=True, exist_ok=True)
+
+                for idx, src_file in enumerate(image_files):
+                    rel = src_file.relative_to(images_src)
+                    dst = images_dest / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, dst)
+                    file_size = src_file.stat().st_size
+                    total_bytes += file_size
+                    progress["bytes_copied"] = total_bytes
+                    if total_image_files > 0:
+                        img_pct = (idx + 1) / total_image_files
+                        progress["percent"] = int(10 + img_pct * 40)
+                    progress["current_file"] = str(rel)
+                    # Yield to event loop periodically
+                    if idx % 50 == 0:
+                        await asyncio.sleep(0)
+
+            if reduced_src.exists():
+                progress["current_file"] = "Copying reduced images..."
+                reduced_files = [f for f in reduced_src.rglob("*") if f.is_file()]
+                reduced_dest = backup_dir / "reduced_images"
+                reduced_dest.mkdir(parents=True, exist_ok=True)
+                for idx, src_file in enumerate(reduced_files):
+                    rel = src_file.relative_to(reduced_src)
+                    dst = reduced_dest / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, dst)
+                    total_bytes += src_file.stat().st_size
+                    progress["bytes_copied"] = total_bytes
+                    progress["percent"] = int(50 + (idx + 1) / max(1, len(reduced_files)) * 20)
+                    progress["current_file"] = str(rel)
+                    if idx % 50 == 0:
+                        await asyncio.sleep(0)
+        else:
+            progress["percent"] = 70
+
+        # Step 3: Copy source PDFs
+        if include_pdfs:
+            progress["current_file"] = "Copying source PDFs..."
+            uploads_src = data_dir / "uploads"
+            if uploads_src.exists():
+                pdf_files = [f for f in uploads_src.rglob("*.pdf") if f.is_file()]
+                pdfs_dest = backup_dir / "pdfs"
+                pdfs_dest.mkdir(parents=True, exist_ok=True)
+                for idx, src_file in enumerate(pdf_files):
+                    rel = src_file.relative_to(uploads_src)
+                    dst = pdfs_dest / rel
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_file, dst)
+                    total_bytes += src_file.stat().st_size
+                    progress["bytes_copied"] = total_bytes
+                    progress["percent"] = int(70 + (idx + 1) / max(1, len(pdf_files)) * 20)
+                    progress["current_file"] = str(rel)
+                    if idx % 10 == 0:
+                        await asyncio.sleep(0)
+        else:
+            progress["percent"] = 90
+
+        # Step 4: Write manifest
+        progress["current_file"] = "Writing manifest..."
+        manifest = {
+            "timestamp": ts,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "total_bytes": total_bytes,
+            "include_images": include_images,
+            "include_pdfs": include_pdfs,
+            "document_count": len(export["documents"]),
+            "page_count": len(export["pages"]),
+        }
+        manifest_file = backup_dir / "manifest.json"
+        manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+        progress["percent"] = 100
+        progress["current_file"] = "Complete"
+        progress["running"] = False
+        progress["finished_at"] = datetime.now(timezone.utc).isoformat()
+        progress["total_bytes"] = total_bytes
+        progress["backup_path"] = str(backup_dir)
+
+        logger.info(
+            "Full backup complete: %s (%d bytes)", backup_dir, total_bytes
+        )
+
+    except Exception as exc:
+        logger.error("Full backup failed: %s", exc)
+        progress["running"] = False
+        progress["error"] = str(exc)
+        progress["current_file"] = f"FAILED: {exc}"

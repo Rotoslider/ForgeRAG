@@ -370,6 +370,59 @@ export const getGpu = () =>
 export const unloadModel = (name: string) =>
   request<{ name: string; unloaded: boolean }>(`/system/models/${name}/unload`, { method: "POST" });
 
+// ---- Backup & Restore ----
+export interface BackupSettingsData {
+  destination: string;
+  include_images: boolean;
+  include_pdfs: boolean;
+  gdrive_enabled: boolean;
+}
+
+export interface BackupEntry {
+  path: string;
+  source: string;
+  timestamp: string;
+  size_bytes: number;
+  size_mb: number;
+  has_dump: boolean;
+  has_images: boolean;
+  has_manifest: boolean;
+  type: string;
+}
+
+export interface BackupProgress {
+  running: boolean;
+  percent?: number;
+  current_file?: string;
+  bytes_copied?: number;
+  started_at?: string;
+  finished_at?: string;
+  total_bytes?: number;
+  backup_path?: string;
+  error?: string;
+}
+
+export const getBackupSettings = () =>
+  request<BackupSettingsData>("/admin/backup/settings");
+
+export const updateBackupSettings = (body: BackupSettingsData) =>
+  request<BackupSettingsData>("/admin/backup/settings", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+
+export const listBackups = () =>
+  request<{ backups: BackupEntry[] }>("/admin/backup/list");
+
+export const getBackupProgress = () =>
+  request<BackupProgress>("/admin/backup/progress");
+
+export const triggerFullBackup = () =>
+  request<{ message: string; destination: string; include_images: boolean; include_pdfs: boolean }>(
+    "/admin/backup/full",
+    { method: "POST" }
+  );
+
 // ---- Image URLs (direct, not JSON) ----
 export const pageImageUrl = (hash: string, page: number) => `/images/${hash}/${page}`;
 export const reducedImageUrl = (hash: string, page: number) => `/images/${hash}/${page}/reduced`;

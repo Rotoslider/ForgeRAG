@@ -106,6 +106,13 @@ class GPUSettings(BaseModel):
     max_vram_usage_pct: int = 80
 
 
+class BackupSettings(BaseModel):
+    destination: str = ""  # local path like /mnt/nas/forgerag-backups
+    include_images: bool = True
+    include_pdfs: bool = True
+    gdrive_enabled: bool = True
+
+
 class Settings(BaseModel):
     server: ServerSettings = Field(default_factory=ServerSettings)
     neo4j: Neo4jSettings = Field(default_factory=Neo4jSettings)
@@ -113,6 +120,7 @@ class Settings(BaseModel):
     llm: LLMSettings = Field(default_factory=LLMSettings)
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     gpu: GPUSettings = Field(default_factory=GPUSettings)
+    backup: BackupSettings = Field(default_factory=BackupSettings)
 
     @classmethod
     def from_toml(cls, path: Path | str) -> Settings:
