@@ -400,6 +400,7 @@ export interface BackupProgress {
   total_bytes?: number;
   backup_path?: string;
   error?: string;
+  dump_skipped?: string;
 }
 
 export const getBackupSettings = () =>

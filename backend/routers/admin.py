@@ -1005,67 +1005,66 @@ async def _run_full_backup(
         import subprocess
 
         # Step 1: Neo4j database dump (the critical piece — includes embeddings)
-        progress["current_file"] = "Creating Neo4j database dump..."
+        # Uses a dedicated helper script via sudo. The helper handles
+        # stop→dump→restart so Neo4j always comes back up even on failure.
+        # Setup (run once):
+        #   sudo cp scripts/neo4j-dump-helper.sh /usr/local/bin/forgerag-dump
+        #   sudo chmod 755 /usr/local/bin/forgerag-dump
+        #   echo 'nuc1 ALL=(ALL) NOPASSWD: /usr/local/bin/forgerag-dump' | sudo tee /etc/sudoers.d/forgerag-dump
+        #   sudo chmod 440 /etc/sudoers.d/forgerag-dump
+        progress["current_file"] = "Creating Neo4j database dump (Neo4j will pause briefly)..."
         progress["percent"] = 2
         dump_file = backup_dir / f"neo4j_{ts}.dump"
         dump_ok = False
         try:
-            # Stop Neo4j, dump, restart — brief downtime (~10-30s)
-            progress["current_file"] = "Stopping Neo4j for dump..."
-            stop_result = await asyncio.to_thread(
+            dump_result = await asyncio.to_thread(
                 subprocess.run,
-                ["sudo", "systemctl", "stop", "neo4j"],
-                capture_output=True, text=True, timeout=60,
+                ["sudo", "/usr/local/bin/forgerag-dump", str(backup_dir), ts],
+                capture_output=True, text=True, timeout=600,
             )
-            if stop_result.returncode != 0:
-                logger.warning("Neo4j stop failed: %s", stop_result.stderr[:200])
-                progress["current_file"] = "Neo4j dump skipped (could not stop service)"
+            if dump_result.returncode == 0 and dump_file.exists():
+                dump_size = dump_file.stat().st_size
+                total_bytes += dump_size
+                dump_ok = True
+                logger.info("Neo4j dump created: %s (%d bytes)", dump_file, dump_size)
             else:
-                progress["current_file"] = "Dumping Neo4j database..."
-                dump_result = await asyncio.to_thread(
-                    subprocess.run,
-                    [
-                        "sudo", "neo4j-admin", "database", "dump",
-                        "neo4j", "--to-path", str(backup_dir),
-                        "--overwrite-destination=true",
-                    ],
-                    capture_output=True, text=True, timeout=600,
+                stderr = dump_result.stderr[:300] if dump_result.stderr else ""
+                stdout = dump_result.stdout[:300] if dump_result.stdout else ""
+                logger.warning(
+                    "Neo4j dump failed (code %d). Setup required:\n"
+                    "  sudo cp scripts/neo4j-dump-helper.sh /usr/local/bin/forgerag-dump\n"
+                    "  sudo chmod 755 /usr/local/bin/forgerag-dump\n"
+                    "  echo 'nuc1 ALL=(ALL) NOPASSWD: /usr/local/bin/forgerag-dump' "
+                    "| sudo tee /etc/sudoers.d/forgerag-dump\n"
+                    "  sudo chmod 440 /etc/sudoers.d/forgerag-dump\n"
+                    "stderr: %s\nstdout: %s",
+                    dump_result.returncode, stderr, stdout,
                 )
-                # neo4j-admin creates neo4j.dump in --to-path
-                auto_dump = backup_dir / "neo4j.dump"
-                if auto_dump.exists():
-                    auto_dump.rename(dump_file)
-                    dump_size = dump_file.stat().st_size
-                    total_bytes += dump_size
-                    dump_ok = True
-                    logger.info("Neo4j dump created: %s (%d bytes)", dump_file, dump_size)
-                elif dump_result.returncode != 0:
-                    logger.warning("neo4j-admin dump failed: %s", dump_result.stderr[:300])
-
-                # Always restart Neo4j
-                progress["current_file"] = "Restarting Neo4j..."
-                await asyncio.to_thread(
-                    subprocess.run,
-                    ["sudo", "systemctl", "start", "neo4j"],
-                    capture_output=True, text=True, timeout=60,
+                progress["dump_skipped"] = (
+                    "Neo4j dump requires one-time setup. "
+                    "See server logs for instructions."
                 )
-                # Wait for Neo4j to come back
-                for _ in range(30):
-                    await asyncio.sleep(2)
-                    if await app.state.neo4j.verify_connectivity():
-                        break
-                logger.info("Neo4j restarted after dump")
+            # Wait for Neo4j to come back (the helper script restarts it)
+            progress["current_file"] = "Waiting for Neo4j to restart..."
+            for _ in range(30):
+                await asyncio.sleep(2)
+                if await app.state.neo4j.verify_connectivity():
+                    break
+        except FileNotFoundError:
+            logger.warning(
+                "forgerag-dump helper not installed. Run:\n"
+                "  sudo cp scripts/neo4j-dump-helper.sh /usr/local/bin/forgerag-dump\n"
+                "  sudo chmod 755 /usr/local/bin/forgerag-dump\n"
+                "  echo 'nuc1 ALL=(ALL) NOPASSWD: /usr/local/bin/forgerag-dump' "
+                "| sudo tee /etc/sudoers.d/forgerag-dump\n"
+                "  sudo chmod 440 /etc/sudoers.d/forgerag-dump"
+            )
+            progress["dump_skipped"] = (
+                "forgerag-dump helper not installed. "
+                "See server logs for setup instructions."
+            )
         except Exception as dump_exc:
             logger.warning("Neo4j dump error (non-fatal): %s", dump_exc)
-            # Ensure Neo4j is running
-            try:
-                await asyncio.to_thread(
-                    subprocess.run,
-                    ["sudo", "systemctl", "start", "neo4j"],
-                    capture_output=True, text=True, timeout=60,
-                )
-            except Exception:
-                pass
 
         progress["percent"] = 5
         progress["bytes_copied"] = total_bytes
@@ -1254,11 +1253,37 @@ async def _run_full_backup(
         manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
         # Step 6: Upload to Google Drive if enabled
+        # Copy key files to data/backups/ so gdrive_backup.py can find them,
+        # then run the upload script.
         if gdrive_enabled:
-            progress["current_file"] = "Uploading to Google Drive..."
-            progress["percent"] = 95
+            progress["current_file"] = "Preparing Google Drive upload..."
+            progress["percent"] = 93
             try:
                 project_root = Path(__file__).resolve().parent.parent.parent
+                local_backups = data_dir / "backups"
+                local_backups.mkdir(parents=True, exist_ok=True)
+
+                # Copy graph JSON to data/backups/ for gdrive_backup.py
+                local_graph = local_backups / graph_file.name
+                shutil.copy2(graph_file, local_graph)
+
+                # Copy manifest
+                local_manifest = local_backups / f"manifest_{ts}.json"
+                shutil.copy2(manifest_file, local_manifest)
+
+                # Symlink or copy dump if it exists
+                if dump_ok and dump_file.exists():
+                    local_dump_dir = local_backups / ts
+                    local_dump_dir.mkdir(parents=True, exist_ok=True)
+                    local_dump_link = local_dump_dir / dump_file.name
+                    if not local_dump_link.exists():
+                        try:
+                            local_dump_link.symlink_to(dump_file)
+                        except OSError:
+                            shutil.copy2(dump_file, local_dump_link)
+
+                progress["current_file"] = "Uploading to Google Drive..."
+                progress["percent"] = 95
                 gdrive_script = project_root / "scripts" / "gdrive_backup.py"
                 venv_python = project_root / "venv" / "bin" / "python3"
                 python_cmd = str(venv_python) if venv_python.exists() else "python3"

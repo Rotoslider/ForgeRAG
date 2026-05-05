@@ -397,10 +397,15 @@ function BackupRestoreCard() {
 
           {!isRunning && progress?.finished_at && !progress.error && (
             <div className="text-xs text-emerald-400 bg-emerald-950/30 rounded px-2 py-1.5">
-              Last backup complete: {(progress.total_bytes || 0 / 1e9).toFixed?.(2) || "?"} GB
+              Last backup complete: {((progress.total_bytes || 0) / 1e9).toFixed(2)} GB
               {progress.backup_path && (
                 <div className="font-mono mt-0.5 text-forge-muted truncate" title={progress.backup_path}>
                   {progress.backup_path}
+                </div>
+              )}
+              {progress.dump_skipped && (
+                <div className="mt-1 text-amber-400">
+                  Neo4j dump skipped: {progress.dump_skipped}
                 </div>
               )}
             </div>
