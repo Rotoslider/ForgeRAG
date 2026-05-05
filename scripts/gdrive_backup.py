@@ -281,16 +281,22 @@ def main() -> int:
     ts_match = re.search(r"(\d{8}_\d{6})", latest_graph.name)
     backup_ts = ts_match.group(1) if ts_match else ""
 
-    # Find manifest if it exists (may be in a timestamped subdirectory or at top level)
+    # Find manifest — could be manifest_{timestamp}.json (from GUI backup)
+    # or manifest.json inside a timestamped subdirectory (from backup.sh)
     manifest_path: Optional[Path] = None
-    # Check timestamped subdirectories first (from backup.sh)
-    subdirs = sorted(BACKUP_DIR.glob("[0-9]*"), reverse=True)
-    for subdir in subdirs:
-        candidate = subdir / "manifest.json"
-        if candidate.exists():
-            manifest_path = candidate
-            break
-    # Fallback: top-level manifest
+    # Check for timestamped manifest files at top level (GUI backup pattern)
+    manifest_files = sorted(BACKUP_DIR.glob("manifest_*.json"), reverse=True)
+    if manifest_files:
+        manifest_path = manifest_files[0]
+    # Check timestamped subdirectories (backup.sh pattern)
+    if manifest_path is None:
+        subdirs = sorted(BACKUP_DIR.glob("[0-9]*"), reverse=True)
+        for subdir in subdirs:
+            candidate = subdir / "manifest.json"
+            if candidate.exists():
+                manifest_path = candidate
+                break
+    # Fallback: plain manifest.json at top level
     if manifest_path is None:
         candidate = BACKUP_DIR / "manifest.json"
         if candidate.exists():
