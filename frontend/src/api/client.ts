@@ -376,6 +376,7 @@ export interface BackupSettingsData {
   include_images: boolean;
   include_pdfs: boolean;
   gdrive_enabled: boolean;
+  gdrive_dump?: boolean;
 }
 
 export interface BackupEntry {

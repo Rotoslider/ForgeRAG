@@ -774,6 +774,7 @@ class BackupSettingsPayload(BaseModel):
     include_images: bool = True
     include_pdfs: bool = True
     gdrive_enabled: bool = True
+    gdrive_dump: bool = False
 
 
 def _backup_settings_path(settings: Any) -> Path:
@@ -794,6 +795,7 @@ def _load_backup_settings(settings: Any) -> dict:
         "include_images": settings.backup.include_images,
         "include_pdfs": settings.backup.include_pdfs,
         "gdrive_enabled": settings.backup.gdrive_enabled,
+        "gdrive_dump": settings.backup.gdrive_dump,
     }
 
 
@@ -944,6 +946,7 @@ async def trigger_full_backup(request: Request) -> ForgeResult:
     include_images = backup_settings.get("include_images", True)
     include_pdfs = backup_settings.get("include_pdfs", True)
     gdrive_enabled = backup_settings.get("gdrive_enabled", True)
+    gdrive_dump = backup_settings.get("gdrive_dump", False)
 
     # Initialize progress
     request.app.state.backup_progress = {
@@ -957,7 +960,7 @@ async def trigger_full_backup(request: Request) -> ForgeResult:
     asyncio.create_task(
         _run_full_backup(
             request.app, settings, dest_path,
-            include_images, include_pdfs, gdrive_enabled,
+            include_images, include_pdfs, gdrive_enabled, gdrive_dump,
         )
     )
 
@@ -991,6 +994,7 @@ async def _run_full_backup(
     include_images: bool,
     include_pdfs: bool,
     gdrive_enabled: bool = False,
+    gdrive_dump: bool = False,
 ) -> None:
     """Background task that performs the full backup."""
     data_dir = Path(settings.server.data_dir)
@@ -1271,8 +1275,8 @@ async def _run_full_backup(
                 local_manifest = local_backups / f"manifest_{ts}.json"
                 shutil.copy2(manifest_file, local_manifest)
 
-                # Symlink or copy dump if it exists
-                if dump_ok and dump_file.exists():
+                # Symlink dump for Drive upload only if gdrive_dump is enabled
+                if gdrive_dump and dump_ok and dump_file.exists():
                     local_dump_dir = local_backups / ts
                     local_dump_dir.mkdir(parents=True, exist_ok=True)
                     local_dump_link = local_dump_dir / dump_file.name

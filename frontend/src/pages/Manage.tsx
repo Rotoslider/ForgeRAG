@@ -238,6 +238,7 @@ function BackupRestoreCard() {
   const [includeImages, setIncludeImages] = useState(true);
   const [includePdfs, setIncludePdfs] = useState(true);
   const [gdriveEnabled, setGdriveEnabled] = useState(true);
+  const [gdriveDump, setGdriveDump] = useState(false);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [saveMsg, setSaveMsg] = useState<string | null>(null);
 
@@ -248,6 +249,7 @@ function BackupRestoreCard() {
       setIncludeImages(currentSettings.include_images);
       setIncludePdfs(currentSettings.include_pdfs);
       setGdriveEnabled(currentSettings.gdrive_enabled);
+      setGdriveDump(currentSettings.gdrive_dump ?? false);
       setSettingsLoaded(true);
     }
   }, [currentSettings, settingsLoaded]);
@@ -284,6 +286,7 @@ function BackupRestoreCard() {
       include_images: includeImages,
       include_pdfs: includePdfs,
       gdrive_enabled: gdriveEnabled,
+      gdrive_dump: gdriveDump,
     });
   };
 
@@ -350,6 +353,16 @@ function BackupRestoreCard() {
               />
               Upload to Google Drive
             </label>
+            {gdriveEnabled && (
+              <label className="flex items-center gap-2 text-xs ml-5">
+                <input
+                  type="checkbox"
+                  checked={gdriveDump}
+                  onChange={(e) => setGdriveDump(e.target.checked)}
+                />
+                Include Neo4j dump (~8-14 GB)
+              </label>
+            )}
           </div>
 
           {saveMsg && (

@@ -111,6 +111,7 @@ class BackupSettings(BaseModel):
     include_images: bool = True
     include_pdfs: bool = True
     gdrive_enabled: bool = True
+    gdrive_dump: bool = False  # upload the large Neo4j dump to Drive (8-14 GB)
 
 
 class Settings(BaseModel):
