@@ -366,6 +366,12 @@ function BackupRestoreCard() {
           >
             {isRunning ? "Backup Running..." : backupMutation.isPending ? "Starting..." : "Start Full Backup"}
           </button>
+          {!isRunning && (
+            <div className="text-xs text-forge-muted">
+              Creates a complete Neo4j dump (includes all embeddings), graph JSON,
+              and selected files. Neo4j pauses briefly (~30s) during the dump.
+            </div>
+          )}
 
           {isRunning && progress && (
             <div className="space-y-1.5">

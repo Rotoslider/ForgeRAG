@@ -1002,14 +1002,82 @@ async def _run_full_backup(
     total_bytes = 0
 
     try:
-        # Step 1: Export graph JSON (hot backup)
-        progress["current_file"] = "Exporting graph JSON..."
+        import subprocess
+
+        # Step 1: Neo4j database dump (the critical piece — includes embeddings)
+        progress["current_file"] = "Creating Neo4j database dump..."
+        progress["percent"] = 2
+        dump_file = backup_dir / f"neo4j_{ts}.dump"
+        dump_ok = False
+        try:
+            # Stop Neo4j, dump, restart — brief downtime (~10-30s)
+            progress["current_file"] = "Stopping Neo4j for dump..."
+            stop_result = await asyncio.to_thread(
+                subprocess.run,
+                ["sudo", "systemctl", "stop", "neo4j"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if stop_result.returncode != 0:
+                logger.warning("Neo4j stop failed: %s", stop_result.stderr[:200])
+                progress["current_file"] = "Neo4j dump skipped (could not stop service)"
+            else:
+                progress["current_file"] = "Dumping Neo4j database..."
+                dump_result = await asyncio.to_thread(
+                    subprocess.run,
+                    [
+                        "sudo", "neo4j-admin", "database", "dump",
+                        "neo4j", "--to-path", str(backup_dir),
+                        "--overwrite-destination=true",
+                    ],
+                    capture_output=True, text=True, timeout=600,
+                )
+                # neo4j-admin creates neo4j.dump in --to-path
+                auto_dump = backup_dir / "neo4j.dump"
+                if auto_dump.exists():
+                    auto_dump.rename(dump_file)
+                    dump_size = dump_file.stat().st_size
+                    total_bytes += dump_size
+                    dump_ok = True
+                    logger.info("Neo4j dump created: %s (%d bytes)", dump_file, dump_size)
+                elif dump_result.returncode != 0:
+                    logger.warning("neo4j-admin dump failed: %s", dump_result.stderr[:300])
+
+                # Always restart Neo4j
+                progress["current_file"] = "Restarting Neo4j..."
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["sudo", "systemctl", "start", "neo4j"],
+                    capture_output=True, text=True, timeout=60,
+                )
+                # Wait for Neo4j to come back
+                for _ in range(30):
+                    await asyncio.sleep(2)
+                    if await app.state.neo4j.verify_connectivity():
+                        break
+                logger.info("Neo4j restarted after dump")
+        except Exception as dump_exc:
+            logger.warning("Neo4j dump error (non-fatal): %s", dump_exc)
+            # Ensure Neo4j is running
+            try:
+                await asyncio.to_thread(
+                    subprocess.run,
+                    ["sudo", "systemctl", "start", "neo4j"],
+                    capture_output=True, text=True, timeout=60,
+                )
+            except Exception:
+                pass
+
         progress["percent"] = 5
+        progress["bytes_copied"] = total_bytes
+
+        # Step 2: Export graph JSON (lightweight metadata backup)
+        progress["current_file"] = "Exporting graph JSON..."
 
         neo4j = app.state.neo4j
         export: dict = {
             "exported_at": datetime.now(timezone.utc).isoformat(),
             "format_version": 1,
+            "has_dump": dump_ok,
         }
 
         docs = await neo4j.run_query("MATCH (d:Document) RETURN d {.*} AS doc")
@@ -1081,7 +1149,7 @@ async def _run_full_backup(
         progress["bytes_copied"] = total_bytes
         progress["percent"] = 10
 
-        # Step 2: Copy page images (incremental — shared dir, skip existing)
+        # Step 3: Copy page images (incremental — shared dir, skip existing)
         copied_files = 0
         skipped_files = 0
         if include_images:
@@ -1139,7 +1207,7 @@ async def _run_full_backup(
         else:
             progress["percent"] = 70
 
-        # Step 3: Copy source PDFs (incremental)
+        # Step 4: Copy source PDFs (incremental)
         if include_pdfs:
             progress["current_file"] = "Scanning source PDFs..."
             uploads_src = data_dir / "uploads"
@@ -1165,11 +1233,15 @@ async def _run_full_backup(
         else:
             progress["percent"] = 90
 
-        # Step 4: Write manifest
+        # Step 5: Write manifest
         progress["current_file"] = "Writing manifest..."
+        dump_size_bytes = dump_file.stat().st_size if dump_file.exists() else 0
         manifest = {
             "timestamp": ts,
             "exported_at": datetime.now(timezone.utc).isoformat(),
+            "has_dump": dump_ok,
+            "dump_file": dump_file.name if dump_ok else None,
+            "dump_size_bytes": dump_size_bytes,
             "total_bytes_copied": total_bytes,
             "files_copied": copied_files,
             "files_skipped": skipped_files,
@@ -1181,12 +1253,11 @@ async def _run_full_backup(
         manifest_file = backup_dir / "manifest.json"
         manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-        # Step 5: Upload to Google Drive if enabled
+        # Step 6: Upload to Google Drive if enabled
         if gdrive_enabled:
             progress["current_file"] = "Uploading to Google Drive..."
             progress["percent"] = 95
             try:
-                import subprocess
                 project_root = Path(__file__).resolve().parent.parent.parent
                 gdrive_script = project_root / "scripts" / "gdrive_backup.py"
                 venv_python = project_root / "venv" / "bin" / "python3"
