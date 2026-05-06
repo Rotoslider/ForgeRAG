@@ -127,7 +127,13 @@ Documents are organized into domain-specific **collections** (e.g., `asm_referen
 - `RefTable` — design-handbook reference tables (`kind`: dimensions, specifications, conversion, selection...) with title + natural-language description.
 - `Page.topic_tags` — page-level kebab-case topic classifier (`tap-drill-chart`, `conductor-ampacity`, `gear-tooth-geometry`, ...) as a fast retrieval filter.
 
-**Entity canonicalization** (Phase 8): Material / Equipment / Process / Standard nodes go through Tier 1 case-fold + singularization + designation-prefix merging at apply time. Existing graphs can be canonicalized retroactively via the scripts below.
+**Entity deduplication** runs at two levels:
+
+- **Tier 1 (canonicalization)**: case-fold + singularization + designation-prefix merging. Handles "Stainless Steel" vs "stainless steel" vs "stainless steels". Run retroactively via `scripts/canonicalize_entity_dryrun.py` + `canonicalize_entity_apply.py`.
+- **Tier 2 (fuzzy dedup)**: SequenceMatcher similarity matching with safety guards (blocks different alloy numbers, conflicting properties, well-established entities). Handles "Ti-6Al-4V" vs "Ti6Al4V" vs "TI-6AL-4V", "gas-tungsten arc welding" vs "Gas Tungsten Arc Welding". Run via `scripts/dedup_entities_dryrun.py` + `dedup_entities_apply.py`.
+- **Automatic (per-ingestion)**: after each document's entity extraction, a lightweight dedup pass merges near-duplicates created by that document against existing entities. Uses a 0.92 similarity threshold with numeric-designation guards. No manual intervention needed — new documents won't create "Stainless Steel" when "stainless steel" already exists.
+
+Merged entity names are preserved as `common_names` on the surviving node, so fuzzy search still finds them. After bulk dedup, rebuild communities (`Manage → GraphRAG Communities → rebuild`) since the graph topology has changed.
 
 **Standard codes vs titles**: `Standard.code` is the short designator (`ASME BPVC IX`, `NFPA 70`, `SEMI S2`); `Standard.title` is the full descriptive title. Both are alias-aware in queries.
 
@@ -750,6 +756,8 @@ ForgeRAG/
 |   +-- canonicalize_materials_apply.py   Apply the plan (idempotent, per-group tx)
 |   +-- canonicalize_entity_dryrun.py     Generalized canonicalization for any label
 |   +-- canonicalize_entity_apply.py      (--label Equipment|Process|Standard|Material)
+|   +-- dedup_entities_dryrun.py          Tier 2 fuzzy dedup: SequenceMatcher + safety guards
+|   +-- dedup_entities_apply.py           Apply Tier 2 plan (reuses canonicalize_entity_apply)
 |   +-- cleanup_numeric_garbage.py        Null LLM-debris values in Material numeric fields
 +-- data/                          Runtime data (gitignored)
     +-- page_images/{hash}/        Full-resolution PNGs

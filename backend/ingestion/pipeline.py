@@ -197,6 +197,20 @@ class IngestionPipeline:
                 )
                 await self._extract_entities(job_id, doc_id)
 
+            # Post-extraction: merge near-duplicate entities created by this doc.
+            # Runs a lightweight dedup pass on entities linked to this document
+            # so "Stainless Steel" and "stainless steel" don't pile up as
+            # separate nodes across ingestions.
+            try:
+                await self.jobs.update(
+                    job_id, current_step="dedup_entities", progress_pct=95.0
+                )
+                merged = await self._dedup_doc_entities(doc_id)
+                if merged:
+                    logger.info("Post-ingestion dedup merged %d entities for doc %s", merged, doc_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Post-ingestion dedup failed (non-fatal): %s", exc)
+
             await self.jobs.complete(job_id)
             logger.info("Job %s completed successfully", job_id)
 
@@ -1174,3 +1188,134 @@ class IngestionPipeline:
             dict(_Counter(c.chunk_type for c in chunks)),
         )
         return {"chunks": total_written}
+
+    # --------------------------------------------------------- post-ingestion dedup
+
+    async def _dedup_doc_entities(self, doc_id: str) -> int:
+        """Merge near-duplicate entities linked to a specific document.
+
+        After entity extraction, the same real-world entity often appears
+        as separate nodes due to casing, hyphens, or plural differences
+        (e.g., "Stainless Steel" vs "stainless steel"). This method finds
+        entities linked to the just-ingested document and merges them with
+        existing nodes that normalize to the same form.
+
+        Returns the number of entities merged.
+        """
+        import re as _re
+        from difflib import SequenceMatcher as _SM
+
+        _STRIP = _re.compile(r"[®©™°\-–—\s]+")
+
+        def _norm(name: str) -> str:
+            return _STRIP.sub("", name).lower()
+
+        # Fetch entities linked to this document's pages
+        rel_types = [
+            ("MENTIONS_MATERIAL", "Material", "name"),
+            ("DESCRIBES_PROCESS", "Process", "name"),
+            ("REFERENCES_STANDARD", "Standard", "code"),
+            ("MENTIONS_EQUIPMENT", "Equipment", "name"),
+        ]
+
+        total_merged = 0
+        for rel, label, pk in rel_types:
+            # Get entity names linked to this doc
+            doc_entities = await self.neo4j.run_query(
+                f"""
+                MATCH (d:Document {{doc_id: $doc_id}})-[:HAS_PAGE]->(p:Page)-[:{rel}]->(e:{label})
+                RETURN DISTINCT e.{pk} AS name
+                """,
+                {"doc_id": doc_id},
+            )
+            if not doc_entities:
+                continue
+
+            doc_names = {r["name"] for r in doc_entities if r["name"]}
+            if not doc_names:
+                continue
+
+            # For each doc entity, check if there's an existing entity with
+            # a different name that normalizes to the same form, or is very
+            # similar (>= 0.92 threshold, high to avoid false merges).
+            for name in doc_names:
+                norm = _norm(name)
+                if len(norm) < 3:
+                    continue
+
+                # Find candidates: same label, different name, similar normalized form
+                candidates = await self.neo4j.run_query(
+                    f"""
+                    MATCH (e:{label})
+                    WHERE e.{pk} <> $name
+                      AND e.{pk} IS NOT NULL
+                      AND toLower(e.{pk}) CONTAINS $prefix
+                    OPTIONAL MATCH (p:Page)-[:{rel}]->(e)
+                    RETURN e.{pk} AS name, count(DISTINCT p) AS mentions
+                    LIMIT 20
+                    """,
+                    {"name": name, "prefix": norm[:4] if len(norm) >= 4 else norm[:3]},
+                )
+                if not candidates:
+                    continue
+
+                for cand in candidates:
+                    cand_name = cand["name"]
+                    cand_norm = _norm(cand_name)
+
+                    # Check similarity
+                    if cand_norm == norm:
+                        sim = 1.0
+                    elif _SM(None, norm, cand_norm).ratio() >= 0.92:
+                        sim = _SM(None, norm, cand_norm).ratio()
+                    else:
+                        continue
+
+                    # Safety: different numbers → skip
+                    nums_a = set(_re.findall(r"\d{2,}", name))
+                    nums_b = set(_re.findall(r"\d{2,}", cand_name))
+                    if nums_a and nums_b and nums_a != nums_b:
+                        continue
+
+                    # Pick winner by mention count
+                    doc_ent_mentions = await self.neo4j.run_query(
+                        f"MATCH (p:Page)-[:{rel}]->(e:{label} {{{pk}: $name}}) RETURN count(p) AS c",
+                        {"name": name},
+                    )
+                    my_mentions = doc_ent_mentions[0]["c"] if doc_ent_mentions else 0
+
+                    if cand["mentions"] >= my_mentions:
+                        winner_name, loser_name = cand_name, name
+                    else:
+                        winner_name, loser_name = name, cand_name
+
+                    # Redirect relationships and delete loser
+                    await self.neo4j.run_write(
+                        f"""
+                        MATCH (w:{label} {{{pk}: $winner}})
+                        MATCH (l:{label} {{{pk}: $loser}})
+                        OPTIONAL MATCH (src)-[r]->(l)
+                        WITH w, l, src, r
+                        WHERE r IS NOT NULL
+                        MERGE (src)-[nr]->(w)
+                        DELETE r
+                        WITH DISTINCT w, l
+                        OPTIONAL MATCH (l)-[r2]->(tgt)
+                        WITH w, l, tgt, r2
+                        WHERE r2 IS NOT NULL
+                        MERGE (w)-[nr2]->(tgt)
+                        DELETE r2
+                        WITH DISTINCT w, l
+                        SET w.common_names = coalesce(w.common_names, []) + [$loser]
+                        DETACH DELETE l
+                        """,
+                        {"winner": winner_name, "loser": loser_name},
+                    )
+                    total_merged += 1
+                    logger.debug(
+                        "Dedup: merged %s %r into %r (sim=%.2f)",
+                        label, loser_name, winner_name, sim,
+                    )
+                    break  # one merge per doc entity per pass
+
+        return total_merged
