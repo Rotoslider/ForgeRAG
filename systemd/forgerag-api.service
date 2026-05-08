@@ -15,6 +15,7 @@ WorkingDirectory=/home/nuc1/projects/ForgeRAG
 EnvironmentFile=-/etc/forgerag/env
 Environment=FORGERAG_CONFIG=/home/nuc1/projects/ForgeRAG/config/forgerag.toml
 Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+Environment=HF_HUB_OFFLINE=1
 ExecStart=/home/nuc1/projects/ForgeRAG/venv/bin/python backend/run.py
 Restart=on-failure
 RestartSec=10

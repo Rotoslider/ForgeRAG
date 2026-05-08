@@ -329,6 +329,8 @@ echo "NEO4J_PASSWORD='YOUR_STRONG_PASSWORD'" | sudo tee /etc/forgerag/env > /dev
 sudo chmod 600 /etc/forgerag/env
 ```
 
+The env file is also where you can set `HF_HUB_OFFLINE=1` to prevent the `transformers` library from contacting HuggingFace at runtime. All models are downloaded at install time, so there's no reason to phone home during ingestion — and transient HuggingFace API errors (500s) can crash long-running jobs. Both `run.py` and the systemd service default to offline mode, but the env file lets you override it (`HF_HUB_OFFLINE=0`) if you need to download a new model.
+
 ### 10. Seed the Neo4j Schema
 
 This creates constraints, indexes, vector indexes, and full-text indexes. Idempotent — safe to run multiple times:
