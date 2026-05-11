@@ -16,7 +16,7 @@ from backend.models.search import (
 )
 from pydantic import BaseModel, Field
 
-from backend.services.graph_reasoning import GraphContext, explore_from_query
+from backend.services.graph_reasoning import GraphContext, explore_from_query, _STOPWORDS
 
 logger = logging.getLogger(__name__)
 
@@ -1118,7 +1118,10 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
         # appearing on the page's graph edges. Previously used the stale
         # page_text_embedding index and returned nothing post-BGE-M3
         # migration — rewritten to go through chunk_embedding.
-        query_terms = [t.lower() for t in body.query.split() if len(t) >= 3]
+        query_terms = [
+            t.lower() for t in body.query.split()
+            if len(t) >= 4 and t.lower() not in _STOPWORDS
+        ]
 
         # Fuzzy entity matching: expand query_terms with names of known
         # entities that fuzzy-match the query (catches "inconel 625" vs
@@ -1245,7 +1248,10 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
     if body.strategy == "graph_first":
         # Find entity nodes whose names or common_names contain any query
         # term, then pages that mention them.
-        query_terms = [t.lower() for t in body.query.split() if len(t) >= 3]
+        query_terms = [
+            t.lower() for t in body.query.split()
+            if len(t) >= 4 and t.lower() not in _STOPWORDS
+        ]
 
         # Fuzzy entity matching: expand query_terms with names of known
         # entities that fuzzy-match the query (catches "inconel 625" vs
@@ -1263,14 +1269,21 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
             except Exception as exc:
                 logger.warning("EntityMatcher failed in graph_first: %s", exc)
 
+        # Build a Lucene query string from query terms. Each term is
+        # OR'd so any entity whose name contains the term is a candidate.
+        # The fulltext index (entity_name_fulltext) covers Material.name,
+        # Process.name, Equipment.name, and Standard.code — no full
+        # property scan needed.
+        lucene_query = " OR ".join(query_terms)
+
         cypher = f"""
-            MATCH (e)
-            WHERE any(l IN labels(e) WHERE l IN ['Material','Process','Standard','Equipment'])
-              AND (
-                any(t IN $terms WHERE toLower(coalesce(e.name, e.code, '')) CONTAINS t)
-                OR any(alias IN coalesce(e.common_names, []) WHERE
-                       any(t IN $terms WHERE toLower(alias) CONTAINS t))
-              )
+            CALL db.index.fulltext.queryNodes('entity_name_fulltext', $lucene)
+            YIELD node AS e, score AS ft_score
+            WHERE any(l IN labels(e) WHERE l IN
+                      ['Material','Process','Standard','Equipment'])
+            WITH e, ft_score
+            ORDER BY ft_score DESC
+            LIMIT 40
             MATCH (p:Page)-[r]->(e)
             WHERE type(r) IN ['MENTIONS_MATERIAL','DESCRIBES_PROCESS',
                               'REFERENCES_STANDARD','MENTIONS_EQUIPMENT']
@@ -1292,7 +1305,7 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
                    [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
                    [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
         """
-        params = {"terms": query_terms, "pool": body.candidate_pool}
+        params = {"lucene": lucene_query, "pool": body.candidate_pool}
         params.update(filter_params)
         rows = await neo4j.run_query(cypher, params)
 

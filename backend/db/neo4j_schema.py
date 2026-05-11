@@ -107,6 +107,13 @@ FULLTEXT_INDEXES: list[str] = [
     # match even when the raw chunk text uses different wording.
     """CREATE FULLTEXT INDEX chunk_text_fulltext IF NOT EXISTS
        FOR (c:Chunk) ON EACH [c.text, c.summary]""",
+
+    # Entity name fulltext — used by graph_first hybrid strategy to find
+    # entities matching query terms without a full property scan across
+    # 180K+ nodes. Covers all four entity labels.
+    """CREATE FULLTEXT INDEX entity_name_fulltext IF NOT EXISTS
+       FOR (m:Material|Process|Equipment|Standard)
+       ON EACH [m.name, m.code]""",
 ]
 
 

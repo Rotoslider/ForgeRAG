@@ -45,7 +45,7 @@ All phases complete.
 Recent additions since the Phase 9 baseline:
 
 - **Search error boundary** — no more blank pages when switching between search modes. The React search view catches rendering errors and recovers gracefully.
-- **Fuzzy entity matching** — EntityMatcher service loads entity names from Neo4j into memory and matches query text with difflib SequenceMatcher. Handles OCR-style typos, missing special characters, case mismatches, and spacing differences.
+- **Fuzzy entity matching** — EntityMatcher service loads entity names from Neo4j into memory and matches query text with difflib SequenceMatcher. Handles OCR-style typos, missing special characters, case mismatches, and spacing differences. Noise-word filtering, a 25-window cap, and a 5-second time budget prevent long natural-language queries from hanging (previously ~200s on 180K+ entities).
 - **OCR typo tolerance** — keyword search now uses Lucene `~1` fuzzy operator so queries like "alumnum" still match "aluminum" in extracted text.
 - **Community search weighted by member count** — community results are ranked by the number of entity members, surfacing the most connected communities first.
 - **LLM circuit breaker** — 5 consecutive LLM failures trip the breaker open; all requests fail fast for 60 seconds, then a single probe request is allowed through. Prevents cascading timeouts during LM Studio restarts.
@@ -144,7 +144,7 @@ Merged entity names are preserved as `common_names` on the surviving node, so fu
 | **Answer** (default) | RRF hybrid + BGE reranker + graph traversal, then VLM reads page images and synthesizes an answer with citations | Questions: *"What preheat does ASME IX require for P-1 over 1 inch?"* |
 | **Keyword** | Lucene full-text phrase search on extracted text/chunks, with ~1 fuzzy tolerance for OCR typos | Specific codes: *"C12000"*, *"QW-451.1"*, *"ASTM A 709"* |
 | **Visual** | ColPali/Nemotron two-stage retrieval (text-vector coarse, then MaxSim rerank) | Finding specific charts, tables, diagrams |
-| **Hybrid** | Strategies: `rrf` (BM25 + dense + bge-reranker, default), `graph_boosted`, `vector_first`, `graph_first`, `community` | Tuned search behaviour per query type |
+| **Hybrid** | Strategies: `rrf` (BM25 + dense + bge-reranker, default), `graph_boosted`, `vector_first`, `graph_first`, `community`. Graph strategies use stopword filtering and a Lucene fulltext index on entity names for fast lookup across 180K+ entities. | Tuned search behaviour per query type |
 
 ### RRF Hybrid (default)
 

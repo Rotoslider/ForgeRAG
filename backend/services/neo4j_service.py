@@ -182,13 +182,24 @@ class Neo4jService:
         cypher: str,
         parameters: dict[str, Any] | None = None,
         database: str | None = None,
+        timeout: float | None = 90.0,
     ) -> list[dict[str, Any]]:
-        """Run a Cypher query and return results as a list of dicts."""
+        """Run a Cypher query and return results as a list of dicts.
+
+        timeout: max seconds for the query (default 90s). Prevents runaway
+        Cypher from holding the HTTP connection until the browser kills it.
+        Pass None to disable.
+        """
         db = database or self.settings.database
-        async with self.driver.session(database=db) as session:
-            result = await session.run(cypher, parameters or {})
-            records = [dict(record) async for record in result]
-            return records
+
+        async def _execute() -> list[dict[str, Any]]:
+            async with self.driver.session(database=db) as session:
+                result = await session.run(cypher, parameters or {})
+                return [dict(record) async for record in result]
+
+        if timeout is not None:
+            return await asyncio.wait_for(_execute(), timeout=timeout)
+        return await _execute()
 
     async def run_write(
         self,

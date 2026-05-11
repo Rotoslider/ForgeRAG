@@ -14,6 +14,7 @@ graph_boosted to expand the set of recognized entity names.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import time
@@ -128,6 +129,21 @@ class EntityMatcher:
         if not self._entities or (time.monotonic() - self._last_refresh > self._refresh_interval):
             await self.refresh()
 
+    # Common English words that are noise for entity matching — they
+    # produce millions of useless SequenceMatcher comparisons on long
+    # natural-language queries without ever matching a real entity.
+    _NOISE_TOKENS = frozenset({
+        "the", "and", "for", "with", "from", "this", "that", "these",
+        "those", "are", "was", "has", "have", "had", "can", "will",
+        "would", "should", "could", "may", "might", "does", "did",
+        "about", "into", "over", "what", "when", "where", "which",
+        "who", "why", "how", "not", "but", "also", "than", "then",
+        "between", "considering", "run", "size", "type", "using",
+    })
+
+    _MAX_WINDOWS = 25
+    _TIME_BUDGET = 5.0  # seconds
+
     def find_matches(
         self,
         query: str,
@@ -136,45 +152,49 @@ class EntityMatcher:
         """Find entity names that fuzzy-match tokens/windows in the query.
 
         Strategy:
-        - Tokenize the query
+        - Tokenize the query, filter noise words
         - For each bigram and trigram window (and individual tokens >= 3 chars),
           compare against known entity names using:
           1. Normalized exact match (catches "inconel625" vs "Inconel® 625")
-          2. SequenceMatcher ratio for candidates within reasonable length range
-          3. Token set overlap for multi-word entities
+          2. Containment check for abbreviations
+          3. SequenceMatcher ratio for candidates within reasonable length range
 
+        Caps at _MAX_WINDOWS and bails after _TIME_BUDGET seconds.
         Returns matches sorted by score descending.
         """
         if not self._entities:
             return []
 
         query_lower = query.lower()
-        tokens = query_lower.split()
-        results: dict[str, MatchResult] = {}  # name -> best result
+        tokens = [
+            t for t in query_lower.split()
+            if len(t) >= 3 and t not in self._NOISE_TOKENS
+        ]
+        results: dict[str, MatchResult] = {}
 
-        # Build candidate windows from the query
+        # Build candidate windows from filtered tokens
         windows: list[str] = []
-        # Individual tokens (>= 3 chars)
         for t in tokens:
-            if len(t) >= 3:
-                windows.append(t)
-        # Bigrams
+            windows.append(t)
         for i in range(len(tokens) - 1):
             windows.append(f"{tokens[i]} {tokens[i+1]}")
-        # Trigrams
         for i in range(len(tokens) - 2):
             windows.append(f"{tokens[i]} {tokens[i+1]} {tokens[i+2]}")
-        # Full query as a window too (for short queries)
         if len(tokens) <= 5:
             windows.append(query_lower)
 
-        # Normalize each window
+        # Cap to avoid O(windows × entities) explosion on long queries
+        if len(windows) > self._MAX_WINDOWS:
+            # Prefer shorter, more specific windows (individual tokens and
+            # short n-grams) — they're more likely to match entity names.
+            windows.sort(key=len)
+            windows = windows[: self._MAX_WINDOWS]
+
         normalized_windows = [_normalize(w) for w in windows]
+        deadline = time.monotonic() + self._TIME_BUDGET
 
         for entry in self._entities:
             best_score = 0.0
-
-            # Fast check: if entity is very long relative to all windows, skip
             elen = len(entry.normalized)
             if elen == 0:
                 continue
@@ -182,34 +202,27 @@ class EntityMatcher:
             for i, window in enumerate(windows):
                 nw = normalized_windows[i]
                 wlen = len(nw)
-
-                # Skip if length mismatch is too extreme (more than 3x difference)
                 if wlen == 0:
                     continue
                 ratio = max(elen, wlen) / max(min(elen, wlen), 1)
                 if ratio > 3.0:
                     continue
 
-                # 1. Normalized exact match
                 if nw == entry.normalized:
                     best_score = 1.0
                     break
 
-                # 2. Check if one contains the other (common for abbreviations)
                 if entry.normalized in nw or nw in entry.normalized:
-                    # Score based on how much of the entity the window covers
                     containment_score = min(elen, wlen) / max(elen, wlen)
                     if containment_score > best_score:
                         best_score = containment_score
                     continue
 
-                # 3. SequenceMatcher for edit distance
                 sim = SequenceMatcher(None, nw, entry.normalized).ratio()
                 if sim > best_score:
                     best_score = sim
 
             if best_score >= threshold:
-                # Keep the best score for this entity name
                 existing = results.get(entry.name)
                 if existing is None or best_score > existing.score:
                     results[entry.name] = MatchResult(
@@ -218,7 +231,15 @@ class EntityMatcher:
                         score=best_score,
                     )
 
-        # Sort by score descending
+            # Bail early if time budget exceeded — partial results are
+            # still useful and better than a 200s hang.
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "EntityMatcher hit %.0fs time budget after %d/%d entities",
+                    self._TIME_BUDGET, len(results), len(self._entities),
+                )
+                break
+
         matched = sorted(results.values(), key=lambda m: m.score, reverse=True)
         return matched
 
@@ -227,6 +248,7 @@ class EntityMatcher:
         query: str,
         threshold: float = 0.75,
     ) -> list[MatchResult]:
-        """Async wrapper: ensures entities are loaded, then runs matching."""
+        """Async wrapper: ensures entities are loaded, then runs matching
+        in a thread to avoid blocking the event loop."""
         await self._ensure_loaded()
-        return self.find_matches(query, threshold)
+        return await asyncio.to_thread(self.find_matches, query, threshold)

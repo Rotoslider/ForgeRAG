@@ -77,7 +77,7 @@ class LLMSettings(BaseModel):
     model: str = "qwen/qwen3.6-35b-a3b"
     max_tokens: int = 4096
     temperature: float = 0.1
-    timeout_seconds: int = 120
+    timeout_seconds: int = 300
     # Some models (Gemma 4 MoE) break under strict JSON schema grammar
     # enforcement and produce repetitive junk. Others (GLM reasoning
     # variants) work great with it. Toggle per model.
