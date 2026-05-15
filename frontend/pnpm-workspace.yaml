@@ -1,0 +1,5 @@
+allowBuilds:
+  esbuild: set this to true or false
+minimumReleaseAgeExclude:
+  - esbuild@0.24.3
+  - vite@6.4.2
