@@ -162,7 +162,8 @@ class CommunityDetector:
                  <-[:MENTIONS_MATERIAL|DESCRIBES_PROCESS|REFERENCES_STANDARD|MENTIONS_EQUIPMENT]-(p2:Page)
             WHERE id(p1) < id(p2)
             RETURN p1.page_id AS src, p2.page_id AS dst, count(e) AS weight
-            """
+            """,
+            timeout=None,
         )
         if not rows:
             return ig.Graph(), []

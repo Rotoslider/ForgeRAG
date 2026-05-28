@@ -238,7 +238,8 @@ class IngestionPipeline:
             await self.jobs.complete(job_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Community job %s failed", job_id)
-            await self.jobs.fail(job_id, str(exc))
+            msg = str(exc) or f"{type(exc).__name__} (no message)"
+            await self.jobs.fail(job_id, msg)
 
     async def run_extraction_only(self, job_id: str, doc_id: str) -> None:
         """Re-run only entity extraction for an already-ingested document.
