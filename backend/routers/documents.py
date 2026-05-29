@@ -258,25 +258,35 @@ async def reembed_document(doc_id: str, request: Request) -> ForgeResult:
 
 @router.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str, request: Request) -> ForgeResult:
-    """Delete a document and all its pages. Also removes page images from disk."""
+    """Delete a document and everything derived from it.
+
+    Removes the :Document node, its :Page nodes, the :Chunk nodes hanging off
+    those pages, the rasterized page images on disk, and the staged source
+    PDF in uploads/. Category and Tag nodes are kept (other docs may use them).
+    """
     neo4j = request.app.state.neo4j
     settings = request.app.state.settings
 
-    # Look up the file_hash first (needed to find on-disk images)
+    # Look up file_hash (for on-disk images) and filename (for the upload).
     rows = await neo4j.run_query(
-        "MATCH (d:Document {doc_id: $doc_id}) RETURN d.file_hash AS h",
+        "MATCH (d:Document {doc_id: $doc_id}) "
+        "RETURN d.file_hash AS h, d.filename AS f",
         {"doc_id": doc_id},
     )
     if not rows:
         raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
     file_hash = rows[0]["h"]
+    filename = rows[0]["f"]
 
-    # Detach-delete the document and its pages (keeps category/tag nodes)
+    # Detach-delete the document, its pages, and the chunks attached to those
+    # pages (keeps category/tag nodes). Without deleting chunks here they'd be
+    # left orphaned in the graph.
     await neo4j.run_write(
         """
         MATCH (d:Document {doc_id: $doc_id})
         OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
-        DETACH DELETE d, p
+        OPTIONAL MATCH (p)-[:HAS_CHUNK]->(c:Chunk)
+        DETACH DELETE d, p, c
         """,
         {"doc_id": doc_id},
     )
@@ -289,6 +299,16 @@ async def delete_document(doc_id: str, request: Request) -> ForgeResult:
         if folder.exists():
             shutil.rmtree(folder, ignore_errors=True)
             removed.append(str(folder))
+
+    # Remove the staged source PDF in uploads/. Uploads are named
+    # "{uuid_hex}_{original_filename}", so match by the filename suffix.
+    if filename:
+        uploads = data_dir / "uploads"
+        if uploads.is_dir():
+            for entry in uploads.iterdir():
+                if entry.is_file() and entry.name.endswith(f"_{filename}"):
+                    entry.unlink(missing_ok=True)
+                    removed.append(str(entry))
 
     return ForgeResult(
         success=True,

@@ -9,8 +9,10 @@ inspect history via GET /ingest/jobs.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,13 @@ import aiosqlite
 from backend.models.ingestion import Job, JobStatus, JobStep
 
 logger = logging.getLogger(__name__)
+
+# How long a connection waits for a competing writer before giving up.
+# WAL serializes writers; without a busy timeout, concurrent ingestion jobs
+# writing job progress collide and SQLite raises "database is locked"
+# immediately. 30 s is far longer than any single job-row write needs.
+_CONNECT_TIMEOUT = 30.0
+_BUSY_TIMEOUT_MS = 30000
 
 
 _SCHEMA = """
@@ -56,6 +65,25 @@ class JobManager:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
         self._ready = False
+        # SQLite allows only one writer at a time. Serializing writes from
+        # this process through an asyncio lock removes intra-process
+        # contention entirely; the busy_timeout below covers other processes
+        # (e.g. the maintenance scripts) that open the same file.
+        self._write_lock = asyncio.Lock()
+
+    @asynccontextmanager
+    async def _connect(self):
+        """Open a connection with a generous busy timeout applied.
+
+        Every code path goes through here so the busy timeout is never
+        forgotten — the original bug was connections defaulting to a tiny
+        timeout and failing instantly under concurrent ingestion.
+        """
+        async with aiosqlite.connect(
+            self.db_path, timeout=_CONNECT_TIMEOUT
+        ) as db:
+            await db.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            yield db
 
     async def init(self) -> None:
         """Create the database file and schema if they don't exist, and mark
@@ -64,7 +92,7 @@ class JobManager:
         if self._ready:
             return
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._write_lock, self._connect() as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.executescript(_SCHEMA)
             # Mark in-flight jobs from the previous run as failed. Any
@@ -102,7 +130,7 @@ class JobManager:
 
         job_id = str(uuid.uuid4())
         now = _utcnow_iso()
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._write_lock, self._connect() as db:
             await db.execute(
                 """
                 INSERT INTO jobs (
@@ -123,7 +151,7 @@ class JobManager:
         return await self.get(job_id)  # type: ignore[return-value]
 
     async def get(self, job_id: str) -> Job | None:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
@@ -142,7 +170,7 @@ class JobManager:
         query += " ORDER BY created_at DESC LIMIT ?"
         params = (*params, limit)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cur = await db.execute(query, params)
             rows = await cur.fetchall()
@@ -186,7 +214,7 @@ class JobManager:
         params.append(_utcnow_iso())
         params.append(job_id)
 
-        async with aiosqlite.connect(self.db_path) as db:
+        async with self._write_lock, self._connect() as db:
             await db.execute(
                 f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ?", params
             )

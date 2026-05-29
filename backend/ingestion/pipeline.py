@@ -120,9 +120,24 @@ class IngestionPipeline:
         self.text_extractor = TextExtractor(
             scanned_text_threshold_chars=settings.ingestion.scanned_text_threshold_chars,
         )
+        # Cap how many full ingestion jobs run concurrently. Every upload
+        # spawns its own background task; without this gate, adding dozens of
+        # PDFs at once floods the job DB (the bug that caused "database is
+        # locked") and thrashes the GPU. Jobs beyond the limit wait here.
+        self._ingest_semaphore = asyncio.Semaphore(
+            max(1, settings.ingestion.max_concurrent_ingestions)
+        )
 
     async def run_job(self, job_id: str, collection: str = "default") -> None:
-        """Run the full pipeline for a queued job. Catches and records errors."""
+        """Run the full pipeline for a queued job. Catches and records errors.
+
+        Bounded by the ingestion semaphore so a large batch of uploads drains
+        a few at a time instead of all at once.
+        """
+        async with self._ingest_semaphore:
+            await self._run_job_inner(job_id, collection)
+
+    async def _run_job_inner(self, job_id: str, collection: str = "default") -> None:
         try:
             job = await self.jobs.get(job_id)
             if job is None:
@@ -250,6 +265,12 @@ class IngestionPipeline:
             await self.jobs.update(job_id, status="processing", doc_id=doc_id)
             if self.entity_extractor is None:
                 raise ValueError("LLM service not configured — cannot extract entities")
+            if await self._page_count(doc_id) == 0:
+                raise ValueError(
+                    f"Document {doc_id} has 0 pages — it was only partially "
+                    "ingested. Delete it and re-ingest the PDF; entity "
+                    "extraction has no pages to work on."
+                )
             await self.jobs.update(
                 job_id, current_step="extracting_entities", progress_pct=10.0
             )
@@ -297,6 +318,18 @@ class IngestionPipeline:
             title = rows[0]["title"] or doc_id
             file_hash = rows[0]["file_hash"]
             filename = rows[0]["filename"] or ""
+
+            # Guard: a rebuild attaches chunks/entities to existing :Page
+            # nodes. A document with zero pages (e.g. one whose ingestion
+            # died during registration) would otherwise rebuild to nothing
+            # and report success. Fail loudly so the user knows it needs a
+            # full re-ingestion, not a rebuild.
+            if await self._page_count(doc_id) == 0:
+                raise ValueError(
+                    f"Document {doc_id} has 0 pages — it was only partially "
+                    "ingested. Delete it and re-ingest the PDF; a rebuild "
+                    "cannot recreate missing pages."
+                )
 
             # Locate source PDF in data/uploads/ by hash prefix
             upload_dir = Path(self.settings.server.data_dir) / "uploads"
@@ -457,6 +490,20 @@ class IngestionPipeline:
         except Exception as exc:  # noqa: BLE001
             logger.exception("Rebuild-chunks job %s failed", job_id)
             await self.jobs.fail(job_id, str(exc))
+
+    async def _page_count(self, doc_id: str) -> int:
+        """Number of :Page nodes attached to a document. Zero means the doc
+        was only partially ingested (registered but text-extraction never
+        ran)."""
+        rows = await self.neo4j.run_query(
+            """
+            MATCH (d:Document {doc_id: $doc_id})
+            OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
+            RETURN count(p) AS n
+            """,
+            {"doc_id": doc_id},
+        )
+        return rows[0]["n"] if rows else 0
 
     async def _backfill_blank_flags(self, doc_id: str, file_hash: str) -> int:
         """Compute and store is_blank on any Page that doesn't have it yet.

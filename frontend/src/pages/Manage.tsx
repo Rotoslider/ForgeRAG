@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addDocumentTag,
@@ -1263,31 +1264,54 @@ function ActionBtn({
 
 function OverflowMenu({ children }: { children: React.ReactNode }) {
   // Dropdown with the less-frequently-used row actions tucked out of the
-  // primary button row. Closes on outside click and on Escape — the menu
-  // body is intentionally not auto-closed on item click; child MenuItem
-  // uses setOpen(false) via onClick composition below.
+  // primary button row. The menu is rendered into a portal with FIXED
+  // positioning anchored to the trigger button. This is deliberate: the
+  // trigger lives inside the documents table's scroll container (and a
+  // `sticky` cell), so an `absolute` menu gets clipped by those ancestors'
+  // overflow and loses the z-index race against the sticky header. A fixed
+  // portal escapes every clipping/stacking context.
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
+  const btnRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ top: number; right: number }>({ top: 0, right: 0 });
+
+  // Position the menu just below the button, right-aligned to it. Runs
+  // before paint so the menu never flashes in the wrong spot.
+  useLayoutEffect(() => {
+    if (!open || !btnRef.current) return;
+    const r = btnRef.current.getBoundingClientRect();
+    setPos({ top: r.bottom + 4, right: window.innerWidth - r.right });
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
     const onDocClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      const t = e.target as Node;
+      if (btnRef.current?.contains(t) || menuRef.current?.contains(t)) return;
+      setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
     };
+    // Any scroll/resize would leave the fixed menu detached from its button,
+    // so just close it.
+    const onScroll = () => setOpen(false);
     document.addEventListener("mousedown", onDocClick);
     document.addEventListener("keydown", onKey);
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", onScroll);
     return () => {
       document.removeEventListener("mousedown", onDocClick);
       document.removeEventListener("keydown", onKey);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onScroll);
     };
   }, [open]);
 
   return (
-    <div className="relative" ref={ref}>
+    <>
       <button
+        ref={btnRef}
         onClick={() => setOpen((v) => !v)}
         title="More actions"
         aria-haspopup="menu"
@@ -1296,16 +1320,20 @@ function OverflowMenu({ children }: { children: React.ReactNode }) {
       >
         ⋯
       </button>
-      {open && (
-        <div
-          role="menu"
-          className="absolute right-0 top-full mt-1 min-w-[14rem] bg-forge-panel border border-forge-edge rounded shadow-lg z-20 py-1 text-left"
-          onClick={() => setOpen(false)}
-        >
-          {children}
-        </div>
-      )}
-    </div>
+      {open &&
+        createPortal(
+          <div
+            ref={menuRef}
+            role="menu"
+            style={{ position: "fixed", top: pos.top, right: pos.right }}
+            className="min-w-[14rem] bg-forge-panel border border-forge-edge rounded shadow-lg z-[100] py-1 text-left"
+            onClick={() => setOpen(false)}
+          >
+            {children}
+          </div>,
+          document.body
+        )}
+    </>
   );
 }
 

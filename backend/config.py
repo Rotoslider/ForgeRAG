@@ -98,6 +98,10 @@ class IngestionSettings(BaseModel):
     text_embedding_batch_size: int = 32
     max_concurrent_pdf_conversions: int = 4
     scanned_text_threshold_chars: int = 50
+    # How many ingestion jobs may run at once. Each upload starts its own
+    # background task; without a cap, adding dozens of PDFs at once stampedes
+    # the job DB and the GPU. Keep this small.
+    max_concurrent_ingestions: int = 3
 
 
 class GPUSettings(BaseModel):
