@@ -302,7 +302,7 @@ cd ForgeRAG
 
 # Frontend dependencies
 cd frontend
-npm install
+pnpm install
 cd ..
 ```
 
@@ -344,7 +344,7 @@ export NEO4J_PASSWORD='YOUR_STRONG_PASSWORD'
 
 ```bash
 cd frontend
-npm run build
+pnpm build
 cd ..
 ```
 
