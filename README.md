@@ -270,6 +270,11 @@ sudo apt-get install -y nodejs
 # Verify
 node --version   # v24.x.x
 npm --version
+
+# Enable pnpm (bundled with Node via Corepack). The frontend uses pnpm for
+# its lockfile and minimumReleaseAge supply-chain protection.
+corepack enable pnpm
+pnpm --version
 ```
 
 ### 6. LM Studio
