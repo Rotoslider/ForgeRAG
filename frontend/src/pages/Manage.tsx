@@ -76,7 +76,7 @@ function StatsCard() {
   const labels = data?.data?.labels || [];
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg p-4">
-      <h2 className="font-semibold mb-3">Graph Stats</h2>
+      <h2 className="font-semibold mb-3" title="Live node counts in the Neo4j knowledge graph — refreshes every 5 s">Graph Stats</h2>
       {labels.length === 0 ? (
         <div className="text-xs text-forge-muted">No nodes in the graph yet.</div>
       ) : (
@@ -114,7 +114,7 @@ function GpuCard() {
 
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg p-4">
-      <h2 className="font-semibold mb-3">GPU</h2>
+      <h2 className="font-semibold mb-3" title="Models load into VRAM on demand and auto-unload after sitting idle — an empty list here is normal">GPU</h2>
       {!g?.available && <div className="text-forge-muted text-sm">GPU not available.</div>}
       {g?.available && (
         <>
@@ -145,6 +145,7 @@ function GpuCard() {
                   className="ml-auto text-xs text-forge-muted hover:text-forge-accent"
                   onClick={() => unload.mutate(m.name)}
                   disabled={unload.isPending}
+                  title="Free this model's VRAM now (it reloads automatically next time it's needed)"
                 >
                   unload
                 </button>
@@ -186,7 +187,7 @@ function CommunitiesCard() {
           onClick={() => build.mutate()}
           disabled={build.isPending}
           className="ml-auto text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge disabled:opacity-50"
-          title="Rebuild hierarchical community summaries from the current graph"
+          title="Re-clusters the whole entity graph (Leiden) and writes fresh LLM topic summaries. Run after ingesting or extracting a batch of documents — takes a while on a large graph"
         >
           {build.isPending ? "queuing…" : "rebuild"}
         </button>
@@ -560,6 +561,7 @@ function VerificationCard() {
           onClick={() => verify.refetch()}
           disabled={verify.isFetching}
           className="bg-forge-accent text-black font-semibold rounded px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50"
+          title="The strictest check: proves every stored artifact is present and well-formed, with exact counts. Read-only. PASS means zero violations anywhere"
         >
           {verify.isFetching ? "Verifying… (full scans, ~1-2 min)" : "Run verification"}
         </button>
@@ -697,13 +699,19 @@ function VerificationCard() {
 
 // ---------------------------------------------------------------- audit
 
-const AUDIT_ASPECTS: Array<{ key: string; label: string }> = [
-  { key: "pages", label: "pages" },
-  { key: "text", label: "page text" },
-  { key: "text_embedding", label: "text embed" },
-  { key: "visual_embedding", label: "visual embed" },
-  { key: "chunks", label: "chunks" },
-  { key: "entities", label: "entities" },
+const AUDIT_ASPECTS: Array<{ key: string; label: string; tip: string }> = [
+  { key: "pages", label: "pages",
+    tip: "Was every PDF page registered and rendered? Shows Page nodes vs pages in the PDF. Red = ingestion died early; delete and re-ingest." },
+  { key: "text", label: "page text",
+    tip: "Does each page have extracted text? Scanned PDFs have none from the PDF itself — amber here means OCR text exists in chunks and can be recovered with one click." },
+  { key: "text_embedding", label: "text embed",
+    tip: "Every page with text should have a 1024-dim BGE-M3 vector (used by semantic/hybrid search). Counts show embedded / needed." },
+  { key: "visual_embedding", label: "visual embed",
+    tip: "Every non-blank page should have Nemotron 128-dim visual vectors (used by Visual search). Counts show embedded / needed." },
+  { key: "chunks", label: "chunks",
+    tip: "Docling structural chunks with LLM summaries — the primary retrieval unit for semantic and hybrid search. Counts show pages with chunks / pages that should have them." },
+  { key: "entities", label: "entities",
+    tip: "LLM-extracted Materials, Processes, Standards, and Equipment per page — this feeds the knowledge graph. Counts show pages extracted / text pages. Some pages legitimately contain no entities; those still count once extraction has run on them." },
 ];
 
 const AUDIT_CIRCLE: Record<string, string> = {
@@ -1078,6 +1086,7 @@ function CompletenessCard() {
           }}
           disabled={audit.isFetching}
           className="bg-forge-accent text-black font-semibold rounded px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50"
+          title="Scans the whole database (~10 s) and shows which pipeline steps are complete per document. Read-only — changes nothing"
         >
           {audit.isFetching ? "Auditing… (full page scan)" : report ? "Re-run audit" : "Run audit"}
         </button>
@@ -1124,13 +1133,13 @@ function CompletenessCard() {
       {report && !audit.isFetching && (
         <>
           <div className="flex items-center gap-2 flex-wrap mb-3 text-xs">
-            <span className="border border-emerald-500/50 text-emerald-400 rounded px-2 py-0.5">
+            <span className="border border-emerald-500/50 text-emerald-400 rounded px-2 py-0.5" title="Documents where every pipeline step is fully done">
               {report.summary.complete} complete
             </span>
-            <span className="border border-amber-500/50 text-amber-400 rounded px-2 py-0.5">
+            <span className="border border-amber-500/50 text-amber-400 rounded px-2 py-0.5" title="Documents with at least one step missing or partial — expand a row's fix button to repair">
               {report.summary.incomplete} incomplete
             </span>
-            <span className="border border-rose-500/50 text-rose-400 rounded px-2 py-0.5">
+            <span className="border border-rose-500/50 text-rose-400 rounded px-2 py-0.5" title="Documents with unrepairable problems (no pages, wrong-dimension embeddings) — these need re-ingest or re-embed">
               {report.summary.error} error
             </span>
             <label className="ml-auto flex items-center gap-1.5 cursor-pointer text-forge-muted">
@@ -1139,7 +1148,7 @@ function CompletenessCard() {
                 checked={showAll}
                 onChange={(e) => setShowAll(e.target.checked)}
               />
-              show complete docs too
+              <span title="By default only documents with problems are listed">show complete docs too</span>
             </label>
           </div>
 
@@ -1244,7 +1253,11 @@ function CompletenessCard() {
                     <th className="px-2 py-1.5 font-normal">document</th>
                     <th className="px-2 py-1.5 font-normal">collection</th>
                     {AUDIT_ASPECTS.map((a) => (
-                      <th key={a.key} className="px-2 py-1.5 font-normal">
+                      <th
+                        key={a.key}
+                        className="px-2 py-1.5 font-normal cursor-help underline decoration-dotted decoration-forge-muted/40 underline-offset-2"
+                        title={a.tip}
+                      >
                         {a.label}
                       </th>
                     ))}
@@ -1437,7 +1450,7 @@ function DocumentsTable() {
               onClick={() => bulkRebuild.mutate({})}
               disabled={bulkRebuild.isPending}
               className="px-2 py-1 text-xs rounded border border-forge-edge hover:bg-forge-bg disabled:opacity-50"
-              title="Full chunk rebuild + Phase 3 entity re-extraction"
+              title="For each selected document: re-run Docling chunking, summaries, and embeddings, then re-extract entities on pages missing topic tags. The heavy option"
             >
               {bulkRebuild.isPending ? "queuing…" : `rebuild (${selected.size})`}
             </button>
@@ -1445,7 +1458,7 @@ function DocumentsTable() {
               onClick={() => bulkRebuild.mutate({ extract_only: true })}
               disabled={bulkRebuild.isPending}
               className="px-2 py-1 text-xs rounded border border-forge-edge hover:bg-forge-bg disabled:opacity-50"
-              title="Only re-extract entities on pages missing topic_tags (cheap resume)"
+              title="Skip chunking — only re-run LLM entity extraction on pages missing topic tags. Cheap way to resume after extraction failures"
             >
               extract-only
             </button>
@@ -1453,13 +1466,14 @@ function DocumentsTable() {
               onClick={() => bulkRebuild.mutate({ only_missing: true })}
               disabled={bulkRebuild.isPending}
               className="px-2 py-1 text-xs rounded border border-forge-edge hover:bg-forge-bg disabled:opacity-50"
-              title="Only rebuild docs that don't have chunks yet"
+              title="Rebuild only the selected documents that have no chunks at all — documents that already have chunks are skipped"
             >
               only-missing
             </button>
             <button
               onClick={() => setSelected(new Set())}
               className="px-2 py-1 text-xs rounded border border-forge-edge hover:bg-forge-bg"
+              title="Deselect all documents"
             >
               clear
             </button>
@@ -1601,21 +1615,21 @@ function DocRow({
             <ActionBtn onClick={() => setSuggesting(!suggesting)} title="LLM-suggest collection, categories, and tags">
               {suggesting ? "close" : "suggest"}
             </ActionBtn>
-            <ActionBtn onClick={onRebuild} title="Rebuild chunks + re-extract entities (Phase 5)" disabled={rebuildPending}>
+            <ActionBtn onClick={onRebuild} title="Re-run Docling chunking + summaries + embeddings for this document, then re-extract entities on pages missing topic tags" disabled={rebuildPending}>
               {rebuildPending ? "…" : "rebuild"}
             </ActionBtn>
             <OverflowMenu>
               <MenuItem onClick={onExtractOnly} disabled={rebuildPending}>
-                extract-only · re-run entity extraction on untagged pages
+                extract-only · re-run LLM entity extraction on pages missing topic tags (no chunking)
               </MenuItem>
               <MenuItem onClick={onReembed} disabled={reembedPending}>
-                re-embed · legacy Phase 3 re-embed
+                re-embed · clear and regenerate ALL embeddings for this doc — hours of GPU; only needed after an embedding-model change
               </MenuItem>
               <MenuItem onClick={onExtract} disabled={extractPending}>
-                extract · legacy page-level entity extraction
+                extract · run entity extraction on pages not yet extracted (skips finished pages)
               </MenuItem>
               <MenuItem onClick={onDelete} danger>
-                delete · remove document and all pages
+                delete · permanently remove this document, its pages, and its images — the PDF on your disk is untouched
               </MenuItem>
             </OverflowMenu>
           </div>

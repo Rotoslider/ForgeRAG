@@ -198,7 +198,7 @@ function UploadForm() {
           </label>
           <div className="flex flex-wrap gap-2 mb-2">
             <label className="text-xs border border-forge-edge rounded px-3 py-1.5 cursor-pointer hover:bg-forge-edge">
-              Add files…
+              <span title="Pick one or more PDFs">Add files…</span>
               <input
                 type="file"
                 accept="application/pdf"
@@ -211,7 +211,7 @@ function UploadForm() {
               />
             </label>
             <label className="text-xs border border-forge-edge rounded px-3 py-1.5 cursor-pointer hover:bg-forge-edge">
-              Add folder…
+              <span title="Pick a folder — every PDF inside (including subfolders) is added">Add folder…</span>
               <input
                 ref={(el) => {
                   folderInputRef.current = el;
@@ -266,7 +266,7 @@ function UploadForm() {
           )}
         </div>
         <div>
-          <label className="block text-xs text-forge-muted mb-1">Collection</label>
+          <label className="block text-xs text-forge-muted mb-1" title="The top-level shelf a document lives on (e.g. robotics, electronics). Every document belongs to exactly one collection; pick an existing one or create a new one.">Collection</label>
           <div className="flex gap-2">
             <select
               value={newCollection ? "__new__" : collection}
@@ -303,7 +303,7 @@ function UploadForm() {
 
       <div className="grid md:grid-cols-2 gap-4 mb-4">
         <div>
-          <label className="block text-xs text-forge-muted mb-1">
+          <label className="block text-xs text-forge-muted mb-1" title="Optional domain classifications (Ctrl-click for several). Leave empty on the default collection and the LLM auto-tagger will suggest some from the content.">
             Categories ({selectedCats.length} selected)
           </label>
           <select
@@ -323,7 +323,7 @@ function UploadForm() {
         </div>
 
         <div>
-          <label className="block text-xs text-forge-muted mb-1">
+          <label className="block text-xs text-forge-muted mb-1" title="Optional free-form topic labels. Leave empty on the default collection and the auto-tagger fills them in; setting any manually turns auto-tagging off for this upload.">
             Tags ({selectedTags.length} selected)
           </label>
           <div className="flex gap-2 mb-2">
@@ -555,19 +555,19 @@ function JobsList() {
         )}
         <span className="text-[10px] text-forge-muted ml-auto flex items-center gap-2">
           <span className="flex items-center gap-1">
-            <span className="h-2 w-2 rounded-full bg-emerald-500 inline-block" /> done
+            <span className="h-2 w-2 rounded-full bg-emerald-500 inline-block" /> <span title="Step finished successfully">done</span>
           </span>
           <span className="flex items-center gap-1">
-            <span className="h-2 w-2 rounded-full bg-amber-500 inline-block" /> partial
+            <span className="h-2 w-2 rounded-full bg-amber-500 inline-block" /> <span title="Step finished but some pages inside it failed — open the logs for details">partial</span>
           </span>
           <span className="flex items-center gap-1">
-            <span className="h-2 w-2 rounded-full bg-rose-500 inline-block" /> failed
+            <span className="h-2 w-2 rounded-full bg-rose-500 inline-block" /> <span title="Step failed — the reason is shown under the circles and in the logs">failed</span>
           </span>
           <span className="flex items-center gap-1">
-            <span className="h-2 w-2 rounded-full border border-amber-500/70 inline-block" /> skipped
+            <span className="h-2 w-2 rounded-full border border-amber-500/70 inline-block" /> <span title="Step deliberately not run (e.g. LLM offline, manual tags provided) — hover the circle for the reason">skipped</span>
           </span>
           <span className="flex items-center gap-1">
-            <span className="h-2 w-2 rounded-full border border-forge-muted/50 inline-block" /> not run
+            <span className="h-2 w-2 rounded-full border border-forge-muted/50 inline-block" /> <span title="Step has not started yet">not run</span>
           </span>
         </span>
       </div>
@@ -602,6 +602,17 @@ const STEP_LABELS: Record<string, string> = {
 };
 
 const stepLabel = (name: string) => STEP_LABELS[name] || name.replace(/_/g, " ");
+
+// What each job type actually does — shown on the job-type badge.
+const JOB_TYPE_TIPS: Record<string, string> = {
+  "ingest": "Full pipeline on an uploaded PDF: render pages, extract text, auto-tag, embed (text + visual), build chunks, extract entities, dedup",
+  "re-embed": "Clears and regenerates BOTH text and visual embeddings for a document (used after switching embedding models)",
+  "text-reembed": "Clears and regenerates only the text embeddings (visual untouched)",
+  "extract-entities": "LLM entity extraction on pages that haven't been extracted yet — skips finished pages",
+  "build-communities": "Rebuilds the GraphRAG topic communities across the whole library (Leiden clustering + LLM summaries)",
+  "rebuild-chunks": "Re-runs Docling chunking + per-chunk summaries + embeddings for a document",
+  "fill-missing": "Repair job from the completeness audit: processes ONLY missing artifacts (recovered text, embeddings, entities) — never redoes finished work",
+};
 
 const STEP_CIRCLE: Record<StepStatus, string> = {
   done: "bg-emerald-500",
@@ -782,14 +793,14 @@ function JobRowCard({ job }: { job: JobRow }) {
     <div className="bg-forge-panel border border-forge-edge rounded p-3">
       <div className="flex items-center gap-3 mb-1">
         <span className={`h-2 w-2 rounded-full ${color}`} />
-        <span className={`text-xs font-semibold uppercase ${typeColors[jobType] || ""}`}>
+        <span className={`text-xs font-semibold uppercase ${typeColors[jobType] || ""}`} title={JOB_TYPE_TIPS[jobType] || jobType}>
           {jobType}
         </span>
         <span className="font-semibold truncate flex-1">{job.filename}</span>
-        <span className="font-mono text-xs text-forge-muted">
+        <span className="font-mono text-xs text-forge-muted" title="Job status and the pipeline step it is currently on">
           {job.status} · {job.current_step}
         </span>
-        <span className="font-mono text-xs text-forge-muted">
+        <span className="font-mono text-xs text-forge-muted" title="Units processed / total for the current phase (pages, or chunks during chunk building)">
           {job.pages_processed}
           {job.pages_total ? ` / ${job.pages_total}` : ""}
         </span>

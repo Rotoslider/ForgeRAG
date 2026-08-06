@@ -75,6 +75,29 @@ export default function Search() {
   );
 }
 
+// Plain-language explanations shown under the search bar and as hover
+// tooltips — written for someone using the tool for the first time.
+const MODE_TIPS: Record<string, string> = {
+  answer:
+    "Answer: finds the best pages, has the vision LLM actually read them, and writes an answer with [Page N] citations. Slowest mode (30–120 s) but does the reading for you — use it for real questions.",
+  keyword:
+    "Keyword: literal text match with typo tolerance. The right tool for exact things — alloy codes, standard numbers, part names ('AISI 4140', 'AWS D1.1'). Fast.",
+  visual:
+    "Visual: matches how pages LOOK, not what they say — good for finding charts, phase diagrams, tables, or figures. Describe the visual content you want.",
+  semantic:
+    "Semantic: meaning-based text search — finds relevant passages even when they use different words than your query.",
+  hybrid:
+    "Hybrid: fuses keyword + vector (+ knowledge graph) rankings. Best all-round retrieval quality when you're browsing rather than asking.",
+};
+
+const STRATEGY_TIPS: Record<string, string> = {
+  rrf: "rrf (recommended): fuses BM25 keyword + dense vector rankings, then a cross-encoder reranks the top hits.",
+  graph_boosted: "graph_boosted: rrf plus a score boost for pages mentioning entities the query names.",
+  vector_first: "vector_first: pure dense-vector ranking — best for vague or conceptual queries.",
+  graph_first: "graph_first: starts from knowledge-graph entities matched in your query, then returns their pages.",
+  community: "community: returns whole GraphRAG topic clusters instead of pages — 'what do my documents cover about X'.",
+};
+
 function SearchInner() {
   const [searchParams, setSearchParams] = useSearchParams();
   const [query, setQuery] = useState(
@@ -189,6 +212,7 @@ function SearchInner() {
             placeholder="e.g. preheat requirements for P-1 materials"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            title="Answer mode: ask a full question. Keyword mode: type exact terms or codes (e.g. 'AISI 4140', 'AWS D1.1'). Visual mode: describe what the page looks like."
           />
         </div>
         <div>
@@ -197,6 +221,7 @@ function SearchInner() {
             value={mode}
             onChange={(e) => handleModeChange(e.target.value as Mode)}
             className="bg-forge-panel border border-forge-edge rounded px-2 py-2"
+            title={MODE_TIPS[mode]}
           >
             <option value="answer">Answer (reads pages, cites sources)</option>
             <option value="keyword">Keyword (exact code/term match)</option>
@@ -214,6 +239,7 @@ function SearchInner() {
               value={strategy}
               onChange={(e) => handleStrategyChange(e.target.value as HybridStrategy)}
               className="bg-forge-panel border border-forge-edge rounded px-2 py-2"
+              title={STRATEGY_TIPS[strategy]}
             >
               <option value="rrf">rrf (BM25 + dense + reranker)</option>
               <option value="graph_boosted">graph_boosted</option>
@@ -232,16 +258,24 @@ function SearchInner() {
             max={50}
             onChange={(e) => setLimit(parseInt(e.target.value) || 10)}
             className="bg-forge-panel border border-forge-edge rounded px-2 py-2 w-20"
+            title="How many results to return — in Answer mode, how many source pages the LLM reads (more pages = slower but more thorough)"
           />
         </div>
         <button
           type="submit"
           className="bg-forge-accent text-black font-semibold rounded px-4 py-2 hover:brightness-110 disabled:opacity-50"
           disabled={searchMutation.isPending || answerMutation.isPending}
+          title={mode === "answer"
+            ? "Retrieves the best pages, has the vision LLM read them, and writes an answer with [Page N] citations — expect 30–120 s"
+            : "Runs the search and lists matching pages"}
         >
           {(searchMutation.isPending || answerMutation.isPending) ? "Searching…" : mode === "answer" ? "Ask" : "Search"}
         </button>
       </form>
+      <p className="text-[11px] text-forge-muted mt-1.5">
+        {MODE_TIPS[mode]}
+        {mode === "hybrid" ? ` — ${STRATEGY_TIPS[strategy]}` : ""}
+      </p>
 
       {(searchMutation.isPending || answerMutation.isPending) && (
         <AnswerProgress inProgress isAnswer={mode === "answer"} />
