@@ -76,6 +76,96 @@ async def deep_verify(request: Request) -> ForgeResult:
     return ForgeResult(success=True, data=report)
 
 
+@router.post("/extract-missing-entities")
+async def extract_missing_entities(request: Request) -> ForgeResult:
+    """Queue entity extraction for EVERY document with unextracted text pages.
+
+    Server-side twin of the deep-verification entity_extraction_complete
+    check: finds all docs holding pages with text but neither entity
+    relationships nor the extracted-empty marker, and queues one
+    fill-missing(entities) job per doc. Long-running LLM work — jobs drain
+    in the background and are fully resumable.
+    """
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    docs = await neo4j.run_query(
+        """
+        MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
+        WHERE p.text_char_count > 0
+          AND p.entities_extracted_at IS NULL
+          AND NOT EXISTS {
+            (p)-[:MENTIONS_MATERIAL|DESCRIBES_PROCESS|REFERENCES_STANDARD|MENTIONS_EQUIPMENT]->()
+          }
+        WITH d, count(p) AS todo
+        RETURN d.doc_id AS doc_id, d.filename AS filename, todo
+        ORDER BY todo DESC
+        """,
+        timeout=600.0,
+    )
+    if not docs:
+        return ForgeResult(success=True, data={"queued": 0, "pages": 0,
+                                               "reason": "nothing to extract"})
+    queued = []
+    for r in docs:
+        job = await jobs.create(
+            source_path=f"(fill-missing of {r['doc_id']})",
+            filename=r["filename"], categories=[], tags=[],
+        )
+        asyncio.create_task(pipeline.run_fill_missing(
+            job.job_id, r["doc_id"],
+            do_text=False, do_visual=False, do_entities=True,
+        ))
+        queued.append({"doc_id": r["doc_id"], "job_id": job.job_id})
+    total_pages = sum(r["todo"] for r in docs)
+    logger.info("Queued entity-extraction drain: %d docs, %d pages",
+                len(queued), total_pages)
+    return ForgeResult(success=True, data={
+        "queued": len(queued), "pages": total_pages, "jobs": queued,
+    })
+
+
+@router.post("/recover-stranded-text")
+async def recover_stranded_text(request: Request) -> ForgeResult:
+    """Queue OCR text recovery (+ text embedding) for every document with
+    pages whose text exists only in chunks. Twin of the deep-verification
+    no_stranded_ocr_text check."""
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    docs = await neo4j.run_query(
+        """
+        MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
+        WHERE coalesce(p.text_char_count, 0) = 0
+          AND EXISTS { (p)-[:HAS_CHUNK]->(:Chunk) }
+        WITH d, count(p) AS todo
+        RETURN d.doc_id AS doc_id, d.filename AS filename, todo
+        """,
+        timeout=600.0,
+    )
+    if not docs:
+        return ForgeResult(success=True, data={"queued": 0, "pages": 0,
+                                               "reason": "nothing to recover"})
+    queued = []
+    for r in docs:
+        job = await jobs.create(
+            source_path=f"(fill-missing of {r['doc_id']})",
+            filename=r["filename"], categories=[], tags=[],
+        )
+        asyncio.create_task(pipeline.run_fill_missing(
+            job.job_id, r["doc_id"],
+            do_text=True, do_visual=False, do_entities=False,
+            do_recover_text=True,
+        ))
+        queued.append({"doc_id": r["doc_id"], "job_id": job.job_id})
+    return ForgeResult(success=True, data={
+        "queued": len(queued), "pages": sum(r["todo"] for r in docs),
+        "jobs": queued,
+    })
+
+
 @router.post("/backfill-blank-flags")
 async def backfill_blank_flags(request: Request) -> ForgeResult:
     """Compute is_blank on every page that doesn't have it yet.

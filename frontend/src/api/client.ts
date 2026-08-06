@@ -392,6 +392,24 @@ export interface VerifyReport {
 export const deepVerify = () =>
   request<VerifyReport>("/admin/verify", { timeoutMs: 15 * 60 * 1000 });
 
+// Server-computed drains for failing verification checks — the server finds
+// every affected document itself, so no audit run is required first.
+export const extractMissingEntitiesAll = () =>
+  request<{ queued: number; pages: number }>("/admin/extract-missing-entities", {
+    method: "POST",
+    timeoutMs: 10 * 60 * 1000,
+  });
+export const recoverStrandedTextAll = () =>
+  request<{ queued: number; pages: number }>("/admin/recover-stranded-text", {
+    method: "POST",
+    timeoutMs: 10 * 60 * 1000,
+  });
+export const backfillBlankFlags = () =>
+  request<{ queued: boolean; docs: number; pages: number }>(
+    "/admin/backfill-blank-flags",
+    { method: "POST" }
+  );
+
 export const fillMissingBulk = (body: {
   doc_ids: string[];
   text?: boolean;

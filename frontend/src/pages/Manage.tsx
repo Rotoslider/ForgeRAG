@@ -5,10 +5,13 @@ import {
   addDocumentTag,
   applyTags,
   auditCompleteness,
+  backfillBlankFlags,
   buildCommunities,
   deepVerify,
   deleteDocument,
+  extractMissingEntitiesAll,
   fillMissingBulk,
+  recoverStrandedTextAll,
   getBackupProgress,
   getBackupSettings,
   listBackups,
@@ -484,7 +487,40 @@ function BackupRestoreCard() {
 
 // ------------------------------------------------------------ verification
 
+// Failing verification checks that have a one-click server-side drain.
+// label may reference the check's violation count; note warns about cost.
+const VERIFY_FIXES: Record<string, {
+  label: (violations: number) => string;
+  note: string;
+  run: () => Promise<ForgeResultShape>;
+}> = {
+  entity_extraction_complete: {
+    label: (v) => `Extract missing entities now (${v.toLocaleString()} pages)`,
+    note: "Background LLM work at roughly 8–10 s/page — days for a large backlog. Fully resumable; jobs appear on the Ingest page and every page is stamped so nothing is ever re-paid.",
+    run: extractMissingEntitiesAll,
+  },
+  no_stranded_ocr_text: {
+    label: (v) => `Recover OCR text now (${v.toLocaleString()} pages)`,
+    note: "Copies Docling OCR text from chunks onto pages and embeds it — fast GPU work.",
+    run: recoverStrandedTextAll,
+  },
+  blank_flags_populated: {
+    label: (v) => `Backfill blank flags now (${v.toLocaleString()} pages)`,
+    note: "Computes is_blank from the reduced images — a few minutes of CPU.",
+    run: () => backfillBlankFlags(),
+  },
+};
+
+// Loose response shape shared by the verify-fix drains — queued is a count
+// for the job-per-doc endpoints and a boolean for the blank-flag backfill.
+interface ForgeResultShape {
+  success: boolean;
+  reason?: string | null;
+  data?: { queued?: number | boolean; pages?: number };
+}
+
 function VerificationCard() {
+  const qc = useQueryClient();
   const verify = useQuery({
     queryKey: ["deep-verify"],
     queryFn: deepVerify,
@@ -494,6 +530,27 @@ function VerificationCard() {
   });
   const report = verify.data?.data;
   const [showPassed, setShowPassed] = useState(false);
+  const [fixMsgs, setFixMsgs] = useState<Record<string, string>>({});
+  const fix = useMutation({
+    mutationFn: (checkName: string) => VERIFY_FIXES[checkName].run(),
+    onSuccess: (res, checkName) => {
+      const d = res.data as { queued?: number | boolean; pages?: number } | undefined;
+      setFixMsgs((prev) => ({
+        ...prev,
+        [checkName]:
+          `Queued — ${typeof d?.queued === "number" ? `${d.queued} jobs, ` : ""}` +
+          `${(d?.pages ?? 0).toLocaleString()} pages. Watch progress on the Ingest ` +
+          `page, then re-run verification once the queue drains.`,
+      }));
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+    },
+    onError: (err, checkName) => {
+      setFixMsgs((prev) => ({
+        ...prev,
+        [checkName]: `Failed to queue: ${(err as Error).message}`,
+      }));
+    },
+  });
 
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg p-5">
@@ -516,6 +573,15 @@ function VerificationCard() {
           >
             {report.verdict} — {report.checks_passed}/{report.checks_total} checks
             {report.checks_warned > 0 ? ` (${report.checks_warned} warnings)` : ""}
+            {report.verdict === "FAIL" && (
+              <span className="font-normal">
+                {" · failing: "}
+                {report.checks
+                  .filter((c) => c.status === "fail")
+                  .map((c) => c.name)
+                  .join(", ")}
+              </span>
+            )}
           </span>
         )}
         {report && (
@@ -573,6 +639,36 @@ function VerificationCard() {
                     )}
                     {c.detail && (
                       <div className="text-forge-muted">{c.detail}</div>
+                    )}
+                    {c.status !== "pass" && VERIFY_FIXES[c.name] && (
+                      <div className="mt-1.5">
+                        {fixMsgs[c.name] ? (
+                          <span
+                            className={
+                              fixMsgs[c.name].startsWith("Failed")
+                                ? "text-rose-400"
+                                : "text-emerald-400"
+                            }
+                          >
+                            {fixMsgs[c.name]}
+                          </span>
+                        ) : (
+                          <>
+                            <button
+                              disabled={fix.isPending}
+                              onClick={() => fix.mutate(c.name)}
+                              className="border border-forge-edge rounded px-2.5 py-1 hover:bg-forge-edge disabled:opacity-50 font-semibold"
+                            >
+                              {fix.isPending && fix.variables === c.name
+                                ? "Queueing…"
+                                : VERIFY_FIXES[c.name].label(c.violations)}
+                            </button>
+                            <div className="text-forge-muted mt-1">
+                              {VERIFY_FIXES[c.name].note}
+                            </div>
+                          </>
+                        )}
+                      </div>
                     )}
                     {c.samples.length > 0 && (
                       <details className="text-forge-muted">
