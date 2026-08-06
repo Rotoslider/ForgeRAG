@@ -453,6 +453,19 @@ Repairs are incremental and never redo finished work:
 
 Queued repairs appear on the Ingest page with their own step circles and logs. Re-run the audit afterwards to confirm everything is green.
 
+### Deep Verification — proving the database is intact
+
+Manage → **Deep Verification** → *Run verification* is the strictest check in the system: ~19 read-only integrity checks with exact counts and **zero sampling** across the whole library. Where the completeness audit answers "which steps ran per document", verification answers "is every artifact the pipeline claims to have produced actually present and well-formed":
+
+- page counts match the PDFs; page numbering contiguous; no duplicate pages, no orphan pages or chunks
+- every page's full-resolution and reduced image exists **on disk**
+- `text_char_count` matches the actual stored text on every page; blank flags populated; no OCR text stranded in chunks
+- every text page has a text embedding at **exactly** the configured dimension; every non-blank page has visual vectors whose stored blob is **byte-for-byte** `count × dim × 4` of float32
+- every chunk has text, a summary, a correct-dimension embedding, and a page link whose numbers agree
+- every text page has been entity-extracted (or carries the extracted-empty marker); entity nodes have their keys; communities have summaries; all btree/fulltext/vector indexes ONLINE
+
+The verdict is **PASS only at literally zero violations**; anything else lists the failing checks with violation counts and sample offenders. Failing checks that have an automated repair carry a **one-click fix button right on the row** (extract missing entities, recover OCR text, backfill blank flags) with an honest cost estimate before you commit to it. Takes ~1–2 minutes on a 100k-page library.
+
 ## Usage
 
 ### Search
@@ -469,6 +482,7 @@ Queued repairs appear on the Ingest page with their own step circles and logs. R
 - **Multi-select + bulk actions**: checkboxes on each row. Select multiple documents, then "rebuild (N)", "extract-only", or "only-missing" (skip docs that already have chunks). Jobs queue sequentially — pick a handful to run now or queue the whole library overnight.
 - **Backup & Restore**: configure backup destination, trigger full backups, monitor progress, and view available backups for restore.
 - **Pipeline Completeness**: audit every document's pipeline state (pages, embeddings + dimensions, chunks, entities) straight from the graph, then repair gaps incrementally — bulk buttons for library-wide fixes, a per-row "fix" panel for one document at a time.
+- **Deep Verification**: exact-count integrity proof of the whole database (images on disk, embedding dimensions, blob byte-integrity, duplicates/orphans, extraction coverage, index health) with one-click fixes on failing checks. PASS requires zero violations.
 - **Graph Stats**: live entity counts across the knowledge graph
 - **GPU**: VRAM usage, loaded models, manual unload
 - **Communities**: rebuild GraphRAG summaries from the entity graph
@@ -655,6 +669,9 @@ When ForgeRAG starts with an empty database (0 documents, 0 pages), the GUI show
 |--------|------|-------------|
 | GET | `/admin/audit/completeness` | Audit every document's pipeline completeness from graph state (embedding dims verified) |
 | GET | `/admin/verify` | Deep verification: ~19 exact-count integrity checks (images on disk, embedding dims, blob byte-integrity, duplicates/orphans, extraction coverage, index health). PASS requires zero violations |
+| POST | `/admin/extract-missing-entities` | Queue entity extraction for every doc with unextracted text pages (server finds them). Long-running background LLM work, resumable |
+| POST | `/admin/recover-stranded-text` | Queue OCR text recovery + embedding for every doc with pages whose text exists only in chunks |
+| POST | `/admin/backfill-blank-flags` | Compute is_blank on pages missing it (trackable background job) |
 | POST | `/admin/fill-missing` | Queue incremental gap-filling jobs. Body: `{doc_ids, text?, visual?, entities?}` — only missing pages are processed, nothing is cleared |
 | POST | `/admin/normalize-entities` | Merge duplicate entities that differ only by case/whitespace |
 | POST | `/admin/bulk-reembed` | Queue re-embed jobs for every document |
