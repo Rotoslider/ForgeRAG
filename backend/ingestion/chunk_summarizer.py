@@ -74,14 +74,24 @@ class ChunkSummarizer:
     def __init__(self, llm: LLMService):
         self.llm = llm
 
-    async def summarize(self, chunk: StructuralChunk) -> str:
-        """Return a summary for one chunk. Returns the raw text for short
-        chunks; returns an LLM-generated summary for longer ones. On LLM
-        failure, falls back to a truncated preview — so the chunk still
-        has *some* summary field populated."""
+    async def summarize(self, chunk: StructuralChunk) -> tuple[str, str]:
+        """Return (summary, source) for one chunk.
+
+        source is one of:
+        - "short":   chunk text is short enough to be its own summary
+        - "llm":     genuine LLM-generated summary
+        - "preview": LLM failed (or returned garbage) and the summary is a
+                     text-preview fallback
+
+        The caller MUST persist the source (Chunk.summary_source) — a
+        preview fallback is a degraded result that must stay identifiable
+        so the resummarize repair can regenerate it later. Silently storing
+        previews as real summaries is what left 18k+ chunks with fake
+        summaries during past LLM outages.
+        """
         text = chunk.text.strip()
         if len(text) < _SHORT_CHUNK_CHARS:
-            return text
+            return text, "short"
 
         user_parts = []
         if chunk.section_path:
@@ -109,7 +119,7 @@ class ChunkSummarizer:
                 "falling back to text preview",
                 chunk.chunk_id, exc,
             )
-            return text[:240]
+            return text[:240], "preview"
 
         summary = (raw or "").strip()
         # Strip common wrappers the model sometimes adds despite instructions.
@@ -119,26 +129,27 @@ class ChunkSummarizer:
         # Safety: if the LLM returned something far too long or clearly
         # malformed, fall back to the preview.
         if not summary or len(summary) > 600:
-            return text[:240]
-        return summary
+            return text[:240], "preview"
+        return summary, "llm"
 
     async def summarize_batch(
         self, chunks: Sequence[StructuralChunk], concurrency: int = 4,
-    ) -> list[str]:
+    ) -> list[tuple[str, str]]:
         """Summarize many chunks with bounded concurrency. Order of output
-        matches order of input."""
+        matches order of input. Each element is (summary, source) — see
+        summarize()."""
         import asyncio
 
         sem = asyncio.Semaphore(concurrency)
 
-        async def _one(i: int, c: StructuralChunk) -> tuple[int, str]:
+        async def _one(i: int, c: StructuralChunk) -> tuple[int, tuple[str, str]]:
             async with sem:
                 s = await self.summarize(c)
                 return i, s
 
         tasks = [asyncio.create_task(_one(i, c)) for i, c in enumerate(chunks)]
         results = await asyncio.gather(*tasks, return_exceptions=False)
-        out = [""] * len(chunks)
+        out: list[tuple[str, str]] = [("", "preview")] * len(chunks)
         for i, s in results:
             out[i] = s
         return out

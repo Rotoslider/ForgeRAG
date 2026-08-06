@@ -262,12 +262,24 @@ class IngestionPipeline:
                 try:
                     counts = await self._build_chunks(job_id, doc_id, file_hash, job.source_path)
                     n_chunks = counts.get("chunks", 0)
-                    await self.jobs.update_step(
-                        job_id, "building_chunks",
-                        "done" if n_chunks else "warning",
-                        detail=f"{n_chunks} chunks written" if n_chunks
-                        else "chunker produced no chunks",
-                    )
+                    n_preview = counts.get("preview_summaries", 0)
+                    if not n_chunks:
+                        await self.jobs.update_step(
+                            job_id, "building_chunks", "warning",
+                            detail="chunker produced no chunks",
+                        )
+                    elif n_preview:
+                        await self.jobs.update_step(
+                            job_id, "building_chunks", "warning",
+                            detail=f"{n_chunks} chunks written, but {n_preview} "
+                            "summaries fell back to text previews (LLM "
+                            "failures) — run 'Resummarize fallbacks' to repair",
+                        )
+                    else:
+                        await self.jobs.update_step(
+                            job_id, "building_chunks", "done",
+                            detail=f"{n_chunks} chunks written",
+                        )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Chunking failed for doc %s (continuing): %s", doc_id, exc
@@ -305,6 +317,15 @@ class IngestionPipeline:
                 )
                 await self.jobs.update_step(job_id, "extracting_entities", "running")
                 done, failed = await self._extract_entities(job_id, doc_id)
+                if done and failed == done:
+                    # Every page failed — the LLM endpoint is down, not a
+                    # per-page problem. Fail the job instead of completing
+                    # with a warning nobody reads.
+                    raise RuntimeError(
+                        f"entity extraction failed for all {done} pages — "
+                        "LLM endpoint unreachable? Pages remain unstamped "
+                        "and will be retried on the next run"
+                    )
                 if failed:
                     await self.jobs.update_step(
                         job_id, "extracting_entities", "warning",
@@ -377,6 +398,269 @@ class IngestionPipeline:
             await self.jobs.update_step(job_id, "building_graph", "error", detail=msg)
             await self.jobs.fail(job_id, msg)
 
+    # Chunks whose summary is a failure fallback: marked explicitly by
+    # current code, or detectable on legacy rows because the fallback was
+    # exactly the first 240 chars of the (stripped) text. Long chunks only —
+    # short chunks legitimately use their text as the summary.
+    _FALLBACK_SUMMARY_PREDICATE = (
+        "c.summary_source = 'preview' OR "
+        "(size(c.text) >= 400 AND c.summary IN "
+        "[left(c.text, 240), left(trim(c.text), 240)])"
+    )
+
+    async def run_resummarize(self, job_id: str) -> None:
+        """Regenerate chunk summaries that fell back to text previews.
+
+        Global job (all documents). For each fallback chunk: LLM summary,
+        re-embed (the retrieval vector is summary + text, so a new summary
+        needs a new vector), write back with summary_source='llm'. Chunks
+        whose regeneration fails again keep their preview marking and are
+        picked up by the next run — failures are never silently converted
+        into 'done'.
+
+        Deliberately NOT behind the ingestion job semaphore: semaphore
+        waiters wake in FIFO order, so queued bulk-drain jobs would starve
+        this repair for days. Its LLM calls are bounded by the LLMService
+        request cap and its embed batches are serialized by the GPU
+        manager — those are the actual shared resources.
+        """
+        current_job_id.set(job_id)
+        await self._run_resummarize_inner(job_id)
+
+    async def _run_resummarize_inner(self, job_id: str) -> None:
+        try:
+            await self.jobs.set_steps(job_id, ["resummarizing"])
+            if self.chunk_summarizer is None or self.text_embedding is None:
+                raise ValueError(
+                    "LLM and text embedding services are required to "
+                    "regenerate summaries"
+                )
+            assert self.gpu is not None
+
+            rows = await self.neo4j.run_query(
+                f"MATCH (c:Chunk) WHERE {self._FALLBACK_SUMMARY_PREDICATE} "
+                "RETURN count(c) AS n",
+                timeout=600.0,
+            )
+            total = rows[0]["n"] if rows else 0
+            await self.jobs.update(
+                job_id, status="processing", current_step="resummarizing",
+                pages_total=total, progress_pct=1.0,
+            )
+            if not total:
+                await self.jobs.update_step(
+                    job_id, "resummarizing", "done",
+                    detail="no fallback summaries found",
+                )
+                await self.jobs.complete(job_id)
+                return
+            await self.jobs.update_step(
+                job_id, "resummarizing", "running",
+                detail=f"{total} fallback summaries to regenerate",
+            )
+
+            done = 0
+            failed = 0
+            failed_ids: list[str] = []
+            BATCH = 100
+            while True:
+                batch = await self.neo4j.run_query(
+                    f"""
+                    MATCH (c:Chunk)
+                    WHERE ({self._FALLBACK_SUMMARY_PREDICATE})
+                      AND NOT c.chunk_id IN $skip
+                    RETURN c.chunk_id AS chunk_id,
+                           c.page_number AS page_number,
+                           c.chunk_type AS chunk_type,
+                           c.text AS text,
+                           c.section_path AS section_path
+                    LIMIT $batch
+                    """,
+                    {"skip": failed_ids, "batch": BATCH},
+                )
+                if not batch:
+                    break
+                chunks = [
+                    StructuralChunk(
+                        chunk_id=r["chunk_id"],
+                        page_number=r["page_number"] or 0,
+                        chunk_index=0,
+                        chunk_type=r["chunk_type"] or "text",
+                        text=r["text"] or "",
+                        section_path=list(r["section_path"] or []),
+                    )
+                    for r in batch
+                ]
+                results = await self.chunk_summarizer.summarize_batch(
+                    chunks, concurrency=2,
+                )
+                repaired: list[tuple[StructuralChunk, str, str]] = []
+                for ch, (summary, source) in zip(chunks, results):
+                    if source == "preview":
+                        # LLM failed again — leave the chunk marked so the
+                        # next run retries it; skip it in this run's queries.
+                        failed += 1
+                        failed_ids.append(ch.chunk_id)
+                        continue
+                    repaired.append((ch, summary, source))
+
+                if repaired:
+                    embed_inputs = [
+                        f"{s}\n\n{ch.text[:2000]}" for ch, s, _src in repaired
+                    ]
+                    async with self.gpu.load_scope("text_embedding"):
+                        vectors = await asyncio.to_thread(
+                            self.text_embedding.embed_documents, embed_inputs,
+                            batch_size=(
+                                self.settings.ingestion.text_embedding_batch_size
+                            ),
+                        )
+                    out = [
+                        {"chunk_id": ch.chunk_id, "summary": s,
+                         "source": src, "embedding": vec.tolist()}
+                        for (ch, s, src), vec in zip(repaired, vectors)
+                    ]
+                    await self.neo4j.run_write(
+                        """
+                        UNWIND $rows AS row
+                        MATCH (c:Chunk {chunk_id: row.chunk_id})
+                        SET c.summary = row.summary,
+                            c.embedding = row.embedding,
+                            c.summary_source = row.source
+                        """,
+                        {"rows": out},
+                    )
+
+                done += len(batch)
+                await self.jobs.update(
+                    job_id, pages_processed=done,
+                    progress_pct=min(99.0, 1.0 + 98.0 * done / max(total, 1)),
+                )
+
+            if done and failed == done:
+                raise RuntimeError(
+                    f"re-summarization failed for all {done} chunks — "
+                    "LLM endpoint unreachable? Chunks remain marked and "
+                    "will be retried on the next run"
+                )
+            if failed:
+                await self.jobs.update_step(
+                    job_id, "resummarizing", "warning",
+                    detail=f"{failed} of {done} chunks failed — "
+                    "run again to retry them",
+                )
+            else:
+                await self.jobs.update_step(
+                    job_id, "resummarizing", "done",
+                    detail=f"{done - failed} summaries regenerated",
+                )
+            await self.jobs.complete(job_id)
+            logger.info(
+                "Resummarize job %s: %d regenerated, %d failed",
+                job_id, done - failed, failed,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Resummarize job %s failed", job_id)
+            await self.jobs.update_step(
+                job_id, "resummarizing", "error", detail=str(exc)
+            )
+            await self.jobs.fail(job_id, str(exc))
+
+    async def run_autotag_missing(self, job_id: str) -> None:
+        """Auto-tag every unorganized document.
+
+        Unorganized = default collection with zero categories and zero
+        tags — the state a doc lands in when auto-tagging fails during
+        ingest (the failure is marked on the job step, but the doc itself
+        just looks untagged). Global job. Not behind the ingestion
+        semaphore (the LLM request cap is the shared-resource guard, and
+        queued bulk jobs would starve this repair). Documents that fail
+        again stay unorganized and are picked up by the next run.
+        """
+        current_job_id.set(job_id)
+        try:
+            await self.jobs.set_steps(job_id, ["auto_tagging"])
+            if self.auto_tagger is None:
+                raise ValueError("LLM service not configured — cannot auto-tag")
+            rows = await self.neo4j.run_query(
+                """
+                MATCH (d:Document)
+                WHERE coalesce(d.collection, 'default') = 'default'
+                  AND NOT (d)-[:IN_CATEGORY]->()
+                  AND NOT (d)-[:TAGGED_WITH]->()
+                RETURN d.doc_id AS doc_id
+                """,
+            )
+            total = len(rows)
+            await self.jobs.update(
+                job_id, status="processing", current_step="auto_tagging",
+                pages_total=total, progress_pct=1.0,
+            )
+            if not total:
+                await self.jobs.update_step(
+                    job_id, "auto_tagging", "done",
+                    detail="every document is organized",
+                )
+                await self.jobs.complete(job_id)
+                return
+            await self.jobs.update_step(
+                job_id, "auto_tagging", "running",
+                detail=f"{total} unorganized documents",
+            )
+            done = 0
+            failed = 0
+            no_text = 0
+            for r in rows:
+                try:
+                    detail = await self._auto_tag(r["doc_id"], "default")
+                    # suggest_for_doc returns None for docs with no usable
+                    # text — that is not a success, it's a doc whose text
+                    # extraction needs repair first. Count it separately so
+                    # "N documents tagged" is never claimed for no-ops.
+                    if detail == "no suggestions from LLM":
+                        no_text += 1
+                except Exception as exc:  # noqa: BLE001
+                    failed += 1
+                    logger.warning(
+                        "Auto-tag failed for doc %s: %s", r["doc_id"], exc
+                    )
+                done += 1
+                await self.jobs.update(
+                    job_id, pages_processed=done,
+                    progress_pct=min(99.0, 1.0 + 98.0 * done / total),
+                )
+            tagged = done - failed - no_text
+            if done and failed == done:
+                raise RuntimeError(
+                    f"auto-tagging failed for all {done} documents — "
+                    "LLM endpoint unreachable? Documents remain unorganized "
+                    "and will be retried on the next run"
+                )
+            parts = [f"{tagged} documents tagged"]
+            if no_text:
+                parts.append(
+                    f"{no_text} skipped (no text to analyze — repair text "
+                    "extraction first)"
+                )
+            if failed:
+                parts.append(f"{failed} failed — run again to retry")
+            await self.jobs.update_step(
+                job_id, "auto_tagging",
+                "warning" if (failed or no_text) else "done",
+                detail=", ".join(parts),
+            )
+            await self.jobs.complete(job_id)
+            logger.info(
+                "Autotag job %s: %d tagged, %d failed",
+                job_id, done - failed, failed,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Autotag job %s failed", job_id)
+            await self.jobs.update_step(
+                job_id, "auto_tagging", "error", detail=str(exc)
+            )
+            await self.jobs.fail(job_id, str(exc))
+
     async def run_extraction_only(self, job_id: str, doc_id: str) -> None:
         """Re-run only entity extraction for an already-ingested document.
 
@@ -399,6 +683,12 @@ class IngestionPipeline:
             )
             await self.jobs.update_step(job_id, "extracting_entities", "running")
             done, failed = await self._extract_entities(job_id, doc_id)
+            if done and failed == done:
+                raise RuntimeError(
+                    f"entity extraction failed for all {done} pages — "
+                    "LLM endpoint unreachable? Pages remain unstamped "
+                    "and will be retried on the next run"
+                )
             if failed:
                 await self.jobs.update_step(
                     job_id, "extracting_entities", "warning",
@@ -526,12 +816,22 @@ class IngestionPipeline:
                         pages_total=len(chunks), progress_pct=20.0,
                     )
                     await self.jobs.update_step(job_id, "summarizing", "running")
-                    summaries = await self.chunk_summarizer.summarize_batch(
+                    summarized = await self.chunk_summarizer.summarize_batch(
                         chunks, concurrency=4,
                     )
+                    summaries = [s for s, _src in summarized]
+                    sources = [src for _s, src in summarized]
+                    preview_count = sum(
+                        1 for src in sources if src == "preview"
+                    )
                     await self.jobs.update_step(
-                        job_id, "summarizing", "done",
-                        detail=f"{len(summaries)} summaries",
+                        job_id, "summarizing",
+                        "warning" if preview_count else "done",
+                        detail=(
+                            f"{preview_count} of {len(summaries)} summaries "
+                            "fell back to text previews (LLM failures) — "
+                            "run 'Resummarize fallbacks' to repair"
+                        ) if preview_count else f"{len(summaries)} summaries",
                     )
                     step = "embedding_chunks"
                     await self.jobs.update(
@@ -564,8 +864,9 @@ class IngestionPipeline:
                     for i in range(0, len(chunks), BATCH):
                         end = min(i + BATCH, len(chunks))
                         rows_to_write = []
-                        for ch, summ, vec in zip(
-                            chunks[i:end], summaries[i:end], vectors[i:end]
+                        for ch, summ, src, vec in zip(
+                            chunks[i:end], summaries[i:end],
+                            sources[i:end], vectors[i:end]
                         ):
                             rows_to_write.append({
                                 "chunk_id": ch.chunk_id,
@@ -574,6 +875,7 @@ class IngestionPipeline:
                                 "chunk_type": ch.chunk_type,
                                 "text": ch.text,
                                 "summary": summ,
+                                "summary_source": src,
                                 "section_path": ch.section_path,
                                 "embedding": vec.tolist(),
                                 "bbox": list(ch.bbox) if ch.bbox is not None else None,
@@ -588,12 +890,14 @@ class IngestionPipeline:
                                           c.chunk_type = row.chunk_type,
                                           c.text = row.text,
                                           c.summary = row.summary,
+                                          c.summary_source = row.summary_source,
                                           c.section_path = row.section_path,
                                           c.embedding = row.embedding,
                                           c.bbox = row.bbox,
                                           c.doc_id = $doc_id
                             ON MATCH SET  c.text = row.text,
                                           c.summary = row.summary,
+                                          c.summary_source = row.summary_source,
                                           c.section_path = row.section_path,
                                           c.chunk_type = row.chunk_type,
                                           c.embedding = row.embedding,
@@ -690,6 +994,12 @@ class IngestionPipeline:
                                 job_id, pages_processed=done,
                                 progress_pct=min(99.0, 75.0 + 24.0 * done / max(total, 1)),
                             )
+                    if total and failed == total:
+                        raise RuntimeError(
+                            f"entity extraction failed for all {total} pages — "
+                            "LLM endpoint unreachable? Pages remain unstamped "
+                            "and will be retried on the next run"
+                        )
                     if failed:
                         logger.warning(
                             "rebuild-chunks: %d/%d page extractions failed",
@@ -921,6 +1231,27 @@ class IngestionPipeline:
         do_entities: bool = False,
         do_recover_text: bool = False,
     ) -> None:
+        """Bounded entry point — see _run_fill_missing_inner for the work.
+
+        The bulk drain endpoints queue one fill-missing job per doc (hundreds
+        at once). Bounded by the same ingestion semaphore as uploads so they
+        drain a few at a time instead of all at once — the unbounded version
+        of this path is what overloaded the LLM server on 2026-08-06.
+        """
+        async with self._ingest_semaphore:
+            await self._run_fill_missing_inner(
+                job_id, doc_id,
+                do_text=do_text, do_visual=do_visual,
+                do_entities=do_entities, do_recover_text=do_recover_text,
+            )
+
+    async def _run_fill_missing_inner(
+        self, job_id: str, doc_id: str, *,
+        do_text: bool = True,
+        do_visual: bool = True,
+        do_entities: bool = False,
+        do_recover_text: bool = False,
+    ) -> None:
         """Fill ONLY missing artifacts for an already-ingested document.
 
         Never clears existing work — the underlying steps are incremental
@@ -1036,6 +1367,12 @@ class IngestionPipeline:
                         job_id, "extracting_entities", "running"
                     )
                     done, failed = await self._extract_entities(job_id, doc_id)
+                    if done and failed == done:
+                        raise RuntimeError(
+                            f"entity extraction failed for all {done} pages — "
+                            "LLM endpoint unreachable? Pages remain unstamped "
+                            "and will be retried on the next run"
+                        )
                     if failed:
                         await self.jobs.update_step(
                             job_id, "extracting_entities", "warning",
@@ -1663,7 +2000,17 @@ class IngestionPipeline:
             job_id, "building_chunks", "running",
             detail=f"summarizing {len(chunks)} chunks via LLM",
         )
-        summaries = await self.chunk_summarizer.summarize_batch(chunks, concurrency=4)
+        summarized = await self.chunk_summarizer.summarize_batch(chunks, concurrency=4)
+        summaries = [s for s, _src in summarized]
+        sources = [src for _s, src in summarized]
+        preview_count = sum(1 for src in sources if src == "preview")
+        if preview_count:
+            logger.warning(
+                "%d of %d chunk summaries fell back to text previews for doc %s "
+                "(LLM failures) — marked summary_source='preview' for the "
+                "resummarize repair",
+                preview_count, len(chunks), doc_id,
+            )
 
         # 3. Embed (summary + text concatenated produces the retrieval vector).
         # We embed the pair so a match on either the raw text or the summary
@@ -1696,8 +2043,9 @@ class IngestionPipeline:
         for i in range(0, len(chunks), BATCH):
             batch = chunks[i : i + BATCH]
             rows = []
-            for ch, summ, vec in zip(
-                batch, summaries[i : i + BATCH], vectors[i : i + BATCH]
+            for ch, summ, src, vec in zip(
+                batch, summaries[i : i + BATCH], sources[i : i + BATCH],
+                vectors[i : i + BATCH]
             ):
                 rows.append({
                     "chunk_id": ch.chunk_id,
@@ -1706,6 +2054,7 @@ class IngestionPipeline:
                     "chunk_type": ch.chunk_type,
                     "text": ch.text,
                     "summary": summ,
+                    "summary_source": src,
                     "section_path": ch.section_path,
                     "embedding": vec.tolist(),
                     "bbox": list(ch.bbox) if ch.bbox is not None else None,
@@ -1720,12 +2069,14 @@ class IngestionPipeline:
                               c.chunk_type = row.chunk_type,
                               c.text = row.text,
                               c.summary = row.summary,
+                              c.summary_source = row.summary_source,
                               c.section_path = row.section_path,
                               c.embedding = row.embedding,
                               c.bbox = row.bbox,
                               c.doc_id = $doc_id
                 ON MATCH SET  c.text = row.text,
                               c.summary = row.summary,
+                              c.summary_source = row.summary_source,
                               c.section_path = row.section_path,
                               c.chunk_type = row.chunk_type,
                               c.embedding = row.embedding,
@@ -1747,7 +2098,7 @@ class IngestionPipeline:
             total_written, doc_id,
             dict(_Counter(c.chunk_type for c in chunks)),
         )
-        return {"chunks": total_written}
+        return {"chunks": total_written, "preview_summaries": preview_count}
 
     # --------------------------------------------------------- post-ingestion dedup
 

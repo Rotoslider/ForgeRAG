@@ -152,6 +152,16 @@ class LLMService:
         self.settings = settings
         self._client: httpx.AsyncClient | None = None
         self.circuit_breaker = CircuitBreaker()
+        # Local LLM servers (LM Studio, llama-server) serve one request at a
+        # time. When many jobs run concurrently (bulk fill-missing queues one
+        # per doc), unthrottled requests all sit in the SERVER's queue, where
+        # time-in-queue counts against timeout_seconds — so requests time out
+        # having never started inference. Queue client-side instead: only
+        # max_concurrent_requests are in flight, so each request's timeout
+        # covers (almost) only its own inference.
+        self._request_slots = asyncio.Semaphore(
+            max(1, getattr(settings, "max_concurrent_requests", 2))
+        )
 
     async def start(self) -> None:
         self._client = httpx.AsyncClient(
@@ -207,18 +217,28 @@ class LLMService:
         if getattr(self.settings, "disable_thinking", False):
             payload["chat_template_kwargs"] = {"enable_thinking": False}
 
-        # Circuit breaker: fail fast if LM Studio is down
-        if not self.circuit_breaker.allow_request():
-            raise LLMTransientError(
-                f"LLM service circuit breaker open — "
-                f"{self.circuit_breaker.consecutive_failures} consecutive failures"
-            )
+        async with self._request_slots:
+            # Circuit breaker: fail fast if LM Studio is down. Checked after
+            # acquiring a slot so callers that waited in line still fail fast
+            # when the breaker opened while they were waiting.
+            if not self.circuit_breaker.allow_request():
+                raise LLMTransientError(
+                    f"LLM service circuit breaker open — "
+                    f"{self.circuit_breaker.consecutive_failures} consecutive failures"
+                )
 
-        try:
-            r = await self._client.post("/chat/completions", json=payload)
-        except httpx.RequestError as exc:
-            self.circuit_breaker.record_failure()
-            raise LLMTransientError(f"Request failed: {exc}") from exc
+            try:
+                r = await self._client.post("/chat/completions", json=payload)
+            except httpx.RequestError as exc:
+                self.circuit_breaker.record_failure()
+                # str() of httpx timeout exceptions is often empty — always
+                # include the exception type so the log says WHAT failed.
+                raise LLMTransientError(
+                    f"Request failed: {type(exc).__name__}: {exc}"
+                    if str(exc) else f"Request failed: {type(exc).__name__} "
+                    f"(no detail — likely timeout after "
+                    f"{self.settings.timeout_seconds}s)"
+                ) from exc
 
         if r.status_code >= 500:
             self.circuit_breaker.record_failure()
@@ -359,10 +379,10 @@ class LLMService:
                 ]
                 continue
 
-        # All retries exhausted. Surface enough detail for a future post-mortem
-        # — the raw `content` from the last attempt (if we have one) plus the
-        # last error. Callers (EntityExtractor) catch this and return an empty
-        # extraction, so ingestion continues.
+        # All retries exhausted. Surface enough detail for a future post-mortem.
+        # This MUST propagate to the per-page handler in the pipeline so the
+        # page is counted as failed and left unstamped for a later retry —
+        # never convert it into an empty result.
         raise LLMFatalError(
             f"Structured JSON call failed after retries: {last_err}"
         )

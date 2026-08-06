@@ -103,6 +103,14 @@ class AutoTagger:
         """Call the LLM to suggest organization for a document.
 
         sample_pages_text: text from the first 3-5 pages (after title/TOC).
+
+        LLM failures propagate — they must NOT be converted into a default
+        AutoTagResult, because defaults are indistinguishable from a real
+        "this belongs in the default collection" answer: the doc would land
+        unorganized with nothing marking that tagging never actually ran.
+        The pipeline's auto_tagging step catches the error, marks the step,
+        and continues the ingest; unorganized docs are then repairable via
+        the autotag-missing drain.
         """
         # Combine sample text, cap at ~3000 chars
         combined = "\n\n---\n\n".join(sample_pages_text)[:3000]
@@ -113,40 +121,36 @@ class AutoTagger:
             sample_text=combined,
         )
 
-        try:
-            result = await self.llm.chat_json_structured(
-                [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                ],
-                AutoTagResult,
-                max_tokens=1024,
-                temperature=0.1,
-            )
-            # Normalize collection name
-            result.collection = (
-                result.collection
-                .strip()
-                .lower()
-                .replace(" ", "_")
-                .replace("-", "_")
-            )
-            # Normalize tags
-            result.tags = [
-                t.strip().lower().replace(" ", "-")
-                for t in result.tags
-                if t.strip()
-            ]
-            logger.info(
-                "Auto-tag suggestion: collection=%s, categories=%s, tags=%s",
-                result.collection,
-                result.categories,
-                result.tags,
-            )
-            return result
-        except Exception as exc:
-            logger.warning("Auto-tagger failed (using defaults): %s", exc)
-            return AutoTagResult()
+        result = await self.llm.chat_json_structured(
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            AutoTagResult,
+            max_tokens=1024,
+            temperature=0.1,
+        )
+        # Normalize collection name
+        result.collection = (
+            result.collection
+            .strip()
+            .lower()
+            .replace(" ", "_")
+            .replace("-", "_")
+        )
+        # Normalize tags
+        result.tags = [
+            t.strip().lower().replace(" ", "-")
+            for t in result.tags
+            if t.strip()
+        ]
+        logger.info(
+            "Auto-tag suggestion: collection=%s, categories=%s, tags=%s",
+            result.collection,
+            result.categories,
+            result.tags,
+        )
+        return result
 
     async def suggest_for_doc(
         self,

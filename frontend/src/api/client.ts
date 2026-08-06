@@ -110,6 +110,7 @@ export function listDocuments(params: {
   category?: string;
   tag?: string;
   sourceType?: string;
+  search?: string;
   limit?: number;
   offset?: number;
 } = {}) {
@@ -117,9 +118,12 @@ export function listDocuments(params: {
   if (params.category) q.set("category", params.category);
   if (params.tag) q.set("tag", params.tag);
   if (params.sourceType) q.set("source_type", params.sourceType);
+  if (params.search) q.set("search", params.search);
   if (params.limit) q.set("limit", String(params.limit));
-  if (params.offset) q.set("offset", String(params.offset));
-  return request<DocumentRow[]>(`/documents${q.toString() ? "?" + q : ""}`);
+  if (params.offset !== undefined) q.set("offset", String(params.offset));
+  return request<{ documents: DocumentRow[]; total: number }>(
+    `/documents${q.toString() ? "?" + q : ""}`
+  );
 }
 
 export const getDocument = (id: string) => request<DocumentRow>(`/documents/${id}`);

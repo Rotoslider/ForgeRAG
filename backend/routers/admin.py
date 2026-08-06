@@ -126,6 +126,41 @@ async def extract_missing_entities(request: Request) -> ForgeResult:
     })
 
 
+@router.post("/resummarize-fallbacks")
+async def resummarize_fallbacks(request: Request) -> ForgeResult:
+    """Queue regeneration of chunk summaries that fell back to text previews
+    (LLM failures during past chunking runs). Twin of the deep-verification
+    chunk_summaries_genuine check. One global job; re-summarizes and
+    re-embeds each affected chunk. Fully resumable — chunks that fail again
+    stay marked and are picked up by the next run."""
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+    job = await jobs.create(
+        source_path="(resummarize fallback chunks)",
+        filename="(all documents)", categories=[], tags=[],
+    )
+    asyncio.create_task(pipeline.run_resummarize(job.job_id))
+    logger.info("Queued resummarize-fallbacks job %s", job.job_id)
+    return ForgeResult(success=True, data={"job_id": job.job_id})
+
+
+@router.post("/autotag-missing")
+async def autotag_missing(request: Request) -> ForgeResult:
+    """Queue auto-tagging for every unorganized document (default
+    collection, zero categories, zero tags) — the state left behind when
+    auto-tagging failed silently during past ingests. Twin of the
+    deep-verification documents_organized check. One global job."""
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+    job = await jobs.create(
+        source_path="(auto-tag unorganized docs)",
+        filename="(all documents)", categories=[], tags=[],
+    )
+    asyncio.create_task(pipeline.run_autotag_missing(job.job_id))
+    logger.info("Queued autotag-missing job %s", job.job_id)
+    return ForgeResult(success=True, data={"job_id": job.job_id})
+
+
 @router.post("/recover-stranded-text")
 async def recover_stranded_text(request: Request) -> ForgeResult:
     """Queue OCR text recovery (+ text embedding) for every document with

@@ -23,7 +23,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from backend.services.llm_service import LLMFatalError, LLMService, LLMTransientError
+from backend.services.llm_service import LLMService
 
 logger = logging.getLogger(__name__)
 
@@ -706,7 +706,15 @@ class EntityExtractor:
     async def extract_page(
         self, *, document_title: str, page_number: int, page_text: str
     ) -> PageExtraction:
-        """Extract entities from a single page. Returns empty PageExtraction on empty text."""
+        """Extract entities from a single page.
+
+        Returns an empty PageExtraction only for genuinely empty page text.
+        LLM failures (LLMTransientError / LLMFatalError) propagate to the
+        caller — they must NOT be converted into an empty extraction, because
+        an empty extraction is indistinguishable from "page has no entities":
+        the pipeline would stamp the page entities_extracted_at and the
+        completeness audit would never retry it.
+        """
         if not page_text or not page_text.strip():
             return PageExtraction()
 
@@ -721,23 +729,11 @@ class EntityExtractor:
             {"role": "user", "content": user_msg},
         ]
 
-        try:
-            # Standards-heavy pages (especially NFPA / ASME cross-reference
-            # appendices) can emit long extractions listing dozens of
-            # standards/clauses. Default max_tokens (4096) truncates the
-            # JSON mid-field. 8192 clears the vast majority of cases at
-            # a modest cost per page.
-            extraction = await self.llm.chat_json_structured(
-                messages, PageExtraction, max_tokens=8192,
-            )
-            return extraction
-        except LLMTransientError as exc:
-            logger.warning(
-                "Transient LLM error extracting page %d: %s", page_number, exc
-            )
-            return PageExtraction()  # skip this page; graph remains valid
-        except LLMFatalError as exc:
-            logger.error(
-                "Fatal LLM error extracting page %d: %s", page_number, exc
-            )
-            return PageExtraction()
+        # Standards-heavy pages (especially NFPA / ASME cross-reference
+        # appendices) can emit long extractions listing dozens of
+        # standards/clauses. Default max_tokens (4096) truncates the
+        # JSON mid-field. 8192 clears the vast majority of cases at
+        # a modest cost per page.
+        return await self.llm.chat_json_structured(
+            messages, PageExtraction, max_tokens=8192,
+        )

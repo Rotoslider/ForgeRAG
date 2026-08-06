@@ -318,6 +318,52 @@ async def run_verification(neo4j, settings) -> dict:
         len(rows), samples=rows[:SAMPLE],
     ))
 
+    # ---------------------------------------------------------- summaries
+    # A chunk summary must be genuine: either a real LLM summary or the
+    # intentional short-chunk case (text is its own summary). Preview
+    # fallbacks — stored when the LLM failed during chunking — are marked
+    # summary_source='preview' by current code and detectable on legacy
+    # rows as summary == first 240 chars of the (possibly stripped) text.
+    rows = await q("""
+        MATCH (c:Chunk)
+        WHERE c.summary_source = 'preview' OR
+              (size(c.text) >= 400 AND c.summary IN
+               [left(c.text, 240), left(trim(c.text), 240)])
+        RETURN c.chunk_id AS id, c.doc_id AS doc_id,
+               c.page_number AS page_number
+        LIMIT 100000
+    """)
+    checks.append(_check(
+        "chunk_summaries_genuine",
+        "No chunk summary is a failure-fallback text preview",
+        len(rows), samples=rows[:SAMPLE],
+        detail="run POST /admin/resummarize-fallbacks to regenerate"
+        if rows else None,
+    ))
+
+    # ------------------------------------------------------- organization
+    # An unorganized doc (default collection, no categories, no tags) is
+    # the footprint auto-tagging leaves when it fails during ingest. It can
+    # also be a legitimately unclassifiable doc, so this warns rather than
+    # fails.
+    rows = await q("""
+        MATCH (d:Document)
+        WHERE coalesce(d.collection, 'default') = 'default'
+          AND NOT (d)-[:IN_CATEGORY]->()
+          AND NOT (d)-[:TAGGED_WITH]->()
+        RETURN d.doc_id AS id, d.title AS title, d.filename AS filename
+        LIMIT 1000
+    """)
+    checks.append(_check(
+        "documents_organized",
+        "Every document has a collection, categories, or tags "
+        "(auto-tagging ran and produced something)",
+        len(rows), samples=rows[:SAMPLE],
+        status="warn" if rows else "pass",
+        detail="run POST /admin/autotag-missing to tag them"
+        if rows else None,
+    ))
+
     # ------------------------------------------------------------- indexes
     idx_rows = await q("SHOW INDEXES YIELD name, state, type RETURN name, state, type")
     by_name = {r["name"]: r for r in idx_rows}

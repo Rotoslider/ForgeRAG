@@ -255,9 +255,16 @@ def create_app() -> FastAPI:
             name="frontend-assets",
         )
 
+        # index.html must never be cached: each build renames the hashed
+        # JS/CSS bundles and deletes the old ones, so a cached index.html
+        # points at assets that 404 — the page renders blank until a hard
+        # refresh. no-cache forces revalidation on every load; the hashed
+        # assets themselves stay long-cacheable.
+        _INDEX_HEADERS = {"Cache-Control": "no-cache"}
+
         @app.get("/app", include_in_schema=False)
         async def _app_root() -> FileResponse:
-            return FileResponse(index_html)
+            return FileResponse(index_html, headers=_INDEX_HEADERS)
 
         @app.get("/app/{path:path}", include_in_schema=False)
         async def _spa_fallback(path: str, request: Request) -> FileResponse:
@@ -266,7 +273,7 @@ def create_app() -> FastAPI:
             candidate = frontend_dist / path
             if candidate.is_file():
                 return FileResponse(candidate)
-            return FileResponse(index_html)
+            return FileResponse(index_html, headers=_INDEX_HEADERS)
 
         logger.info("Frontend mounted from %s (SPA fallback enabled)", frontend_dist)
 

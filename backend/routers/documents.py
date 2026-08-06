@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from backend.models.common import ForgeResult
 from backend.models.documents import ApplyTagsRequest, CategoryCreate, TagCreate
+from backend.services.llm_service import LLMError
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +42,17 @@ async def list_documents(
     category: str | None = Query(None, description="Filter by category name"),
     tag: str | None = Query(None, description="Filter by tag name"),
     source_type: str | None = Query(None, description="digital_native/scanned/hybrid"),
+    search: str | None = Query(
+        None, description="Case-insensitive substring match on title or filename"
+    ),
     limit: int = Query(50, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ) -> ForgeResult:
-    """List documents with optional filtering. Includes page count and metadata."""
+    """List documents with optional filtering and pagination.
+
+    Returns {documents: [...], total: N} — total counts every match, not
+    just this page, so the UI can paginate past the page size.
+    """
     neo4j = request.app.state.neo4j
 
     where_clauses = []
@@ -62,8 +70,20 @@ async def list_documents(
     if source_type:
         where_clauses.append("d.source_type = $source_type")
         params["source_type"] = source_type
+    if search and search.strip():
+        where_clauses.append(
+            "(toLower(d.title) CONTAINS toLower($search) "
+            "OR toLower(d.filename) CONTAINS toLower($search))"
+        )
+        params["search"] = search.strip()
 
     where = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    count_rows = await neo4j.run_query(
+        f"MATCH (d:Document){where} RETURN count(d) AS n",
+        {k: v for k, v in params.items() if k not in ("limit", "offset")},
+    )
+    total = count_rows[0]["n"] if count_rows else 0
 
     query = f"""
         MATCH (d:Document){where}
@@ -82,7 +102,7 @@ async def list_documents(
         SKIP $offset LIMIT $limit
     """
     rows = await neo4j.run_query(query, params)
-    return ForgeResult(success=True, data=rows)
+    return ForgeResult(success=True, data={"documents": rows, "total": total})
 
 
 @router.put("/documents/{doc_id}/collection")
@@ -339,7 +359,14 @@ async def suggest_tags(doc_id: str, request: Request) -> ForgeResult:
     if not rows:
         raise HTTPException(status_code=404, detail=f"Document {doc_id} not found")
 
-    result = await pipeline.auto_tagger.suggest_for_doc(neo4j, doc_id)
+    try:
+        result = await pipeline.auto_tagger.suggest_for_doc(neo4j, doc_id)
+    except LLMError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"LLM request failed — try again once the LLM is "
+            f"reachable: {exc}",
+        ) from exc
     if result is None:
         # Diagnose *why* the helper came up dry so the caller sees something
         # useful instead of a generic error. Counts the three conditions the

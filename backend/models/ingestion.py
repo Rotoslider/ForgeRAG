@@ -27,6 +27,7 @@ JobStep = Literal[
     "summarizing",       # per-chunk LLM summaries
     "embedding_chunks",  # BGE-M3 embeddings over (summary + text)
     "writing_chunks",    # MERGE Chunk nodes + HAS_CHUNK edges
+    "resummarizing",     # regenerate preview-fallback chunk summaries
     "dedup_entities",    # post-ingestion near-duplicate entity merge
     "done",
     "error",

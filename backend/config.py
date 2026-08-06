@@ -78,6 +78,13 @@ class LLMSettings(BaseModel):
     max_tokens: int = 4096
     temperature: float = 0.1
     timeout_seconds: int = 300
+    # Cap on in-flight HTTP requests to the LLM server. Local servers
+    # (LM Studio, llama-server) process one request at a time; letting many
+    # concurrent jobs pile requests into the server's queue makes queue-wait
+    # count against timeout_seconds and requests time out before inference
+    # ever starts. Excess callers wait client-side instead (no timeout while
+    # waiting for a slot).
+    max_concurrent_requests: int = 2
     # Some models (Gemma 4 MoE) break under strict JSON schema grammar
     # enforcement and produce repetitive junk. Others (GLM reasoning
     # variants) work great with it. Toggle per model.

@@ -1342,14 +1342,42 @@ function CompletenessCard() {
   );
 }
 
+const DOCS_PAGE_SIZE = 100;
+
 function DocumentsTable() {
   const qc = useQueryClient();
+  // Search + pagination. searchInput is what the user is typing; search is
+  // the debounced value that actually hits the API (300ms after the last
+  // keystroke) so we don't fire a request per character.
+  const [searchInput, setSearchInput] = useState("");
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(0);
+  useEffect(() => {
+    const t = setTimeout(() => {
+      setSearch(searchInput.trim());
+      setPage(0); // a new search always starts at the first page
+    }, 300);
+    return () => clearTimeout(t);
+  }, [searchInput]);
+
   const { data } = useQuery({
-    queryKey: ["documents"],
-    queryFn: () => listDocuments({ limit: 100 }),
+    queryKey: ["documents", search, page],
+    queryFn: () =>
+      listDocuments({
+        search: search || undefined,
+        limit: DOCS_PAGE_SIZE,
+        offset: page * DOCS_PAGE_SIZE,
+      }),
     refetchInterval: 10000,
   });
-  const docs = data?.data || [];
+  const docs = data?.data?.documents || [];
+  const total = data?.data?.total ?? 0;
+  const pageCount = Math.max(1, Math.ceil(total / DOCS_PAGE_SIZE));
+  // If deletions (or a narrower search) shrink the result set below the
+  // current page, snap back to the last page that still exists.
+  useEffect(() => {
+    if (page > 0 && page >= pageCount) setPage(pageCount - 1);
+  }, [page, pageCount]);
 
   // Track which actions were just triggered so we can show feedback
   const [actionFeedback, setActionFeedback] = useState<Record<string, string>>({});
@@ -1442,7 +1470,40 @@ function DocumentsTable() {
           usable as the document list scrolls. Sits just above the sticky
           table header row. */}
       <div className="sticky top-0 z-30 bg-forge-panel px-4 py-3 border-b border-forge-edge rounded-t-lg flex items-center gap-3 flex-wrap">
-        <h2 className="font-semibold">Documents ({docs.length})</h2>
+        <h2 className="font-semibold">Documents ({total})</h2>
+        <input
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
+          placeholder="search title or filename…"
+          title="Case-insensitive search across every document's title and filename — not just the current page"
+          className="bg-forge-bg border border-forge-edge rounded px-2 py-1 text-xs w-56"
+        />
+        {total > DOCS_PAGE_SIZE && (
+          <span className="flex items-center gap-1 text-xs text-forge-muted">
+            <button
+              onClick={() => setPage((p) => Math.max(0, p - 1))}
+              disabled={page === 0}
+              className="px-2 py-1 rounded border border-forge-edge hover:bg-forge-bg disabled:opacity-40"
+            >
+              ‹ prev
+            </button>
+            <span className="px-1">
+              {page * DOCS_PAGE_SIZE + 1}–{Math.min(total, (page + 1) * DOCS_PAGE_SIZE)} of {total}
+            </span>
+            <button
+              onClick={() => setPage((p) => Math.min(pageCount - 1, p + 1))}
+              disabled={page >= pageCount - 1}
+              className="px-2 py-1 rounded border border-forge-edge hover:bg-forge-bg disabled:opacity-40"
+            >
+              next ›
+            </button>
+          </span>
+        )}
+        {search && (
+          <span className="text-xs text-forge-muted">
+            {total} match{total === 1 ? "" : "es"} for “{search}”
+          </span>
+        )}
         {selected.size > 0 && (
           <>
             <span className="text-xs text-forge-muted">{selected.size} selected</span>
