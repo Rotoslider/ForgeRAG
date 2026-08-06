@@ -484,6 +484,7 @@ function BackupRestoreCard() {
 
 const AUDIT_ASPECTS: Array<{ key: string; label: string }> = [
   { key: "pages", label: "pages" },
+  { key: "text", label: "page text" },
   { key: "text_embedding", label: "text embed" },
   { key: "visual_embedding", label: "visual embed" },
   { key: "chunks", label: "chunks" },
@@ -548,7 +549,12 @@ function DocFixButtons({
   doc: DocAudit;
   busy: boolean;
   queuedLabel: string | null;
-  onFill: (opts: { text: boolean; visual: boolean; entities: boolean }) => void;
+  onFill: (opts: {
+    text: boolean;
+    visual: boolean;
+    entities: boolean;
+    recover_text?: boolean;
+  }) => void;
   onChunks: () => void;
   onReembed: () => void;
 }) {
@@ -582,6 +588,18 @@ function DocFixButtons({
           No pages exist — delete this document in the table below and re-ingest
           the PDF; nothing can be repaired in place.
         </span>
+      )}
+      {doc.recoverable_text_pages > 0 && (
+        <button
+          disabled={busy}
+          onClick={() =>
+            onFill({ text: true, visual: false, entities: true, recover_text: true })
+          }
+          className={btn}
+          title="Copies Docling OCR text from this document's chunks onto its textless pages, then embeds and extracts entities from the recovered text — one job"
+        >
+          Recover OCR text + embed + extract ({doc.recoverable_text_pages} pages)
+        </button>
       )}
       {(textGap || visualGap) && (
         <button
@@ -631,7 +649,7 @@ function DocFixButtons({
           Re-embed (clears + regenerates)
         </button>
       )}
-      {!broken && !textGap && !visualGap && !entityGap && !chunksMissing && !chunksPartial && !dimError && (
+      {!broken && !textGap && !visualGap && !entityGap && !chunksMissing && !chunksPartial && !dimError && doc.recoverable_text_pages === 0 && (
         <span className="text-xs text-forge-muted">nothing fixable — all gaps resolved</span>
       )}
     </div>
@@ -718,7 +736,11 @@ function CompletenessCard() {
       setQueuedMsg(`Queued ${res.data?.queued ?? 0} fill-missing job(s).`);
       trackJobs(
         res.data?.jobs,
-        vars.entities ? "entity extraction" : "embedding fill"
+        vars.recover_text
+          ? "OCR text recovery"
+          : vars.entities
+          ? "entity extraction"
+          : "embedding fill"
       );
     },
   });
@@ -804,6 +826,9 @@ function CompletenessCard() {
     : [];
   const entityGapDocs = docsWhere("entities", ["missing", "partial"]);
   const chunkGapDocs = docsWhere("chunks", ["missing"]);
+  const recoverDocs = (report?.documents ?? [])
+    .filter((d) => d.recoverable_text_pages > 0)
+    .map((d) => d.doc_id);
   const wrongDimDocs = report
     ? (report.documents ?? []).filter(
         (d) =>
@@ -894,6 +919,24 @@ function CompletenessCard() {
           </div>
 
           <div className="flex gap-2 flex-wrap mb-3">
+            {recoverDocs.length > 0 && (
+              <button
+                disabled={busy}
+                onClick={() =>
+                  fill.mutate({
+                    doc_ids: recoverDocs,
+                    text: true,
+                    visual: false,
+                    entities: true,
+                    recover_text: true,
+                  })
+                }
+                className="text-xs border border-forge-edge rounded px-3 py-1.5 hover:bg-forge-edge disabled:opacity-50"
+                title="Scanned PDFs: copy Docling OCR text from chunks onto pages, then embed and extract entities from it"
+              >
+                Recover OCR text + embed + extract ({recoverDocs.length} docs)
+              </button>
+            )}
             {embedGapDocs.length > 0 && (
               <button
                 disabled={busy}

@@ -344,6 +344,7 @@ export interface DocAudit {
   pages: number;
   declared_pages: number;
   chunk_count: number;
+  recoverable_text_pages: number;
   overall: "complete" | "incomplete" | "error";
   aspects: Record<string, AuditAspect>;
 }
@@ -372,6 +373,7 @@ export const fillMissingBulk = (body: {
   text?: boolean;
   visual?: boolean;
   entities?: boolean;
+  recover_text?: boolean;
 }) =>
   request<{ queued: number; not_found: number; jobs: Array<{ doc_id: string; job_id: string }> }>(
     "/admin/fill-missing",

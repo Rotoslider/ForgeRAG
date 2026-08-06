@@ -53,6 +53,9 @@ WITH d, p,
      CASE WHEN p IS NOT NULL AND (p.entities_extracted_at IS NOT NULL OR EXISTS {
               (p)-[:MENTIONS_MATERIAL|DESCRIBES_PROCESS|REFERENCES_STANDARD|MENTIONS_EQUIPMENT]->()
           }) THEN 1 ELSE 0 END AS extraction_done,
+     CASE WHEN p IS NOT NULL AND coalesce(p.text_char_count, 0) = 0
+               AND EXISTS { (p)-[:HAS_CHUNK]->(:Chunk) }
+          THEN 1 ELSE 0 END AS text_recoverable,
      CASE WHEN p.topic_tags IS NOT NULL AND size(p.topic_tags) > 0
           THEN 1 ELSE 0 END AS has_topic_tags
 RETURN d.doc_id AS doc_id,
@@ -72,6 +75,7 @@ RETURN d.doc_id AS doc_id,
        sum(has_chunks) AS pages_with_chunks,
        sum(has_entities) AS pages_with_entities,
        sum(extraction_done) AS pages_extraction_done,
+       sum(text_recoverable) AS pages_text_recoverable,
        sum(has_topic_tags) AS pages_with_topic_tags
 ORDER BY d.title
 """
@@ -124,8 +128,18 @@ def derive_doc_audit(
     else:
         aspects["pages"] = _aspect("done", pages, declared or pages)
 
-    # --- text extraction (informational: scanned docs legitimately have none)
-    if pages > 0 and pages_with_text == 0 and row.get("source_type") == "digital_native":
+    # --- page text. Recoverable pages (chunks carry Docling OCR text but
+    # the page itself has none — scanned PDFs) are a real, fixable gap:
+    # keyword search, page text-embedding, and entity extraction all read
+    # Page.extracted_text and silently lose those pages until recovery.
+    recoverable = row.get("pages_text_recoverable") or 0
+    if recoverable > 0:
+        aspects["text"] = _aspect(
+            "partial", pages_with_text, pages_with_text + recoverable,
+            f"{recoverable} pages have OCR text in chunks but no page text — "
+            "recover it to enable keyword search and entity extraction",
+        )
+    elif pages > 0 and pages_with_text == 0 and row.get("source_type") == "digital_native":
         aspects["text"] = _aspect(
             "partial", 0, pages,
             "digital-native PDF but no page has extracted text",
@@ -133,7 +147,7 @@ def derive_doc_audit(
     else:
         aspects["text"] = _aspect(
             "done", pages_with_text, pages,
-            None if pages_with_text else "no text pages (scanned document)",
+            None if pages_with_text else "no text pages (scanned document, no OCR text in chunks)",
         )
 
     # --- text embedding: every text page should carry a correct-dim vector
@@ -262,6 +276,9 @@ def derive_doc_audit(
         "pages": pages,
         "declared_pages": declared,
         "chunk_count": chunk_count,
+        # Machine-readable count for the UI's recover button — pages whose
+        # OCR text can be copied from chunks.
+        "recoverable_text_pages": recoverable,
         "overall": overall,
         "aspects": aspects,
     }
@@ -277,7 +294,7 @@ def summarize(docs: list[dict]) -> dict:
         "total_pages": sum(d["pages"] for d in docs),
     }
     gaps: dict[str, dict[str, int]] = {}
-    for aspect in ("pages", "text_embedding", "visual_embedding", "chunks", "entities"):
+    for aspect in ("pages", "text", "text_embedding", "visual_embedding", "chunks", "entities"):
         bad = [d for d in docs if d["aspects"][aspect]["status"] in ("missing", "partial", "error")]
         gaps[aspect] = {
             "docs": len(bad),

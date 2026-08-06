@@ -23,6 +23,7 @@ def _row(**overrides) -> dict:
         "pages_with_chunks": 90,
         "pages_with_entities": 80,
         "pages_extraction_done": 80,
+        "pages_text_recoverable": 0,
         "pages_with_topic_tags": 80,
         "chunks_built": False,
     }
@@ -154,6 +155,44 @@ def test_scanned_doc_with_docling_chunks_beyond_text_pages():
     e = d["aspects"]["entities"]
     assert e["status"] == "done"
     assert e["done"] == 1 and e["needed"] == 1
+    assert d["overall"] == "complete"
+
+
+def test_recoverable_ocr_text_flags_doc_incomplete():
+    """A scanned doc whose chunks carry Docling OCR text that never made it
+    onto the pages must be flagged — keyword search and entity extraction
+    silently lose those pages until the text is recovered."""
+    d = _audit(
+        _row(source_type="scanned", pages=499, declared_pages=499,
+             pages_with_text=1, blank_pages=0,
+             text_embedded=1, text_embedded_ok=1,
+             visual_embedded=499, visual_embedded_ok=499,
+             pages_with_chunks=391, pages_with_entities=0,
+             pages_extraction_done=1, pages_text_recoverable=390,
+             pages_with_topic_tags=0),
+        chunk_count=4922,
+    )
+    a = d["aspects"]["text"]
+    assert a["status"] == "partial"
+    assert a["needed"] == 391  # 1 text page + 390 recoverable
+    assert "OCR text in chunks" in a["detail"]
+    assert d["recoverable_text_pages"] == 390
+    assert d["overall"] == "incomplete"
+
+
+def test_scanned_doc_without_chunk_text_is_not_flagged():
+    """A pure scan where Docling also got nothing has no recovery path —
+    it must not be nagged as incomplete."""
+    d = _audit(
+        _row(source_type="scanned", pages_with_text=0, blank_pages=0,
+             text_embedded=0, text_embedded_ok=0,
+             visual_embedded=100, visual_embedded_ok=100,
+             pages_with_chunks=0, pages_with_entities=0,
+             pages_extraction_done=0, pages_text_recoverable=0,
+             pages_with_topic_tags=0),
+        chunk_count=0,
+    )
+    assert d["aspects"]["text"]["status"] == "done"
     assert d["overall"] == "complete"
 
 

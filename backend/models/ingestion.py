@@ -15,6 +15,7 @@ JobStep = Literal[
     "registering",       # compute hash, check dedup, create :Document
     "rendering_pages",   # PDF -> PNGs
     "extracting_text",   # PyMuPDF text + scanned detection
+    "recovering_text",   # copy Docling OCR text from chunks onto pages
     "auto_tagging",      # LLM collection/category/tag suggestion
     "embedding_text",    # Phase 3
     "embedding_visual",  # Phase 3 (ColPali)

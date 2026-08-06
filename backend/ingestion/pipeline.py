@@ -919,6 +919,7 @@ class IngestionPipeline:
         do_text: bool = True,
         do_visual: bool = True,
         do_entities: bool = False,
+        do_recover_text: bool = False,
     ) -> None:
         """Fill ONLY missing artifacts for an already-ingested document.
 
@@ -929,10 +930,18 @@ class IngestionPipeline:
         nothing. This is the repair path for completeness-audit gaps; use
         run_embeddings_only instead when the embedding MODEL changed and
         everything must be regenerated.
+
+        do_recover_text copies Docling OCR text from a page's chunks onto
+        Page.extracted_text for pages that have chunks but no text (scanned
+        PDFs — PyMuPDF finds no text layer, but Docling OCRs the images
+        during chunking). It runs first so the newly-texted pages are picked
+        up by the embedding and extraction steps in the same job.
         """
         current_job_id.set(job_id)
         step = None
         plan = []
+        if do_recover_text:
+            plan.append("recovering_text")
         if do_text:
             plan.append("embedding_text")
         if do_visual:
@@ -956,6 +965,19 @@ class IngestionPipeline:
                     f"Document {doc_id} has 0 pages — it was only partially "
                     "ingested. Delete it and re-ingest the PDF; there is "
                     "nothing to fill."
+                )
+
+            if do_recover_text:
+                step = "recovering_text"
+                await self.jobs.update(
+                    job_id, current_step="recovering_text", progress_pct=2.0
+                )
+                await self.jobs.update_step(job_id, "recovering_text", "running")
+                n = await self._recover_page_text(doc_id)
+                await self.jobs.update_step(
+                    job_id, "recovering_text", "done",
+                    detail=f"{n} pages recovered from chunk OCR text" if n
+                    else "nothing to recover",
                 )
 
             if do_text:
@@ -1033,6 +1055,55 @@ class IngestionPipeline:
             if step is not None:
                 await self.jobs.update_step(job_id, step, "error", detail=str(exc))
             await self.jobs.fail(job_id, str(exc))
+
+    async def _recover_page_text(self, doc_id: str) -> int:
+        """Copy chunk text onto pages that have chunks but no extracted text.
+
+        Scanned PDFs have no text layer, so PyMuPDF extraction leaves
+        Page.extracted_text empty — but Docling OCRs the page images during
+        chunking, so the real text exists on the :Chunk nodes. This copies
+        it back (ordered by chunk_index) so keyword search, text embedding,
+        and entity extraction work on scanned documents too.
+
+        Only touches pages with text_char_count 0/NULL — never overwrites
+        genuine PyMuPDF text. Returns the number of pages recovered.
+        """
+        rows = await self.neo4j.run_query(
+            """
+            MATCH (d:Document {doc_id: $id})-[:HAS_PAGE]->(p:Page)
+            WHERE coalesce(p.text_char_count, 0) = 0
+              AND EXISTS { (p)-[:HAS_CHUNK]->(:Chunk) }
+            MATCH (p)-[:HAS_CHUNK]->(c:Chunk)
+            WITH p, c ORDER BY c.chunk_index
+            RETURN p.page_id AS page_id, collect(c.text) AS texts
+            """,
+            {"id": doc_id},
+        )
+        payload = []
+        for r in rows:
+            text = "\n\n".join(t for t in r["texts"] if t and t.strip())
+            if text.strip():
+                payload.append({"page_id": r["page_id"], "text": text})
+        if not payload:
+            return 0
+
+        BATCH = 100
+        for i in range(0, len(payload), BATCH):
+            await self.neo4j.run_write(
+                """
+                UNWIND $rows AS row
+                MATCH (p:Page {page_id: row.page_id})
+                SET p.extracted_text = row.text,
+                    p.text_char_count = size(row.text),
+                    p.text_recovered_from_chunks = true
+                """,
+                {"rows": payload[i:i + BATCH]},
+            )
+        logger.info(
+            "Recovered chunk OCR text onto %d pages of doc %s",
+            len(payload), doc_id,
+        )
+        return len(payload)
 
     # ------------------------------------------------------------------ step 1
 

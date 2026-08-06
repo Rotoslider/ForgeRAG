@@ -61,6 +61,7 @@ Recent additions since the Phase 9 baseline:
 - **Per-job log viewer** — a "logs" button on each job card shows every backend log line captured while that job ran (including worker threads: Docling, rasterizer, model loading). Logs live-tail running jobs, persist in SQLite, and survive service restarts for post-mortems.
 - **Pipeline Completeness audit** — one click on the Manage page audits every document against the graph itself (no re-processing): page counts, text/visual embedding coverage with dimension verification, chunk coverage, and entity coverage. A ~100k-page library audits in seconds.
 - **Incremental gap repair** — fill-missing jobs process *only* pages lacking an artifact, never redoing finished work. Bulk buttons repair every affected doc at once; each problem row also has a per-document "fix" panel offering exactly the repairs that apply (fill embeddings, extract missing entities, build/rebuild chunks, or full re-embed for wrong-dimension vectors).
+- **OCR text recovery for scanned PDFs** — scanned documents have no text layer, so page-level extraction finds nothing; but Docling OCRs the page images during chunking, so the real text lives on the Chunk nodes. The audit flags these ("page text" column), and a one-click repair copies the OCR text back onto the pages, then embeds it and extracts entities from it — turning image-only books into fully searchable ones.
 
 ## Architecture
 
@@ -446,7 +447,8 @@ Manage → **Pipeline Completeness** → *Run audit* checks every document again
 Repairs are incremental and never redo finished work:
 
 - **Bulk buttons** (e.g. "Extract missing entities (N docs)") queue a repair job per affected document.
-- **Per-row "fix" panel** on any problem document offers only the repairs that apply: fill missing embeddings, extract missing entities, build/rebuild chunks, or — for wrong-dimension vectors from an old model — a full re-embed (the only case that clears anything).
+- **Per-row "fix" panel** on any problem document offers only the repairs that apply: fill missing embeddings, extract missing entities, build/rebuild chunks, recover OCR text, or — for wrong-dimension vectors from an old model — a full re-embed (the only case that clears anything).
+- **OCR text recovery**: for scanned PDFs (no text layer), Docling's OCR text is copied from the chunks back onto the pages, then embedded and entity-extracted in the same job — keyword search and the knowledge graph gain the whole book.
 
 Queued repairs appear on the Ingest page with their own step circles and logs. Re-run the audit afterwards to confirm everything is green.
 

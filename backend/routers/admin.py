@@ -69,7 +69,9 @@ async def fill_missing(request: Request, payload: dict | None = None) -> ForgeRe
         "doc_ids": ["...", ...],   # required
         "text": true,               # fill missing text embeddings
         "visual": true,             # fill missing visual embeddings
-        "entities": false           # re-run extraction on unextracted pages
+        "entities": false,          # re-run extraction on unextracted pages
+        "recover_text": false       # copy Docling OCR text from chunks onto
+                                    # textless pages (scanned PDFs) first
       }
     """
     if not isinstance(payload, dict):
@@ -78,11 +80,12 @@ async def fill_missing(request: Request, payload: dict | None = None) -> ForgeRe
     do_text = bool(payload.get("text", True))
     do_visual = bool(payload.get("visual", True))
     do_entities = bool(payload.get("entities", False))
+    do_recover = bool(payload.get("recover_text", False))
 
     if not isinstance(doc_ids, list) or not doc_ids:
         return ForgeResult(success=False, reason="doc_ids must be a non-empty list",
                            data={"queued": 0})
-    if not (do_text or do_visual or do_entities):
+    if not (do_text or do_visual or do_entities or do_recover):
         return ForgeResult(success=False, reason="nothing to do — enable at least one of text/visual/entities",
                            data={"queued": 0})
 
@@ -113,13 +116,14 @@ async def fill_missing(request: Request, payload: dict | None = None) -> ForgeRe
             pipeline.run_fill_missing(
                 job.job_id, doc_id,
                 do_text=do_text, do_visual=do_visual, do_entities=do_entities,
+                do_recover_text=do_recover,
             )
         )
         queued.append({"doc_id": doc_id, "job_id": job.job_id})
 
     logger.info(
-        "Queued %d fill-missing job(s) (text=%s visual=%s entities=%s)",
-        len(queued), do_text, do_visual, do_entities,
+        "Queued %d fill-missing job(s) (recover=%s text=%s visual=%s entities=%s)",
+        len(queued), do_recover, do_text, do_visual, do_entities,
     )
     return ForgeResult(
         success=True,
