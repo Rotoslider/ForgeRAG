@@ -2263,27 +2263,72 @@ class IngestionPipeline:
                     else:
                         winner_name, loser_name = name, cand_name
 
-                    # Redirect relationships and delete loser
+                    # Redirect relationships and delete loser. Cypher MERGE
+                    # needs a literal relationship type, so discover the
+                    # types actually touching the loser and redirect each
+                    # one separately (same pattern as
+                    # scripts/canonicalize_entity_apply.py). Type strings
+                    # come from the graph's own type(r) values, never user
+                    # input, so interpolating them is safe.
+                    params = {"winner": winner_name, "loser": loser_name}
+                    incoming = await self.neo4j.run_query(
+                        f"MATCH ()-[r]->(l:{label} {{{pk}: $loser}}) "
+                        "RETURN DISTINCT type(r) AS t",
+                        params,
+                    )
+                    for row in incoming:
+                        await self.neo4j.run_write(
+                            f"""
+                            MATCH (w:{label} {{{pk}: $winner}})
+                            MATCH (l:{label} {{{pk}: $loser}})
+                            OPTIONAL MATCH (src)-[r:{row['t']}]->(l)
+                            WITH w, src, r
+                            WHERE r IS NOT NULL AND src <> w
+                            MERGE (src)-[nr:{row['t']}]->(w)
+                            ON CREATE SET
+                                nr.support_count = coalesce(r.support_count, 0),
+                                nr.context = r.context
+                            ON MATCH SET
+                                nr.support_count = coalesce(nr.support_count, 0)
+                                                 + coalesce(r.support_count, 0)
+                            DELETE r
+                            """,
+                            params,
+                        )
+                    outgoing = await self.neo4j.run_query(
+                        f"MATCH (l:{label} {{{pk}: $loser}})-[r]->(t) "
+                        "RETURN DISTINCT type(r) AS t, labels(t)[0] AS tl",
+                        params,
+                    )
+                    for row in outgoing:
+                        await self.neo4j.run_write(
+                            f"""
+                            MATCH (w:{label} {{{pk}: $winner}})
+                            MATCH (l:{label} {{{pk}: $loser}})
+                            OPTIONAL MATCH (l)-[r:{row['t']}]->(tgt:{row['tl']})
+                            WITH w, tgt, r
+                            WHERE r IS NOT NULL AND tgt <> w
+                            MERGE (w)-[nr:{row['t']}]->(tgt)
+                            ON CREATE SET
+                                nr.support_count = coalesce(r.support_count, 0),
+                                nr.context = r.context
+                            ON MATCH SET
+                                nr.support_count = coalesce(nr.support_count, 0)
+                                                 + coalesce(r.support_count, 0)
+                            DELETE r
+                            """,
+                            params,
+                        )
+                    # Any leftover edges (self-references between the pair)
+                    # go down with the loser node.
                     await self.neo4j.run_write(
                         f"""
                         MATCH (w:{label} {{{pk}: $winner}})
                         MATCH (l:{label} {{{pk}: $loser}})
-                        OPTIONAL MATCH (src)-[r]->(l)
-                        WITH w, l, src, r
-                        WHERE r IS NOT NULL
-                        MERGE (src)-[nr]->(w)
-                        DELETE r
-                        WITH DISTINCT w, l
-                        OPTIONAL MATCH (l)-[r2]->(tgt)
-                        WITH w, l, tgt, r2
-                        WHERE r2 IS NOT NULL
-                        MERGE (w)-[nr2]->(tgt)
-                        DELETE r2
-                        WITH DISTINCT w, l
                         SET w.common_names = coalesce(w.common_names, []) + [$loser]
                         DETACH DELETE l
                         """,
-                        {"winner": winner_name, "loser": loser_name},
+                        params,
                     )
                     total_merged += 1
                     logger.debug(

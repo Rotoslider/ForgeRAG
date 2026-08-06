@@ -320,6 +320,58 @@ export const restartJob = (id: string) =>
     { method: "POST" }
   );
 
+// ---- Schedule & automation ----
+export interface ScheduleConfig {
+  enabled: boolean;
+  start: string; // "HH:MM"
+  end: string;
+  days: number[]; // 0-6, Mon=0
+}
+
+export interface WatchConfig {
+  enabled: boolean;
+  path: string;
+  collection: string;
+}
+
+export interface ScheduleStatus {
+  now: string;
+  pause_all: boolean;
+  window_open: boolean | null;
+  next_boundary: { at: string; action: "resume" | "pause" } | null;
+  watch: {
+    path_ok: boolean;
+    pending_files: number;
+    last_scan_at: string | null;
+    last_scan_note: string;
+    default_path: string;
+  };
+  events: Array<{ ts: string; message: string }>;
+}
+
+export interface SchedulePayload {
+  schedule: ScheduleConfig;
+  watch: WatchConfig;
+  status: ScheduleStatus;
+}
+
+export const getSchedule = () => request<SchedulePayload>("/schedule");
+export const updateSchedule = (patch: Partial<ScheduleConfig>) =>
+  request<SchedulePayload>("/schedule", {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
+export const updateWatch = (patch: Partial<WatchConfig>) =>
+  request<SchedulePayload>("/schedule/watch", {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
+export const scanWatchNow = () =>
+  request<{ queued: number; duplicates: number; waiting: number }>(
+    "/schedule/watch/scan-now",
+    { method: "POST" }
+  );
+
 // ---- Search ----
 export const searchSemantic = (query: string, limit = 10) =>
   request<SearchHit[]>("/search/semantic", {

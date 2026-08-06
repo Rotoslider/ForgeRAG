@@ -20,7 +20,12 @@ import {
 import type { DuplicateInfo } from "../api/client";
 import type { JobRow, JobStepRecord, StepStatus } from "../api/types";
 
-const fileKey = (f: File) => `${f.name}|${f.size}`;
+// Folder picks include subfolders, so two different "manual.pdf" files can
+// arrive in one selection — key and label by the relative path when the
+// browser provides one, falling back to the bare name for single-file picks.
+const fileLabel = (f: File) =>
+  (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name;
+const fileKey = (f: File) => `${fileLabel(f)}|${f.size}`;
 
 export default function Ingest() {
   return (
@@ -64,17 +69,17 @@ function UploadForm() {
   const [hashing, setHashing] = useState<{ done: number; total: number } | null>(null);
   const [precheckError, setPrecheckError] = useState<string | null>(null);
 
+  const filesInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
 
   const collections = collectionsResp?.data || [];
 
   const dedupByName = (current: File[], incoming: File[]): File[] => {
-    const seen = new Set(current.map((f) => `${f.name}|${f.size}`));
+    const seen = new Set(current.map(fileKey));
     const merged = [...current];
     for (const f of incoming) {
-      const key = `${f.name}|${f.size}`;
-      if (!seen.has(key)) {
-        seen.add(key);
+      if (!seen.has(fileKey(f))) {
+        seen.add(fileKey(f));
         merged.push(f);
       }
     }
@@ -205,40 +210,56 @@ function UploadForm() {
             Files ({files.length} selected)
           </label>
           <div className="flex flex-wrap gap-2 mb-2">
-            <label className="text-xs border border-forge-edge rounded px-3 py-1.5 cursor-pointer hover:bg-forge-edge">
-              <span title="Pick one or more PDFs">Add files…</span>
-              <input
-                type="file"
-                accept="application/pdf"
-                multiple
-                onChange={(e) => {
-                  addFiles(e.target.files);
-                  e.target.value = "";
-                }}
-                className="hidden"
-              />
-            </label>
-            <label className="text-xs border border-forge-edge rounded px-3 py-1.5 cursor-pointer hover:bg-forge-edge">
-              <span title="Pick a folder — every PDF inside (including subfolders) is added">Add folder…</span>
-              <input
-                ref={(el) => {
-                  folderInputRef.current = el;
-                  if (el) {
-                    // webkitdirectory isn't in the standard React types but is
-                    // the supported Chromium/Safari way to pick a directory.
-                    el.setAttribute("webkitdirectory", "");
-                    el.setAttribute("directory", "");
-                  }
-                }}
-                type="file"
-                multiple
-                onChange={(e) => {
-                  addFiles(e.target.files);
-                  e.target.value = "";
-                }}
-                className="hidden"
-              />
-            </label>
+            {/* Explicit buttons that .click() their hidden inputs: Chromium
+                forwards label activation to plain file inputs but not
+                reliably to webkitdirectory ones, so the label-wrap pattern
+                left "Add folder…" doing nothing. A programmatic click from
+                the button's own handler opens both pickers dependably. */}
+            <button
+              type="button"
+              onClick={() => filesInputRef.current?.click()}
+              className="text-xs border border-forge-edge rounded px-3 py-1.5 cursor-pointer hover:bg-forge-edge"
+              title="Pick one or more PDFs"
+            >
+              Add files…
+            </button>
+            <input
+              ref={filesInputRef}
+              type="file"
+              accept="application/pdf"
+              multiple
+              onChange={(e) => {
+                addFiles(e.target.files);
+                e.target.value = "";
+              }}
+              className="hidden"
+            />
+            <button
+              type="button"
+              onClick={() => folderInputRef.current?.click()}
+              className="text-xs border border-forge-edge rounded px-3 py-1.5 cursor-pointer hover:bg-forge-edge"
+              title="Pick a folder — every PDF inside (including subfolders) is added"
+            >
+              Add folder…
+            </button>
+            <input
+              ref={(el) => {
+                folderInputRef.current = el;
+                if (el) {
+                  // webkitdirectory isn't in the standard React types but is
+                  // the supported Chromium/Safari way to pick a directory.
+                  el.setAttribute("webkitdirectory", "");
+                  el.setAttribute("directory", "");
+                }
+              }}
+              type="file"
+              multiple
+              onChange={(e) => {
+                addFiles(e.target.files);
+                e.target.value = "";
+              }}
+              className="hidden"
+            />
             {files.length > 0 && (
               <button
                 type="button"
@@ -253,10 +274,12 @@ function UploadForm() {
             <div className="max-h-32 overflow-y-auto border border-forge-edge rounded bg-forge-bg">
               {files.map((f, i) => (
                 <div
-                  key={`${f.name}-${f.size}-${i}`}
+                  key={`${fileKey(f)}-${i}`}
                   className="flex items-center gap-2 px-2 py-1 text-xs border-b border-forge-edge last:border-b-0"
                 >
-                  <span className="flex-1 truncate font-mono">{f.name}</span>
+                  <span className="flex-1 truncate font-mono" title={fileLabel(f)}>
+                    {fileLabel(f)}
+                  </span>
                   <span className="text-forge-muted tabular-nums">
                     {(f.size / 1e6).toFixed(1)} MB
                   </span>

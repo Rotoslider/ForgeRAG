@@ -21,7 +21,7 @@ from backend.config import DEFAULT_CONFIG_PATH, get_settings
 from backend.ingestion.job_logs import install_job_log_handler
 from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pipeline import IngestionPipeline
-from backend.routers import admin, documents, graph, health, images, ingestion, search, skills, system
+from backend.routers import admin, documents, graph, health, images, ingestion, schedule, search, skills, system
 from backend.services.colpali_service import create_colpali_service
 from backend.services.nemotron_service import create_nemotron_service
 from backend.services.entity_matcher import EntityMatcher
@@ -29,6 +29,7 @@ from backend.services.image_service import ImageHighlighter
 from backend.services.gpu_manager import GPUManager
 from backend.services.llm_service import create_llm_service
 from backend.services.neo4j_service import Neo4jService
+from backend.services.job_scheduler import JobScheduler
 from backend.services.reranker_service import create_reranker_service
 from backend.services.text_embedding_service import create_text_embedding_service
 
@@ -195,10 +196,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.pipeline = pipeline
 
+    # Schedule & automation: processing-window resume/pause + watch-folder
+    # auto-ingest. Config persists in the job DB's meta table.
+    scheduler = JobScheduler(
+        job_manager=job_manager, pipeline=pipeline, settings=settings
+    )
+    await scheduler.start()
+    app.state.scheduler = scheduler
+
     logger.info("ForgeRAG startup complete on %s:%d", settings.server.host, settings.server.port)
     try:
         yield
     finally:
+        try:
+            await scheduler.stop()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("scheduler.stop failed: %s", exc)
         try:
             await llm_service.stop()
         except Exception as exc:  # noqa: BLE001
@@ -239,6 +252,7 @@ def create_app() -> FastAPI:
     app.include_router(system.router)
     app.include_router(graph.router)
     app.include_router(admin.router)
+    app.include_router(schedule.router)
     app.include_router(skills.router)
 
     # Frontend static mount (production build). Skipped if not built yet.

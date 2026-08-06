@@ -19,6 +19,8 @@ export default defineConfig({
       "/graph": "http://localhost:8200",
       "/system": "http://localhost:8200",
       "/images": "http://localhost:8200",
+      "/schedule": "http://localhost:8200",
+      "/admin": "http://localhost:8200",
     },
   },
   build: {

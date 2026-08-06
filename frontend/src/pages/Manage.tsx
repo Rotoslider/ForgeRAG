@@ -22,6 +22,7 @@ import {
   extractEntities,
   fetchHealth,
   getGpu,
+  getSchedule,
   graphStats,
   listCommunities,
   listDocuments,
@@ -29,12 +30,21 @@ import {
   rebuildChunks,
   rebuildChunksBulk,
   reembedDocument,
+  scanWatchNow,
   suggestTags,
   triggerFullBackup,
   unloadModel,
   updateBackupSettings,
+  updateSchedule,
+  updateWatch,
 } from "../api/client";
-import type { AuditReport, BackupSettingsData, DocAudit } from "../api/client";
+import type {
+  AuditReport,
+  BackupSettingsData,
+  DocAudit,
+  ScheduleConfig,
+  WatchConfig,
+} from "../api/client";
 import type { DocumentRow, JobRow } from "../api/types";
 
 export default function Manage() {
@@ -46,6 +56,7 @@ export default function Manage() {
         <GpuCard />
         <CommunitiesCard />
       </div>
+      <ScheduleCard />
       <BackupRestoreCard />
       <CompletenessCard />
       <VerificationCard />
@@ -214,6 +225,318 @@ function CommunitiesCard() {
           </li>
         ))}
       </ol>
+    </div>
+  );
+}
+
+const DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+function fmtWhen(iso: string): string {
+  const d = new Date(iso);
+  const today = new Date();
+  const day =
+    d.toDateString() === today.toDateString()
+      ? "today"
+      : d.toLocaleDateString(undefined, { weekday: "short" });
+  return `${day} ${d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`;
+}
+
+function ScheduleCard() {
+  const qc = useQueryClient();
+  const { data } = useQuery({
+    queryKey: ["schedule"],
+    queryFn: getSchedule,
+    refetchInterval: 5000,
+  });
+  const { data: collectionsResp } = useQuery({
+    queryKey: ["collections"],
+    queryFn: listCollections,
+  });
+  const payload = data?.data;
+  const status = payload?.status;
+
+  // Form state, seeded once from the server so live polling doesn't stomp
+  // on half-edited fields.
+  const [sched, setSched] = useState<ScheduleConfig | null>(null);
+  const [watch, setWatch] = useState<WatchConfig | null>(null);
+  const [note, setNote] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  useEffect(() => {
+    if (payload && sched === null) setSched(payload.schedule);
+    if (payload && watch === null) setWatch(payload.watch);
+  }, [payload, sched, watch]);
+
+  const refresh = () => qc.invalidateQueries({ queryKey: ["schedule"] });
+  const saveSched = useMutation({
+    mutationFn: (cfg: ScheduleConfig) => updateSchedule(cfg),
+    onSuccess: (res) => {
+      setNote(
+        res.success
+          ? { kind: "ok", text: "Schedule saved — takes effect within seconds." }
+          : { kind: "err", text: res.reason || "save failed" }
+      );
+      if (res.success && res.data) setSched(res.data.schedule);
+    },
+    onSettled: refresh,
+  });
+  const saveWatch = useMutation({
+    mutationFn: (cfg: WatchConfig) => updateWatch(cfg),
+    onSuccess: (res) => {
+      setNote(
+        res.success
+          ? { kind: "ok", text: "Watch folder saved." }
+          : { kind: "err", text: res.reason || "save failed" }
+      );
+      if (res.success && res.data) setWatch(res.data.watch);
+    },
+    onSettled: refresh,
+  });
+  const scanNow = useMutation({
+    mutationFn: scanWatchNow,
+    onSuccess: (res) => {
+      setNote(
+        res.success
+          ? {
+              kind: "ok",
+              text: `Scan done: ${res.data?.queued ?? 0} queued, ${res.data?.duplicates ?? 0} duplicate(s), ${res.data?.waiting ?? 0} waiting.`,
+            }
+          : { kind: "err", text: res.reason || "scan failed" }
+      );
+    },
+    onSettled: refresh,
+  });
+
+  const collections = collectionsResp?.data || [];
+  const busy = saveSched.isPending || saveWatch.isPending;
+
+  return (
+    <div className="bg-forge-panel border border-forge-edge rounded-lg p-5">
+      <div className="flex items-center gap-3 mb-1 flex-wrap">
+        <h2
+          className="font-semibold"
+          title="Automate the Pause all / Resume all switch on a daily window, and auto-ingest PDFs dropped into an inbox folder"
+        >
+          Schedule &amp; Automation
+        </h2>
+        {status && (
+          <span
+            className={`text-xs px-2 py-0.5 rounded ${
+              status.pause_all
+                ? "bg-amber-500/15 text-amber-300"
+                : "bg-emerald-500/15 text-emerald-300"
+            }`}
+            title="Live state of the global job switch (same one as the Ingest tab's Pause/Resume all button)"
+          >
+            jobs {status.pause_all ? "paused" : "running"}
+          </span>
+        )}
+        {status?.next_boundary && (
+          <span className="text-xs text-forge-muted">
+            next: {status.next_boundary.action === "resume" ? "resume" : "pause"}{" "}
+            {fmtWhen(status.next_boundary.at)}
+          </span>
+        )}
+      </div>
+      <p className="text-xs text-forge-muted mb-4">
+        Time-shift heavy work: keep the GPU free during the day and let repairs,
+        re-embeds, and inbox ingests run at night. The schedule drives the same
+        Pause all / Resume all switch as the Ingest tab — manual clicks still
+        work and simply hold until the next scheduled boundary.
+      </p>
+
+      <div className="grid md:grid-cols-2 gap-6">
+        {/* -------- processing window -------- */}
+        <div>
+          <h3 className="text-sm font-semibold mb-2">Processing window</h3>
+          {sched === null ? (
+            <div className="text-xs text-forge-muted">loading…</div>
+          ) : (
+            <>
+              <label className="flex items-center gap-2 text-sm mb-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={sched.enabled}
+                  onChange={(e) => setSched({ ...sched, enabled: e.target.checked })}
+                />
+                <span title="When enabled, jobs are automatically resumed at the start time and paused at the end time. Enabling applies the current window state immediately.">
+                  Only run jobs during this window
+                </span>
+              </label>
+              <div className="flex items-center gap-2 text-sm mb-3">
+                <span className="text-forge-muted text-xs">from</span>
+                <input
+                  type="time"
+                  value={sched.start}
+                  onChange={(e) => setSched({ ...sched, start: e.target.value })}
+                  className="bg-forge-bg border border-forge-edge rounded px-2 py-1 text-sm"
+                  title="Window start — jobs resume here (e.g. 21:00 for overnight work)"
+                />
+                <span className="text-forge-muted text-xs">to</span>
+                <input
+                  type="time"
+                  value={sched.end}
+                  onChange={(e) => setSched({ ...sched, end: e.target.value })}
+                  className="bg-forge-bg border border-forge-edge rounded px-2 py-1 text-sm"
+                  title="Window end — jobs pause here. May be past midnight (21:00 → 06:30 runs overnight)."
+                />
+                <span className="text-[10px] text-forge-muted">(overnight OK)</span>
+              </div>
+              <div className="flex flex-wrap gap-1.5 mb-3">
+                {DAY_LABELS.map((label, d) => {
+                  const on = sched.days.includes(d);
+                  return (
+                    <button
+                      key={label}
+                      type="button"
+                      onClick={() =>
+                        setSched({
+                          ...sched,
+                          days: on
+                            ? sched.days.filter((x) => x !== d)
+                            : [...sched.days, d].sort(),
+                        })
+                      }
+                      className={`text-xs rounded px-2 py-1 border ${
+                        on
+                          ? "border-forge-accent bg-forge-accent/20 text-forge-accent"
+                          : "border-forge-edge text-forge-muted hover:bg-forge-edge"
+                      }`}
+                      title={`Window starting on ${label} (an overnight window started ${label} evening runs into the next morning)`}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
+              </div>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => saveSched.mutate(sched)}
+                className="bg-forge-accent text-black font-semibold rounded px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50"
+              >
+                Save schedule
+              </button>
+            </>
+          )}
+        </div>
+
+        {/* -------- watch folder -------- */}
+        <div>
+          <h3 className="text-sm font-semibold mb-2">Watch folder (auto-ingest inbox)</h3>
+          {watch === null ? (
+            <div className="text-xs text-forge-muted">loading…</div>
+          ) : (
+            <>
+              <label className="flex items-center gap-2 text-sm mb-3 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={watch.enabled}
+                  onChange={(e) => setWatch({ ...watch, enabled: e.target.checked })}
+                />
+                <span title="PDFs dropped into the inbox are ingested automatically whenever job processing isn't paused — with a schedule on, they wait for the window. Files are picked up only once fully copied; duplicates are filed to duplicates/ untouched; ingested files move to ingested/.">
+                  Auto-ingest PDFs from an inbox folder
+                </span>
+              </label>
+              <div className="flex items-center gap-2 mb-2">
+                <input
+                  type="text"
+                  value={watch.path}
+                  onChange={(e) => setWatch({ ...watch, path: e.target.value })}
+                  placeholder={status?.watch.default_path || "absolute folder path"}
+                  className="bg-forge-bg border border-forge-edge rounded px-2 py-1 text-xs font-mono flex-1"
+                  title="Absolute path of the inbox folder. Leave empty to use the default (created for you)."
+                />
+                <button
+                  type="button"
+                  onClick={() => setWatch({ ...watch, path: "" })}
+                  className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge"
+                  title={`Use the default inbox: ${status?.watch.default_path || ""}`}
+                >
+                  default
+                </button>
+              </div>
+              <div className="flex items-center gap-2 mb-3">
+                <span className="text-xs text-forge-muted">collection</span>
+                <input
+                  type="text"
+                  list="watch-collections"
+                  value={watch.collection}
+                  onChange={(e) => setWatch({ ...watch, collection: e.target.value })}
+                  className="bg-forge-bg border border-forge-edge rounded px-2 py-1 text-xs flex-1"
+                  title='Collection for inbox ingests. Leave as "default" to let auto-tagging organize each document.'
+                />
+                <datalist id="watch-collections">
+                  {collections.map((c: { collection: string }) => (
+                    <option key={c.collection} value={c.collection} />
+                  ))}
+                </datalist>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => saveWatch.mutate(watch)}
+                  className="bg-forge-accent text-black font-semibold rounded px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50"
+                >
+                  Save watch folder
+                </button>
+                <button
+                  type="button"
+                  disabled={!payload?.watch.enabled || scanNow.isPending}
+                  onClick={() => scanNow.mutate()}
+                  className="text-xs border border-forge-edge rounded px-2 py-1.5 hover:bg-forge-edge disabled:opacity-50"
+                  title="Scan the inbox right now (skips the usual wait for files to finish copying). Queued jobs still respect Pause all."
+                >
+                  scan now
+                </button>
+              </div>
+              {payload?.watch.enabled && status && (
+                <div className="text-[11px] text-forge-muted mt-2 font-mono">
+                  {status.watch.path_ok
+                    ? `${status.watch.pending_files} PDF(s) in inbox`
+                    : "inbox folder missing!"}
+                  {status.watch.last_scan_at
+                    ? ` · last scan ${fmtWhen(status.watch.last_scan_at)} (${status.watch.last_scan_note})`
+                    : " · not scanned yet"}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {note && (
+        <div
+          className={`text-xs mt-3 ${note.kind === "ok" ? "text-emerald-400" : "text-rose-400"}`}
+        >
+          {note.text}
+        </div>
+      )}
+
+      {status && status.events.length > 0 && (
+        <div className="mt-4">
+          <h3
+            className="text-xs font-semibold text-forge-muted mb-1"
+            title="What the scheduler has done recently (window opened/closed, inbox files queued, config changes)"
+          >
+            Recent automation events
+          </h3>
+          <div className="max-h-28 overflow-y-auto border border-forge-edge rounded bg-forge-bg p-2 font-mono text-[11px] leading-4">
+            {status.events.map((e, i) => (
+              <div key={i}>
+                <span className="text-forge-muted/70">
+                  {new Date(e.ts).toLocaleString(undefined, {
+                    month: "short",
+                    day: "numeric",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                  })}{" "}
+                </span>
+                {e.message}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -12,6 +12,8 @@ Designed for personal/research use. Runs entirely on local hardware — no cloud
 
 ![Job control — "Pause all" holds every job after its current page/batch and frees the GPU; Resume all continues where they left off](docs/ForgeRAG-job-controls.png)
 
+![Schedule & Automation — a daily processing window drives Pause/Resume all automatically, and a watch folder auto-ingests dropped PDFs](docs/ForgeRAG-schedule.png)
+
 ![Manage — Graph stats, GPU status, communities, Backup & Restore, and the Pipeline Completeness audit](docs/ForgeRAG-manage.png)
 
 ![Pipeline Completeness — per-document audit with one-click incremental repairs](docs/ForgeRAG-completeness.png)
@@ -49,6 +51,9 @@ All phases complete.
 - [x] **Phase 12**: Job control — Active Jobs panel with live "now working on"
       labels, per-job pause/resume/stop/restart, and a persistent "Pause all
       (free GPU)" switch for time-shifting heavy repair work
+- [x] **Phase 13**: Schedule & Automation — daily processing window that
+      drives the pause/resume switch automatically, plus a watch-folder
+      inbox that auto-ingests dropped PDFs when processing is allowed
 
 ## New Features
 
@@ -68,7 +73,8 @@ Recent additions since the Phase 9 baseline:
 - **Incremental gap repair** — fill-missing jobs process *only* pages lacking an artifact, never redoing finished work. Bulk buttons repair every affected doc at once; each problem row also has a per-document "fix" panel offering exactly the repairs that apply (fill embeddings, extract missing entities, build/rebuild chunks, or full re-embed for wrong-dimension vectors).
 - **OCR text recovery for scanned PDFs** — scanned documents have no text layer, so page-level extraction finds nothing; but Docling OCRs the page images during chunking, so the real text lives on the Chunk nodes. The audit flags these ("page text" column), and a one-click repair copies the OCR text back onto the pages, then embeds it and extracts entities from it — turning image-only books into fully searchable ones.
 - **Deep Verification** — a Manage-page card (and `GET /admin/verify`) that proves the database is intact with exact counts and zero sampling: page counts and numbering, duplicates and orphans, every page image on disk, text consistency, embedding presence at exact dimensions, visual-embedding blob byte-integrity, chunk completeness, extraction coverage, and index health. The verdict is PASS only at literally zero violations.
-- **Job control (pause / stop / restart)** — every background job is a tracked task. The Ingest tab's **Active Jobs** panel shows what each job is working on *right now* ("page 267 (4/368) — ASM Handbook Vol 3"), with per-job pause/resume/stop buttons and a restart button on finished jobs. Pause and stop are cooperative — the current page/batch finishes first, so nothing is half-written — and every repair recomputes its missing-work set, so a stopped job restarted later continues instead of redoing. **Pause all (free GPU)** holds the entire queue (persists across service restarts; jobs launched while paused hold immediately), letting you keep the GPU free during the day and run repairs overnight with one click — or on a schedule via `curl -X POST :8200/ingest/jobs/{pause-all,resume-all}` in cron.
+- **Job control (pause / stop / restart)** — every background job is a tracked task. The Ingest tab's **Active Jobs** panel shows what each job is working on *right now* ("page 267 (4/368) — ASM Handbook Vol 3"), with per-job pause/resume/stop buttons and a restart button on finished jobs. Pause and stop are cooperative — the current page/batch finishes first, so nothing is half-written — and every repair recomputes its missing-work set, so a stopped job restarted later continues instead of redoing. **Pause all (free GPU)** holds the entire queue (persists across service restarts; jobs launched while paused hold immediately), letting you keep the GPU free during the day and run repairs overnight with one click.
+- **Schedule & Automation** — a Manage-page card that automates the pause/resume switch on a daily **processing window** ("run jobs 21:00 → 06:30 on these days", overnight windows supported). The scheduler fires at window boundaries, catches up after a reboot, and leaves manual pause/resume clicks in force until the next boundary. The same card configures a **watch folder**: PDFs dropped into an inbox are auto-ingested through the normal pipeline (same concurrency caps) whenever processing is allowed — with a schedule on, files dropped during the day simply wait for the window. Files are picked up only once fully copied, hash-checked so already-ingested PDFs are filed to `duplicates/` without spending any GPU, and moved to `ingested/` when queued. A live event log shows everything the scheduler has done.
 
 ## Architecture
 
@@ -451,7 +457,19 @@ Every job card has a **logs** button that expands the backend log lines captured
 
 Every active job has **pause** and **stop** buttons; finished jobs have **restart**. All three are safe by construction: pause and stop wait for the current page/batch to finish (nothing is left half-written), stop keeps all completed work, and restart re-checks what's missing rather than redoing anything.
 
-The **Pause all (free GPU)** button in the Active Jobs header holds the entire queue — no LLM or embedding calls are made while paused, and idle models unload automatically a few minutes later. The switch is persistent: it survives service restarts, and any job (or bulk drain) launched while it's on holds immediately until **Resume all**. Typical day/night workflow: queue big repairs any time, leave everything paused while you need the GPU, click Resume all when you're done for the day. For a hands-free schedule, cron the endpoints: `curl -X POST localhost:8200/ingest/jobs/resume-all` at night and `.../pause-all` in the morning.
+The **Pause all (free GPU)** button in the Active Jobs header holds the entire queue — no LLM or embedding calls are made while paused, and idle models unload automatically a few minutes later. The switch is persistent: it survives service restarts, and any job (or bulk drain) launched while it's on holds immediately until **Resume all**. Typical day/night workflow: queue big repairs any time, leave everything paused while you need the GPU, click Resume all when you're done for the day.
+
+### Scheduling — hands-free day/night operation
+
+Manage → **Schedule & Automation** automates the same switch on a daily **processing window**: pick a start time, an end time (overnight is fine — 21:00 → 06:30 runs into the next morning), and the days it applies. Jobs resume at the window start and pause at the end. The scheduler:
+
+- fires at window boundaries only, so a manual Pause/Resume all in between is respected until the next boundary;
+- catches up after a restart — if the machine was off when the window opened, the boundary is applied on startup;
+- applies the current window state immediately when you enable or edit the schedule (the status chip on the card shows the result).
+
+The **watch folder** on the same card gives you an auto-ingest inbox. Drop PDFs into it (default `data/ingest-inbox/`, or any folder you choose) and they are ingested through the normal upload pipeline — same few-at-a-time concurrency, same LLM caps, visible as regular jobs on the Ingest tab — whenever processing is allowed. With a schedule on, that means files dropped during the day queue up the moment the window opens, after any already-queued work. Safety rails: a file is only picked up once its size stops changing (never mid-copy), already-ingested PDFs (by content hash) are filed to `duplicates/` without touching the GPU, queued originals move to `ingested/`, and a **scan now** button processes the inbox on demand. Recent scheduler activity (windows opened/closed, files queued, duplicates filed) is shown in the card's event log.
+
+Prefer external tooling? The same switch is scriptable: `curl -X POST localhost:8200/ingest/jobs/resume-all` and `.../pause-all`.
 
 ### Verifying the Library — Pipeline Completeness
 
@@ -681,9 +699,16 @@ resume-all.
 | POST | `/ingest/jobs/{id}/cancel` | Stop a job. Queued jobs stop immediately; running ones after the current page/batch |
 | POST | `/ingest/jobs/{id}/restart` | Re-launch a finished job as a new job with the same type/params. 400 for jobs from before job-control existed |
 
-Scheduling tip: to run repairs only at night, pair the endpoints with cron —
-`curl -X POST localhost:8200/ingest/jobs/resume-all` in the evening and
-`.../pause-all` in the morning.
+For hands-free day/night operation use the built-in scheduler (Manage →
+Schedule & Automation, endpoints below) instead of external cron.
+
+### Schedule & Automation
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/schedule` | Schedule + watch-folder config and live status (window open/closed, next boundary, inbox counts, recent events) |
+| PUT | `/schedule` | Update the processing window. Body: `{enabled, start "HH:MM", end "HH:MM", days [0-6, Mon=0]}` — overnight windows supported; takes effect within seconds |
+| PUT | `/schedule/watch` | Update the auto-ingest inbox. Body: `{enabled, path, collection}` — empty path selects the default inbox (created for you) |
+| POST | `/schedule/watch/scan-now` | Scan the inbox immediately, skipping the file-stability wait |
 
 ### Knowledge Graph
 | Method | Path | Description |

@@ -498,6 +498,27 @@ class JobManager:
             await db.commit()
         logger.info("Pause-all %s", "ENABLED" if paused else "cleared")
 
+    # ------------------------------------------------------------------- meta
+
+    async def meta_get(self, key: str) -> str | None:
+        """Read a value from the small key/value meta table (also used for
+        the pause-all flag and the scheduler's persisted config/state)."""
+        async with self._connect() as db:
+            cur = await db.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)
+            )
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+    async def meta_set(self, key: str, value: str) -> None:
+        async with self._write_lock, self._connect() as db:
+            await db.execute(
+                "INSERT INTO meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+            await db.commit()
+
     async def _finalize_cancel(self, job_id: str) -> None:
         """Write the terminal 'cancelled' state for a stopped job: flag any
         running step, keep current_step for context, clear the live item."""
