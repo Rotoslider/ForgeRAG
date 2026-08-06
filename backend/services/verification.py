@@ -328,6 +328,66 @@ async def run_verification(neo4j, settings) -> dict:
         "page links" if temp_total else None,
     ))
 
+    # Repair coverage: the pages the AUDIT counts as missing an artifact
+    # must be exactly the pages the REPAIR queries would select. If these
+    # drift apart you get the "fix runs, reports success, audit unchanged"
+    # failure mode — this check turns that into a red row.
+    from backend.services.work_predicates import (
+        ENTITY_EXTRACTION_DONE,
+        ENTITY_NEEDS_EXTRACTION,
+        TEXT_EMBED_MISSING,
+        VISUAL_EMBED_MISSING,
+    )
+
+    coverage_mismatches = []
+    # Entities: audit arithmetic (text pages minus done) vs repair selector.
+    rows = await q(f"""
+        MATCH (p:Page)
+        RETURN
+          sum(CASE WHEN p.text_char_count > 0 THEN 1 ELSE 0 END) AS text_pages,
+          sum(CASE WHEN p.text_char_count > 0
+                    AND ({ENTITY_EXTRACTION_DONE}) THEN 1 ELSE 0 END) AS done,
+          sum(CASE WHEN {ENTITY_NEEDS_EXTRACTION} THEN 1 ELSE 0 END) AS selectable
+    """)
+    r = rows[0]
+    audit_missing = r["text_pages"] - r["done"]
+    if audit_missing != r["selectable"]:
+        coverage_mismatches.append({
+            "gap": "entities", "audit_missing": audit_missing,
+            "repair_selects": r["selectable"],
+        })
+    # Text / visual embeddings: audit-missing-entirely vs fill selectors.
+    rows = await q(f"""
+        MATCH (p:Page)
+        RETURN
+          sum(CASE WHEN p.text_char_count > 0 AND p.text_embedding IS NULL
+              THEN 1 ELSE 0 END) AS audit_text_missing,
+          sum(CASE WHEN {TEXT_EMBED_MISSING} THEN 1 ELSE 0 END) AS text_selectable,
+          sum(CASE WHEN coalesce(p.colpali_vector_count, 0) = 0
+                    AND (p.is_blank IS NULL OR p.is_blank = false)
+              THEN 1 ELSE 0 END) AS audit_visual_missing,
+          sum(CASE WHEN {VISUAL_EMBED_MISSING} THEN 1 ELSE 0 END) AS visual_selectable
+    """)
+    r = rows[0]
+    if r["audit_text_missing"] != r["text_selectable"]:
+        coverage_mismatches.append({
+            "gap": "text_embedding", "audit_missing": r["audit_text_missing"],
+            "repair_selects": r["text_selectable"],
+        })
+    if r["audit_visual_missing"] != r["visual_selectable"]:
+        coverage_mismatches.append({
+            "gap": "visual_embedding", "audit_missing": r["audit_visual_missing"],
+            "repair_selects": r["visual_selectable"],
+        })
+    checks.append(_check(
+        "repair_coverage_matches",
+        "Every page the audit counts as missing an artifact is selected by "
+        "the corresponding repair query (no audit/repair predicate drift)",
+        len(coverage_mismatches), samples=coverage_mismatches,
+        detail="a repair would report success without touching the audited "
+        "gap — fix the predicate drift in code" if coverage_mismatches else None,
+    ))
+
     # Case/whitespace duplicate entities. These accumulate because the
     # post-ingest dedup step was broken (invalid MERGE) from 2026-05-05 to
     # 2026-08-06 — hygiene, not data loss, so a warning rather than a fail.

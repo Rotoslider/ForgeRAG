@@ -17,6 +17,7 @@ import {
   listBackups,
   listCollections,
   listJobs,
+  getStepIssues,
   moveDocument,
   normalizeEntities,
   removeDocumentTag,
@@ -63,6 +64,7 @@ export default function Manage() {
       </div>
       <ScheduleCard />
       <BackupRestoreCard />
+      <StepIssuesCard />
       <CompletenessCard />
       <VerificationCard />
       <DocumentsTable />
@@ -1230,7 +1232,7 @@ function AuditCell({ doc, aspect }: { doc: DocAudit; aspect: string }) {
 // Per-doc repair panel shown when a row's "fix" button is expanded. Renders
 // one button per detected gap; each queues a job for just this document.
 // New aspect types added later only need a branch here to become fixable.
-function DocFixButtons({
+export function DocFixButtons({
   doc,
   busy,
   queuedLabel,
@@ -1371,6 +1373,59 @@ function DocFixButtons({
   );
 }
 
+// Recurring step errors/warnings across recent jobs, grouped by pattern.
+// A problem that repeats across jobs is a systemic bug — the dedup Cypher
+// error fired on every ingest for three months but was only visible by
+// expanding individual job cards. This makes such patterns a headline.
+function StepIssuesCard() {
+  const { data } = useQuery({
+    queryKey: ["step-issues"],
+    queryFn: () => getStepIssues(7),
+    refetchInterval: 60000,
+  });
+  const issues = data?.data?.issues || [];
+  return (
+    <div className="bg-forge-panel border border-forge-edge rounded-lg p-5">
+      <h2
+        className="font-semibold mb-2"
+        title="Errors and warnings recorded inside job steps over the last 7 days, grouped by pattern. A pattern with a high count is a systemic bug, not a one-off."
+      >
+        Pipeline Health — recent step issues (7 days)
+      </h2>
+      {issues.length === 0 ? (
+        <div className="text-sm text-emerald-400">
+          No step errors or warnings in the last 7 days.
+        </div>
+      ) : (
+        <div className="space-y-1">
+          {issues.map((i, idx) => (
+            <div key={idx} className="text-xs font-mono flex items-baseline gap-2">
+              <span
+                className={`shrink-0 font-bold ${
+                  i.status === "error" ? "text-rose-400" : "text-amber-400"
+                }`}
+              >
+                {i.count}×
+              </span>
+              <span className="shrink-0 text-forge-muted">{i.step}</span>
+              <span className="truncate" title={`latest: ${i.sample_filename} — ${i.sample_detail}`}>
+                {i.pattern || "(no detail)"}
+              </span>
+            </div>
+          ))}
+          <div className="text-[11px] text-forge-muted mt-2">
+            Numbers are squashed to “N” so identical failures group. Hover a
+            row for the most recent example; find its job on the Ingest page
+            for logs. Note: jobs killed by a service restart and re-queued
+            repairs appear here too — a pattern that keeps growing on a
+            normal day is the one to chase.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Amber banner shown on the repair cards while the global pause is on —
 // without it, "queue a fix" looks like "run a fix" and nothing visibly
 // happens (the exact confusion behind the 2026-08-06 "fixed but not
@@ -1392,56 +1447,68 @@ function PausedJobsWarning() {
 }
 
 // Live status of a repair queued from the audit table, resolved by polling
-// the jobs list. Every status is spelled out — a job that is held, stopped,
-// or killed must NEVER read as done (that exact confusion is how "fixed"
-// jobs silently went nowhere during the 2026-08-06 incident).
-function RepairStatus({ label, job }: { label: string; job: JobRow | null }) {
-  if (!job || job.status === "queued") {
+// the jobs list. An EXHAUSTIVE switch over JobStatus — adding a status to
+// the union without handling it here fails compilation, so a held or
+// stopped job can never silently fall through to "done" again (the exact
+// confusion behind the 2026-08-06 "fixed but not fixed" reports).
+function assertNever(x: never): never {
+  throw new Error(`unhandled job status: ${String(x)}`);
+}
+
+export function RepairStatus({ label, job }: { label: string; job: JobRow | null }) {
+  if (!job) {
     return (
-      <span className="text-forge-muted" title={`${label} queued — waiting for a slot; drains a few at a time`}>
+      <span className="text-forge-muted" title={`${label} queued`}>
         {label}: queued…
       </span>
     );
   }
-  if (job.status === "paused") {
-    return (
-      <span
-        className="text-amber-400"
-        title={`${label} is held because job processing is paused. Click "Resume all" on the Ingest page (or wait for the schedule window) and it will run.`}
-      >
-        ⏸ held — jobs are paused
-      </span>
-    );
+  switch (job.status) {
+    case "queued":
+      return (
+        <span className="text-forge-muted" title={`${label} queued — waiting for a slot; drains a few at a time`}>
+          {label}: queued…
+        </span>
+      );
+    case "paused":
+      return (
+        <span
+          className="text-amber-400"
+          title={`${label} is held because job processing is paused. Click "Resume all" on the Ingest page (or wait for the schedule window) and it will run.`}
+        >
+          ⏸ held — jobs are paused
+        </span>
+      );
+    case "processing":
+      return (
+        <span className="text-sky-300 animate-pulse" title={`${label} running`}>
+          {job.current_step} {Math.round(job.progress_pct)}%
+        </span>
+      );
+    case "failed":
+      return (
+        <span
+          className="text-rose-400"
+          title={job.error_message || `${label} failed — see its logs on the Ingest page`}
+        >
+          ✗ failed — see logs
+        </span>
+      );
+    case "cancelled":
+      return (
+        <span className="text-amber-400" title={`${label} was stopped before finishing`}>
+          ■ stopped
+        </span>
+      );
+    case "completed":
+      return (
+        <span className="text-emerald-400" title={`${label} finished`}>
+          ✓ done — re-run audit
+        </span>
+      );
+    default:
+      return assertNever(job.status);
   }
-  if (job.status === "processing") {
-    return (
-      <span className="text-sky-300 animate-pulse" title={`${label} running`}>
-        {job.current_step} {Math.round(job.progress_pct)}%
-      </span>
-    );
-  }
-  if (job.status === "failed") {
-    return (
-      <span
-        className="text-rose-400"
-        title={job.error_message || `${label} failed — see its logs on the Ingest page`}
-      >
-        ✗ failed — see logs
-      </span>
-    );
-  }
-  if (job.status === "cancelled") {
-    return (
-      <span className="text-amber-400" title={`${label} was stopped before finishing`}>
-        ■ stopped
-      </span>
-    );
-  }
-  return (
-    <span className="text-emerald-400" title={`${label} finished`}>
-      ✓ done — re-run audit
-    </span>
-  );
 }
 
 function CompletenessCard() {

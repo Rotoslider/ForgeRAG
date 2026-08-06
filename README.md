@@ -867,6 +867,44 @@ ForgeRAG/
     +-- jobs.sqlite                Ingestion job queue
 ```
 
+## Testing & QA
+
+Three layers, each catching what the others can't:
+
+**Unit/API tests** (fast, no services needed):
+```bash
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 ./venv/bin/pytest -p asyncio tests/   # backend (82 tests)
+cd frontend && npm test                                                # UI contracts (13 tests)
+```
+The frontend tests are request-contract tests: every fix/control button is
+asserted against the exact request body it emits, and every job status
+against the message it must display — the classes of bug (dropped payload
+fields, "done" shown for held jobs) that state audits can never see.
+
+**End-to-end smoke suite** (drives the LIVE service like a user):
+```bash
+./venv/bin/python scripts/smoke_e2e.py [--skip-answer] [--skip-verify]
+```
+Ingests a synthetic 3-page PDF through the real pipeline (priority lane, so
+it runs even under Pause all without disturbing the queue), asserts every
+step-ledger entry genuinely succeeded, confirms the audit sees the document
+as complete, proves keyword/semantic/hybrid retrieval find it and answer
+mode reads the fact off the page, checks the knowledge graph got its
+entities, verifies a repair on a complete document honestly reports
+"nothing missing", then deletes it and confirms it's gone. Costs ~3 pages
+of GPU/LLM work; run it inside your processing window (e.g. nightly).
+
+**Standing tripwires** (no action needed — they watch continuously):
+- **Deep Verification → `repair_coverage_matches`**: the pages the audit
+  counts as missing must be exactly the pages the repair queries would
+  select (shared predicates in `backend/services/work_predicates.py`).
+  Predicate drift — the root cause of "fix runs, audit unchanged" — fails
+  verification instead of silently wasting repair runs.
+- **Manage → Pipeline Health**: recent job step errors/warnings grouped by
+  pattern. A recurring pattern is a systemic bug; the dedup Cypher error
+  sat invisible inside individual job cards for three months, and this
+  panel is what would have surfaced it in a day.
+
 ## LLM Model Notes
 
 **Entity extraction** (Qwen 3.6 35B-A3B MoE, 3B active):

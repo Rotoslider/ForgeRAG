@@ -12,10 +12,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -514,6 +515,57 @@ class JobManager:
             )
             await db.commit()
         logger.info("Pause-all %s", "ENABLED" if paused else "cleared")
+
+    async def step_issue_summary(
+        self, *, days: int = 7, limit_jobs: int = 2000
+    ) -> list[dict[str, Any]]:
+        """Group recent jobs' step errors/warnings by (step, message
+        pattern). A step problem that recurs across jobs is a systemic bug
+        (the dedup Cypher error fired on every ingest for months, visible
+        only inside individual job cards) — this makes it a headline.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+        ).isoformat()
+        async with self._connect() as db:
+            cur = await db.execute(
+                """SELECT job_id, filename, created_at, steps FROM jobs
+                   WHERE created_at >= ? AND steps LIKE '%"status": "%'
+                   ORDER BY created_at DESC LIMIT ?""",
+                (cutoff, limit_jobs),
+            )
+            rows = await cur.fetchall()
+
+        groups: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for job_id, filename, created_at, steps_json in rows:
+            try:
+                steps = json.loads(steps_json or "[]")
+            except json.JSONDecodeError:
+                continue
+            for s in steps:
+                status = s.get("status")
+                if status not in ("error", "warning"):
+                    continue
+                detail = (s.get("detail") or "").strip()
+                # Squash numbers so "6 of 14 pages failed" and "3 of 9
+                # pages failed" group as one pattern.
+                pattern = re.sub(r"\d+", "N", detail)[:120]
+                key = (s.get("name") or "?", status, pattern)
+                g = groups.setdefault(key, {
+                    "step": key[0], "status": status, "pattern": pattern,
+                    "count": 0, "latest_at": created_at,
+                    "sample_job_id": job_id, "sample_filename": filename,
+                    "sample_detail": detail[:200],
+                })
+                g["count"] += 1
+                if created_at > g["latest_at"]:
+                    g["latest_at"] = created_at
+                    g["sample_job_id"] = job_id
+                    g["sample_filename"] = filename
+                    g["sample_detail"] = detail[:200]
+        return sorted(
+            groups.values(), key=lambda g: (-g["count"], g["latest_at"])
+        )
 
     # ------------------------------------------------------------------- meta
 

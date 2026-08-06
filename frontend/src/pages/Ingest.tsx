@@ -71,6 +71,7 @@ function UploadForm() {
 
   const filesInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
+  const [priorityUpload, setPriorityUpload] = useState(false);
 
   const collections = collectionsResp?.data || [];
 
@@ -113,7 +114,7 @@ function UploadForm() {
       for (let i = 0; i < filesToUpload.length; i++) {
         const f = filesToUpload[i];
         try {
-          const res = await uploadPdf(f, col, selectedCats, selectedTags);
+          const res = await uploadPdf(f, col, selectedCats, selectedTags, priorityUpload);
           if (!res.success) {
             errors.push({ name: f.name, reason: res.reason || "upload failed" });
           }
@@ -447,6 +448,17 @@ function UploadForm() {
             ? `Start Ingestion (${files.length} files)`
             : "Start Ingestion"}
         </button>
+        <label
+          className="flex items-center gap-1.5 text-xs cursor-pointer text-amber-300"
+          title="Normally uploads join the FIFO queue and respect Pause all. Check this to process the upload immediately through the priority lane — it skips the queue and runs even while jobs are paused (still capped so it can't overload the LLM)."
+        >
+          <input
+            type="checkbox"
+            checked={priorityUpload}
+            onChange={(e) => setPriorityUpload(e.target.checked)}
+          />
+          ⚡ run immediately (skip queue &amp; pause)
+        </label>
         {precheckError && (
           <span className="text-rose-400 text-sm">{precheckError}</span>
         )}

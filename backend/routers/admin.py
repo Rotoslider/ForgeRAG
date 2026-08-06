@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel
 
 from backend.models.common import ForgeResult
@@ -76,6 +76,19 @@ async def deep_verify(request: Request) -> ForgeResult:
     return ForgeResult(success=True, data=report)
 
 
+@router.get("/step-issues")
+async def step_issues(
+    request: Request,
+    days: int = Query(7, ge=1, le=90),
+) -> ForgeResult:
+    """Recent job step errors/warnings grouped by pattern — recurring step
+    failures are systemic bugs and should be visible without opening
+    individual job cards."""
+    jobs = request.app.state.job_manager
+    issues = await jobs.step_issue_summary(days=days)
+    return ForgeResult(success=True, data={"days": days, "issues": issues})
+
+
 @router.post("/extract-missing-entities")
 async def extract_missing_entities(request: Request) -> ForgeResult:
     """Queue entity extraction for EVERY document with unextracted text pages.
@@ -90,14 +103,12 @@ async def extract_missing_entities(request: Request) -> ForgeResult:
     jobs = request.app.state.job_manager
     pipeline = request.app.state.pipeline
 
+    from backend.services.work_predicates import ENTITY_NEEDS_EXTRACTION
+
     docs = await neo4j.run_query(
-        """
+        f"""
         MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
-        WHERE p.text_char_count > 0
-          AND p.entities_extracted_at IS NULL
-          AND NOT EXISTS {
-            (p)-[:MENTIONS_MATERIAL|DESCRIBES_PROCESS|REFERENCES_STANDARD|MENTIONS_EQUIPMENT]->()
-          }
+        WHERE {ENTITY_NEEDS_EXTRACTION}
         WITH d, count(p) AS todo
         RETURN d.doc_id AS doc_id, d.filename AS filename, todo
         ORDER BY todo DESC

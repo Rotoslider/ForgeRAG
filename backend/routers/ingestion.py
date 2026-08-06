@@ -35,6 +35,7 @@ async def start_ingestion(
     collection: str = Form("default", description="Collection name (e.g. asm_references, mechanical_design)"),
     categories: str = Form("", description="Comma-separated category names"),
     tags: str = Form("", description="Comma-separated tag names"),
+    priority: bool = Form(False, description="Run now: skip the FIFO queue and the pause-all hold"),
 ) -> ForgeResult:
     """Upload a PDF and enqueue an ingestion job.
 
@@ -78,8 +79,13 @@ async def start_ingestion(
     )
 
     # Kick off the pipeline in the background, tracked so the job can be
-    # paused/stopped from the UI.
-    jobs.spawn(job.job_id, pipeline.run_job(job.job_id, collection=col))
+    # paused/stopped from the UI. priority = the "run now" lane: skips the
+    # FIFO queue and the pause-all hold.
+    if priority:
+        jobs.exempt_from_pause(job.job_id)
+        jobs.spawn(job.job_id, pipeline.run_job_now(job.job_id, collection=col))
+    else:
+        jobs.spawn(job.job_id, pipeline.run_job(job.job_id, collection=col))
 
     logger.info(
         "Enqueued ingestion job %s for %s (collection=%s, categories=%s, tags=%s)",

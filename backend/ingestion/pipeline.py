@@ -36,6 +36,11 @@ from backend.ingestion.pdf_processor import PDFProcessor
 from backend.ingestion.text_extractor import TextExtractor
 from backend.services.colpali_service import ColPaliService, serialize_colpali
 from backend.services.entity_merge import merge_entity
+from backend.services.work_predicates import (
+    ENTITY_NEEDS_EXTRACTION,
+    TEXT_EMBED_MISSING,
+    VISUAL_EMBED_MISSING,
+)
 from backend.services.nemotron_service import NemotronService, serialize_nemotron
 from backend.services.gpu_manager import GPUManager
 from backend.services.llm_service import LLMService
@@ -145,6 +150,16 @@ class IngestionPipeline:
         # while everything was paused.
         await self.jobs.checkpoint(job_id)
         async with self._ingest_semaphore:
+            await self.jobs.checkpoint(job_id)
+            await self._run_job_inner(job_id, collection)
+
+    async def run_job_now(self, job_id: str, collection: str = "default") -> None:
+        """Priority ("run now") variant of run_job: the priority lane
+        instead of the FIFO ingest queue, for an upload the user needs
+        processed immediately (and, with JobManager.exempt_from_pause set
+        by the caller, even while pause-all is on). Also what the E2E smoke
+        suite uses so it can run without unleashing the paused backlog."""
+        async with self._priority_semaphore:
             await self.jobs.checkpoint(job_id)
             await self._run_job_inner(job_id, collection)
 
@@ -1796,11 +1811,12 @@ class IngestionPipeline:
         assert self.text_embedding is not None
         assert self.gpu is not None
 
-        # Pull pages that have text and no embedding yet
+        # Pull pages that have text and no embedding yet (shared predicate —
+        # deep verify's repair_coverage check compares the audit against it)
         pages = await self.neo4j.run_query(
-            """
-            MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
-            WHERE p.text_char_count > 0 AND p.text_embedding IS NULL
+            f"""
+            MATCH (d:Document {{doc_id: $doc_id}})-[:HAS_PAGE]->(p:Page)
+            WHERE {TEXT_EMBED_MISSING}
             RETURN p.page_id AS page_id, p.extracted_text AS text
             ORDER BY p.page_number
             """,
@@ -1874,10 +1890,9 @@ class IngestionPipeline:
         # Find all pages that don't yet have visual embeddings, excluding
         # pages flagged as visually blank (no signal for ColPali/Nemotron).
         rows = await self.neo4j.run_query(
-            """
-            MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
-            WHERE (p.colpali_vector_count IS NULL OR p.colpali_vector_count = 0)
-              AND (p.is_blank IS NULL OR p.is_blank = false)
+            f"""
+            MATCH (d:Document {{doc_id: $doc_id}})-[:HAS_PAGE]->(p:Page)
+            WHERE {VISUAL_EMBED_MISSING}
             RETURN p.page_id AS page_id, p.page_number AS page_number
             ORDER BY p.page_number
             """,
@@ -1963,16 +1978,12 @@ class IngestionPipeline:
         # that still genuinely have nothing relevant; those pages just get
         # re-run (fast path since the LLM returns empty arrays).
         rows = await self.neo4j.run_query(
-            """
-            MATCH (d:Document {doc_id: $doc_id})
+            f"""
+            MATCH (d:Document {{doc_id: $doc_id}})
             OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
-            WHERE p.text_char_count > 0
-              AND p.entities_extracted_at IS NULL
-              AND NOT EXISTS {
-                (p)-[:MENTIONS_MATERIAL|DESCRIBES_PROCESS|REFERENCES_STANDARD|MENTIONS_EQUIPMENT]->()
-              }
+            WHERE {ENTITY_NEEDS_EXTRACTION}
             RETURN d.title AS title,
-                   collect({page_id: p.page_id, page_number: p.page_number, text: p.extracted_text}) AS pages
+                   collect({{page_id: p.page_id, page_number: p.page_number, text: p.extracted_text}}) AS pages
             """,
             {"doc_id": doc_id},
         )

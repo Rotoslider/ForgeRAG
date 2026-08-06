@@ -266,13 +266,15 @@ export async function uploadPdf(
   file: File,
   collection: string,
   categories: string[],
-  tags: string[]
+  tags: string[],
+  priority = false
 ): Promise<ForgeResult<{ job_id: string; status: string; filename: string }>> {
   const fd = new FormData();
   fd.append("file", file);
   fd.append("collection", collection);
   fd.append("categories", categories.join(","));
   fd.append("tags", tags.join(","));
+  if (priority) fd.append("priority", "true");
   const res = await fetch("/ingest", { method: "POST", body: fd });
   if (!res.ok) {
     let reason: string;
@@ -318,6 +320,22 @@ export const restartJob = (id: string) =>
   request<{ job_id: string; restarted_from: string }>(
     `/ingest/jobs/${id}/restart`,
     { method: "POST" }
+  );
+
+export interface StepIssue {
+  step: string;
+  status: string;
+  pattern: string;
+  count: number;
+  latest_at: string;
+  sample_job_id: string;
+  sample_filename: string;
+  sample_detail: string;
+}
+
+export const getStepIssues = (days = 7) =>
+  request<{ days: number; issues: StepIssue[] }>(
+    `/admin/step-issues?days=${days}`
   );
 
 export const normalizeEntities = () =>
