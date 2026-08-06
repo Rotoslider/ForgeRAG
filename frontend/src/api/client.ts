@@ -7,6 +7,7 @@ import type {
   GraphStats,
   HealthPayload,
   HybridStrategy,
+  JobControls,
   JobLogLine,
   JobRow,
   PageDetail,
@@ -295,6 +296,28 @@ export const listJobs = (status?: string, limit = 50) => {
 export const getJobLogs = (id: string, limit = 1000) =>
   request<{ job_id: string; filename: string; lines: JobLogLine[] }>(
     `/ingest/jobs/${id}/logs?limit=${limit}`
+  );
+
+// ---- Job control ----
+export const getJobControls = () =>
+  request<JobControls>("/ingest/jobs/controls");
+export const pauseAllJobs = () =>
+  request<JobControls>("/ingest/jobs/pause-all", { method: "POST" });
+export const resumeAllJobs = () =>
+  request<JobControls>("/ingest/jobs/resume-all", { method: "POST" });
+export const pauseJob = (id: string) =>
+  request<{ job_id: string }>(`/ingest/jobs/${id}/pause`, { method: "POST" });
+export const resumeJob = (id: string) =>
+  request<{ job_id: string; held_by_pause_all?: boolean }>(
+    `/ingest/jobs/${id}/resume`,
+    { method: "POST" }
+  );
+export const cancelJob = (id: string) =>
+  request<{ job_id: string }>(`/ingest/jobs/${id}/cancel`, { method: "POST" });
+export const restartJob = (id: string) =>
+  request<{ job_id: string; restarted_from: string }>(
+    `/ingest/jobs/${id}/restart`,
+    { method: "POST" }
   );
 
 // ---- Search ----

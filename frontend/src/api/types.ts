@@ -36,7 +36,13 @@ export interface PageDetail extends PageMeta {
 }
 
 // --- Ingest jobs ---
-export type JobStatus = "queued" | "processing" | "completed" | "failed" | "cancelled";
+export type JobStatus =
+  | "queued"
+  | "processing"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled";
 
 // Per-step ledger. "warning" = ran but some units failed; "skipped" = the
 // pipeline deliberately didn't run it (detail says why).
@@ -74,6 +80,19 @@ export interface JobRow {
   doc_id: string | null;
   file_hash: string | null;
   steps: JobStepRecord[];
+  // Type slug + launch params (enough to restart the job). Jobs created
+  // before job control existed have job_type "".
+  job_type: string;
+  job_params: Record<string, unknown>;
+  // Live "now working on" label written by the pipeline (page/batch/doc).
+  current_item: string | null;
+}
+
+// GET /ingest/jobs/controls
+export interface JobControls {
+  pause_all: boolean;
+  counts: Record<string, number>;
+  active: number;
 }
 
 // --- Search ---

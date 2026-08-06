@@ -66,6 +66,11 @@ class _JobsStub:
     async def update(self, job_id, **kwargs):
         pass
 
+    async def checkpoint(self, job_id):
+        # Pause/stop gate — a no-op here; job-control behaviour is covered
+        # by tests/test_job_control.py.
+        pass
+
     async def update_step(self, job_id, step, status, detail=None):
         self.steps.append((step, status, detail))
 

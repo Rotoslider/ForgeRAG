@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import shutil
 import uuid
@@ -67,18 +66,20 @@ async def start_ingestion(
     tgs = [t.strip() for t in tags.split(",") if t.strip()]
     col = collection.strip() or "default"
 
-    # Create job record
+    # Create job record. Collection rides along in job_params so a Restart
+    # can reconstruct the exact run_job call.
     job = await jobs.create(
         source_path=str(staged_path),
         filename=file.filename,
         categories=cats,
         tags=tgs,
+        job_type="ingest",
+        params={"collection": col},
     )
 
-    # Kick off the pipeline in the background with collection info.
-    # Collection is passed directly to run_job since it's not persisted
-    # in the job table — it gets set on the Document node during _register.
-    asyncio.create_task(pipeline.run_job(job.job_id, collection=col))
+    # Kick off the pipeline in the background, tracked so the job can be
+    # paused/stopped from the UI.
+    jobs.spawn(job.job_id, pipeline.run_job(job.job_id, collection=col))
 
     logger.info(
         "Enqueued ingestion job %s for %s (collection=%s, categories=%s, tags=%s)",
@@ -116,6 +117,203 @@ async def check_duplicates(body: DuplicateCheckRequest, request: Request) -> For
     )
     duplicates = {r["file_hash"]: r for r in rows}
     return ForgeResult(success=True, data={"duplicates": duplicates})
+
+
+# --------------------------------------------------------------- job control
+#
+# NOTE: /jobs/controls is registered BEFORE /jobs/{job_id} — FastAPI matches
+# routes in declaration order, and "controls" must not be parsed as a job id.
+
+
+@router.get("/jobs/controls")
+async def job_controls(request: Request) -> ForgeResult:
+    """Global job-control state: the pause-all switch plus per-status job
+    counts (the Active Jobs panel header)."""
+    jobs = request.app.state.job_manager
+    counts = await jobs.status_counts()
+    return ForgeResult(success=True, data={
+        "pause_all": jobs.pause_all_active,
+        "counts": counts,
+        "active": sum(
+            counts.get(s, 0) for s in ("queued", "processing", "paused")
+        ),
+    })
+
+
+@router.post("/jobs/pause-all")
+async def pause_all_jobs(request: Request) -> ForgeResult:
+    """Pause every running and queued job (each holds after its current
+    page/batch). Frees the GPU/LLM for other work; persists across service
+    restarts until resume-all."""
+    jobs = request.app.state.job_manager
+    await jobs.set_pause_all(True)
+    counts = await jobs.status_counts()
+    return ForgeResult(success=True, data={"pause_all": True, "counts": counts})
+
+
+@router.post("/jobs/resume-all")
+async def resume_all_jobs(request: Request) -> ForgeResult:
+    """Clear the global pause AND any per-job pauses; paused jobs continue
+    within a second."""
+    jobs = request.app.state.job_manager
+    await jobs.set_pause_all(False)
+    counts = await jobs.status_counts()
+    return ForgeResult(success=True, data={"pause_all": False, "counts": counts})
+
+
+@router.post("/jobs/{job_id}/pause")
+async def pause_job(job_id: str, request: Request) -> ForgeResult:
+    """Pause one job at its next checkpoint (current page/batch finishes
+    first, so this can take a few seconds to show)."""
+    jobs = request.app.state.job_manager
+    ok = await jobs.request_pause(job_id)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job {job_id} is not active (already finished or unknown)",
+        )
+    return ForgeResult(success=True, data={"job_id": job_id, "pausing": True})
+
+
+@router.post("/jobs/{job_id}/resume")
+async def resume_job(job_id: str, request: Request) -> ForgeResult:
+    """Resume one paused job. If pause-all is on, the job stays held until
+    resume-all — the response says so instead of pretending it resumed."""
+    jobs = request.app.state.job_manager
+    ok = await jobs.request_resume(job_id)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job {job_id} is not active (already finished or unknown)",
+        )
+    return ForgeResult(success=True, data={
+        "job_id": job_id,
+        "resuming": not jobs.pause_all_active,
+        "held_by_pause_all": jobs.pause_all_active,
+    })
+
+
+@router.post("/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str, request: Request) -> ForgeResult:
+    """Stop a job. Queued jobs stop immediately; running ones stop after
+    the current page/batch. All repair job types are safe to restart later —
+    they re-check what's missing and never redo finished work."""
+    jobs = request.app.state.job_manager
+    ok = await jobs.request_cancel(job_id)
+    if not ok:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job {job_id} is not active (already finished or unknown)",
+        )
+    return ForgeResult(success=True, data={"job_id": job_id, "cancelling": True})
+
+
+# Job types the restart endpoint knows how to re-launch. Kept in sync with
+# _build_restart_coro below; the frontend shows Restart only for these.
+RESTARTABLE_JOB_TYPES = {
+    "ingest", "fill-missing", "extract-entities", "rebuild-chunks",
+    "re-embed", "text-reembed", "resummarize", "autotag",
+    "build-communities",
+}
+
+
+def _build_restart_coro(pipeline, new_job_id: str, job):
+    """Reconstruct the pipeline call for a finished job. Returns a coroutine
+    or None if the job type can't be restarted. Callers must validate with
+    RESTARTABLE_JOB_TYPES first so no orphan job rows get created."""
+    p = job.job_params or {}
+    jt = job.job_type
+    doc_id = job.doc_id
+    if jt == "ingest":
+        return pipeline.run_job(
+            new_job_id, collection=p.get("collection", "default")
+        )
+    if jt == "fill-missing" and doc_id:
+        return pipeline.run_fill_missing(
+            new_job_id, doc_id,
+            do_text=bool(p.get("text", True)),
+            do_visual=bool(p.get("visual", True)),
+            do_entities=bool(p.get("entities", False)),
+            do_recover_text=bool(p.get("recover_text", False)),
+        )
+    if jt == "extract-entities" and doc_id:
+        return pipeline.run_extraction_only(new_job_id, doc_id)
+    if jt == "rebuild-chunks" and doc_id:
+        return pipeline.run_rebuild_chunks(
+            new_job_id, doc_id,
+            extract_only=bool(p.get("extract_only")),
+            skip_extract=bool(p.get("skip_extract")),
+        )
+    if jt == "re-embed" and doc_id:
+        return pipeline.run_embeddings_only(new_job_id, doc_id)
+    if jt == "text-reembed" and doc_id:
+        return pipeline.run_text_reembed_only(new_job_id, doc_id)
+    if jt == "resummarize":
+        return pipeline.run_resummarize(new_job_id)
+    if jt == "autotag":
+        return pipeline.run_autotag_missing(new_job_id)
+    if jt == "build-communities":
+        return pipeline.run_communities_only(new_job_id)
+    return None
+
+
+@router.post("/jobs/{job_id}/restart")
+async def restart_job(job_id: str, request: Request) -> ForgeResult:
+    """Re-launch a finished (failed/cancelled/completed) job as a NEW job.
+
+    Safe for every repair type: the underlying steps re-query what's
+    missing, so a restart continues where the stopped run left off instead
+    of redoing finished work.
+    """
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+    job = await jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    if job.status in ("queued", "processing", "paused"):
+        raise HTTPException(
+            status_code=409, detail="Job is still active — stop it first"
+        )
+    if job.job_type not in RESTARTABLE_JOB_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail="This job predates restart support (or is a type that "
+            "can't be restarted here) — use the repair buttons on the "
+            "Manage tab instead",
+        )
+    if job.job_type == "ingest" and not Path(job.source_path).exists():
+        raise HTTPException(
+            status_code=409,
+            detail="The staged upload for this job no longer exists "
+            "(uploads were cleaned) — re-upload the PDF instead",
+        )
+    if job.job_type in ("fill-missing", "extract-entities", "rebuild-chunks",
+                        "re-embed", "text-reembed") and not job.doc_id:
+        raise HTTPException(
+            status_code=409,
+            detail="Job has no doc_id recorded — it failed before touching "
+            "a document; use the repair buttons on the Manage tab",
+        )
+
+    new = await jobs.create(
+        source_path=job.source_path,
+        filename=job.filename,
+        categories=job.requested_categories,
+        tags=job.requested_tags,
+        job_type=job.job_type,
+        doc_id=job.doc_id,
+        params=job.job_params,
+    )
+    coro = _build_restart_coro(pipeline, new.job_id, job)
+    assert coro is not None  # guarded by the checks above
+    jobs.spawn(new.job_id, coro)
+    logger.info(
+        "Restarted job %s as %s (%s)", job_id, new.job_id, job.job_type
+    )
+    return ForgeResult(success=True, data={
+        "job_id": new.job_id, "restarted_from": job_id,
+        "job_type": job.job_type,
+    })
 
 
 @router.get("/jobs/{job_id}")

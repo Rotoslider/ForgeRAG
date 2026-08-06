@@ -8,7 +8,9 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-JobStatus = Literal["queued", "processing", "completed", "failed", "cancelled"]
+JobStatus = Literal[
+    "queued", "processing", "paused", "completed", "failed", "cancelled"
+]
 
 JobStep = Literal[
     "pending",
@@ -78,6 +80,17 @@ class Job(BaseModel):
     # updated as each step runs/finishes/skips/fails. Old jobs (before the
     # ledger existed) have an empty list.
     steps: list[StepRecord] = Field(default_factory=list)
+
+    # How this job was launched, in enough detail to launch it again (the
+    # Restart button): a type slug (ingest / fill-missing / resummarize /
+    # ...) plus the pipeline kwargs. Jobs from before this existed have
+    # job_type "" and cannot be restarted from the UI.
+    job_type: str = ""
+    job_params: dict = Field(default_factory=dict)
+
+    # Live "now working on" label (e.g. "page 267 of 474" or a document
+    # filename), written by the pipeline as it moves between units of work.
+    current_item: str | None = None
 
 
 class IngestResponse(BaseModel):

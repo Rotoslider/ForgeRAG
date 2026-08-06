@@ -8,7 +8,9 @@ Designed for personal/research use. Runs entirely on local hardware — no cloud
 
 ![Search — Answer mode with VLM-generated response and page citations](docs/ForgeRAG-search.png)
 
-![Ingest — PDF upload plus per-job step circles and the built-in log viewer](docs/ForgeRAG-ingest.png)
+![Ingest — Active Jobs panel with live per-page progress, pause/stop controls, and per-job step circles](docs/ForgeRAG-ingest.png)
+
+![Job control — "Pause all" holds every job after its current page/batch and frees the GPU; Resume all continues where they left off](docs/ForgeRAG-job-controls.png)
 
 ![Manage — Graph stats, GPU status, communities, Backup & Restore, and the Pipeline Completeness audit](docs/ForgeRAG-manage.png)
 
@@ -44,6 +46,9 @@ All phases complete.
 - [x] **Phase 11**: Pipeline observability — per-job step ledger with status circles,
       per-job log capture + viewer, completeness audit across the whole library,
       and incremental gap-filling repairs (bulk and per-document)
+- [x] **Phase 12**: Job control — Active Jobs panel with live "now working on"
+      labels, per-job pause/resume/stop/restart, and a persistent "Pause all
+      (free GPU)" switch for time-shifting heavy repair work
 
 ## New Features
 
@@ -63,6 +68,7 @@ Recent additions since the Phase 9 baseline:
 - **Incremental gap repair** — fill-missing jobs process *only* pages lacking an artifact, never redoing finished work. Bulk buttons repair every affected doc at once; each problem row also has a per-document "fix" panel offering exactly the repairs that apply (fill embeddings, extract missing entities, build/rebuild chunks, or full re-embed for wrong-dimension vectors).
 - **OCR text recovery for scanned PDFs** — scanned documents have no text layer, so page-level extraction finds nothing; but Docling OCRs the page images during chunking, so the real text lives on the Chunk nodes. The audit flags these ("page text" column), and a one-click repair copies the OCR text back onto the pages, then embeds it and extracts entities from it — turning image-only books into fully searchable ones.
 - **Deep Verification** — a Manage-page card (and `GET /admin/verify`) that proves the database is intact with exact counts and zero sampling: page counts and numbering, duplicates and orphans, every page image on disk, text consistency, embedding presence at exact dimensions, visual-embedding blob byte-integrity, chunk completeness, extraction coverage, and index health. The verdict is PASS only at literally zero violations.
+- **Job control (pause / stop / restart)** — every background job is a tracked task. The Ingest tab's **Active Jobs** panel shows what each job is working on *right now* ("page 267 (4/368) — ASM Handbook Vol 3"), with per-job pause/resume/stop buttons and a restart button on finished jobs. Pause and stop are cooperative — the current page/batch finishes first, so nothing is half-written — and every repair recomputes its missing-work set, so a stopped job restarted later continues instead of redoing. **Pause all (free GPU)** holds the entire queue (persists across service restarts; jobs launched while paused hold immediately), letting you keep the GPU free during the day and run repairs overnight with one click — or on a schedule via `curl -X POST :8200/ingest/jobs/{pause-all,resume-all}` in cron.
 
 ## Architecture
 
@@ -437,9 +443,15 @@ Review the suggestions as editable chips, drop what you don't want, choose **mer
 
 ### Monitoring Progress
 
-The Ingest tab shows real-time progress for each job: current phase, pages processed, and a per-step status ledger drawn as colored circles — green done, amber partial or skipped (hover for the reason), red failed, hollow not yet run, pulsing blue running. Any step that didn't fully succeed also prints its reason under the circles (e.g. "auto-tag skipped: manual categories/tags provided" or "12 of 900 pages failed — see logs").
+The Ingest tab is split into **Active Jobs** (running, paused, and queued — running first) and **Finished Jobs** (completed, failed, stopped). Each active job shows its current phase, pages processed, a live "now working on" line (e.g. `▸ page 267 (4/368) — ASM Handbook Vol 3`), and a per-step status ledger drawn as colored circles — green done, amber partial or skipped (hover for the reason), red failed, hollow not yet run, pulsing blue running. Any step that didn't fully succeed also prints its reason under the circles (e.g. "auto-tag skipped: manual categories/tags provided" or "12 of 900 pages failed — see logs").
 
 Every job card has a **logs** button that expands the backend log lines captured while that job ran — it live-tails active jobs and is kept for finished ones, so a failed overnight run can be diagnosed the next morning. Jobs run a few at a time; queue as many PDFs as you like.
+
+### Pausing and stopping work — keeping the GPU free
+
+Every active job has **pause** and **stop** buttons; finished jobs have **restart**. All three are safe by construction: pause and stop wait for the current page/batch to finish (nothing is left half-written), stop keeps all completed work, and restart re-checks what's missing rather than redoing anything.
+
+The **Pause all (free GPU)** button in the Active Jobs header holds the entire queue — no LLM or embedding calls are made while paused, and idle models unload automatically a few minutes later. The switch is persistent: it survives service restarts, and any job (or bulk drain) launched while it's on holds immediately until **Resume all**. Typical day/night workflow: queue big repairs any time, leave everything paused while you need the GPU, click Resume all when you're done for the day. For a hands-free schedule, cron the endpoints: `curl -X POST localhost:8200/ingest/jobs/resume-all` at night and `.../pause-all` in the morning.
 
 ### Verifying the Library — Pipeline Completeness
 
@@ -451,7 +463,7 @@ Repairs are incremental and never redo finished work:
 - **Per-row "fix" panel** on any problem document offers only the repairs that apply: fill missing embeddings, extract missing entities, build/rebuild chunks, recover OCR text, or — for wrong-dimension vectors from an old model — a full re-embed (the only case that clears anything).
 - **OCR text recovery**: for scanned PDFs (no text layer), Docling's OCR text is copied from the chunks back onto the pages, then embedded and entity-extracted in the same job — keyword search and the knowledge graph gain the whole book.
 
-Queued repairs appear on the Ingest page with their own step circles and logs. Re-run the audit afterwards to confirm everything is green.
+Queued repairs appear in the Ingest page's Active Jobs panel with their own step circles, logs, and pause/stop controls (they respect "Pause all"). Re-run the audit afterwards to confirm everything is green.
 
 ### Deep Verification — proving the database is intact
 
@@ -638,9 +650,40 @@ When ForgeRAG starts with an empty database (0 documents, 0 pages), the GUI show
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/ingest` | Upload PDF (multipart: file, collection, categories, tags) |
-| GET | `/ingest/jobs/{id}` | Poll job progress (includes the per-step status ledger) |
+| GET | `/ingest/jobs/{id}` | Poll job progress (includes the per-step status ledger and the live `current_item` label) |
 | GET | `/ingest/jobs/{id}/logs` | Captured log lines for a job (live-tails running jobs) |
-| GET | `/ingest/jobs` | List recent jobs |
+| GET | `/ingest/jobs` | List jobs. `status` accepts a concrete status, `active` (queued/processing/paused, running first), or `terminal` (completed/failed/cancelled) |
+
+### Job control
+
+Every background job (ingest, repair drains, re-embeds) is a tracked task
+that can be paused, stopped, and restarted. Pause and stop are cooperative:
+the job finishes its current unit of work (one page for entity extraction,
+one batch for embedding/summarization) and then holds or exits, so nothing
+is ever left half-written. All repair job types recompute what's missing
+when they run, so a stopped job restarted later continues where it left off
+instead of redoing finished work.
+
+**Pause-all is the "free the GPU" switch**: every running job holds after
+its current page/batch, queued jobs stay queued, no LLM or embedding calls
+are made while paused, and idle models unload after
+`model_idle_unload_seconds`. The switch is persisted — it survives service
+restarts — and jobs launched while it is on hold immediately until
+resume-all.
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/ingest/jobs/controls` | Global control state: `{pause_all, counts, active}` |
+| POST | `/ingest/jobs/pause-all` | Pause every running and queued job; persists across restarts |
+| POST | `/ingest/jobs/resume-all` | Clear the global pause and all per-job pauses |
+| POST | `/ingest/jobs/{id}/pause` | Pause one job at its next checkpoint |
+| POST | `/ingest/jobs/{id}/resume` | Resume one paused job (stays held if pause-all is on) |
+| POST | `/ingest/jobs/{id}/cancel` | Stop a job. Queued jobs stop immediately; running ones after the current page/batch |
+| POST | `/ingest/jobs/{id}/restart` | Re-launch a finished job as a new job with the same type/params. 400 for jobs from before job-control existed |
+
+Scheduling tip: to run repairs only at night, pair the endpoints with cron —
+`curl -X POST localhost:8200/ingest/jobs/resume-all` in the evening and
+`.../pause-all` in the morning.
 
 ### Knowledge Graph
 | Method | Path | Description |
@@ -670,6 +713,8 @@ When ForgeRAG starts with an empty database (0 documents, 0 pages), the GUI show
 | GET | `/admin/audit/completeness` | Audit every document's pipeline completeness from graph state (embedding dims verified) |
 | GET | `/admin/verify` | Deep verification: ~19 exact-count integrity checks (images on disk, embedding dims, blob byte-integrity, duplicates/orphans, extraction coverage, index health). PASS requires zero violations |
 | POST | `/admin/extract-missing-entities` | Queue entity extraction for every doc with unextracted text pages (server finds them). Long-running background LLM work, resumable |
+| POST | `/admin/resummarize-fallbacks` | One global job that regenerates chunk summaries which fell back to text previews (LLM failures), re-embedding each repaired chunk. Resumable |
+| POST | `/admin/autotag-missing` | One global job that auto-tags every unorganized document (default collection, no categories/tags). Resumable |
 | POST | `/admin/recover-stranded-text` | Queue OCR text recovery + embedding for every doc with pages whose text exists only in chunks |
 | POST | `/admin/backfill-blank-flags` | Compute is_blank on pages missing it (trackable background job) |
 | POST | `/admin/fill-missing` | Queue incremental gap-filling jobs. Body: `{doc_ids, text?, visual?, entities?}` — only missing pages are processed, nothing is cleared |

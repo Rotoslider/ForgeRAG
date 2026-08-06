@@ -156,7 +156,6 @@ async def extract_entities(doc_id: str, request: Request) -> ForgeResult:
     Useful for documents ingested before Phase 4 or after changing the
     extraction prompt. Requires the LLM service to be configured and reachable.
     """
-    import asyncio
     neo4j = request.app.state.neo4j
     jobs = request.app.state.job_manager
     pipeline = request.app.state.pipeline
@@ -180,8 +179,9 @@ async def extract_entities(doc_id: str, request: Request) -> ForgeResult:
         filename=filename,
         categories=[],
         tags=[],
+        job_type="extract-entities", doc_id=doc_id,
     )
-    asyncio.create_task(pipeline.run_extraction_only(job.job_id, doc_id))
+    jobs.spawn(job.job_id, pipeline.run_extraction_only(job.job_id, doc_id))
     return ForgeResult(
         success=True,
         data={"job_id": job.job_id, "doc_id": doc_id, "status": "queued"},
@@ -205,7 +205,6 @@ async def rebuild_chunks(
 
     Queues a job visible in /ingest/jobs and the Ingest tab.
     """
-    import asyncio
     neo4j = request.app.state.neo4j
     jobs = request.app.state.job_manager
     pipeline = request.app.state.pipeline
@@ -229,13 +228,16 @@ async def rebuild_chunks(
         filename=filename,
         categories=[],
         tags=[],
+        job_type="rebuild-chunks", doc_id=doc_id,
+        params={"extract_only": extract_only, "skip_extract": skip_extract},
     )
-    asyncio.create_task(
+    jobs.spawn(
+        job.job_id,
         pipeline.run_rebuild_chunks(
             job.job_id, doc_id,
             extract_only=extract_only,
             skip_extract=skip_extract,
-        )
+        ),
     )
     return ForgeResult(
         success=True,
@@ -250,7 +252,6 @@ async def reembed_document(doc_id: str, request: Request) -> ForgeResult:
     Useful for documents ingested under earlier phases that don't yet have
     embeddings. Creates a new job for progress tracking.
     """
-    import asyncio
     neo4j = request.app.state.neo4j
     jobs = request.app.state.job_manager
     pipeline = request.app.state.pipeline
@@ -268,8 +269,9 @@ async def reembed_document(doc_id: str, request: Request) -> ForgeResult:
         filename=filename,
         categories=[],
         tags=[],
+        job_type="re-embed", doc_id=doc_id,
     )
-    asyncio.create_task(pipeline.run_embeddings_only(job.job_id, doc_id))
+    jobs.spawn(job.job_id, pipeline.run_embeddings_only(job.job_id, doc_id))
     return ForgeResult(
         success=True,
         data={"job_id": job.job_id, "doc_id": doc_id, "status": "queued"},

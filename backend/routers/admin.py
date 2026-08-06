@@ -112,8 +112,10 @@ async def extract_missing_entities(request: Request) -> ForgeResult:
         job = await jobs.create(
             source_path=f"(fill-missing of {r['doc_id']})",
             filename=r["filename"], categories=[], tags=[],
+            job_type="fill-missing", doc_id=r["doc_id"],
+            params={"text": False, "visual": False, "entities": True},
         )
-        asyncio.create_task(pipeline.run_fill_missing(
+        jobs.spawn(job.job_id, pipeline.run_fill_missing(
             job.job_id, r["doc_id"],
             do_text=False, do_visual=False, do_entities=True,
         ))
@@ -138,8 +140,9 @@ async def resummarize_fallbacks(request: Request) -> ForgeResult:
     job = await jobs.create(
         source_path="(resummarize fallback chunks)",
         filename="(all documents)", categories=[], tags=[],
+        job_type="resummarize",
     )
-    asyncio.create_task(pipeline.run_resummarize(job.job_id))
+    jobs.spawn(job.job_id, pipeline.run_resummarize(job.job_id))
     logger.info("Queued resummarize-fallbacks job %s", job.job_id)
     return ForgeResult(success=True, data={"job_id": job.job_id})
 
@@ -155,8 +158,9 @@ async def autotag_missing(request: Request) -> ForgeResult:
     job = await jobs.create(
         source_path="(auto-tag unorganized docs)",
         filename="(all documents)", categories=[], tags=[],
+        job_type="autotag",
     )
-    asyncio.create_task(pipeline.run_autotag_missing(job.job_id))
+    jobs.spawn(job.job_id, pipeline.run_autotag_missing(job.job_id))
     logger.info("Queued autotag-missing job %s", job.job_id)
     return ForgeResult(success=True, data={"job_id": job.job_id})
 
@@ -188,8 +192,11 @@ async def recover_stranded_text(request: Request) -> ForgeResult:
         job = await jobs.create(
             source_path=f"(fill-missing of {r['doc_id']})",
             filename=r["filename"], categories=[], tags=[],
+            job_type="fill-missing", doc_id=r["doc_id"],
+            params={"text": True, "visual": False, "entities": False,
+                    "recover_text": True},
         )
-        asyncio.create_task(pipeline.run_fill_missing(
+        jobs.spawn(job.job_id, pipeline.run_fill_missing(
             job.job_id, r["doc_id"],
             do_text=True, do_visual=False, do_entities=False,
             do_recover_text=True,
@@ -232,6 +239,7 @@ async def backfill_blank_flags(request: Request) -> ForgeResult:
         source_path="(blank-flag backfill)",
         filename=f"(blank flags on {len(docs)} docs)",
         categories=[], tags=[],
+        job_type="blank-flags",
     )
 
     async def _run() -> None:
@@ -245,7 +253,13 @@ async def backfill_blank_flags(request: Request) -> ForgeResult:
             await jobs.update_step(job.job_id, "extracting_text", "running",
                                    detail="computing is_blank flags")
             done = 0
-            for r in docs:
+            for i, r in enumerate(docs):
+                await jobs.checkpoint(job.job_id)
+                await jobs.update(
+                    job.job_id,
+                    current_item=f"doc {i + 1}/{len(docs)} "
+                    f"({r['pages']} pages)",
+                )
                 await pipeline._backfill_blank_flags(r["doc_id"], r["file_hash"])
                 done += r["pages"]
                 await jobs.update(
@@ -259,7 +273,7 @@ async def backfill_blank_flags(request: Request) -> ForgeResult:
             logger.exception("Blank-flag backfill failed")
             await jobs.fail(job.job_id, str(exc))
 
-    asyncio.create_task(_run())
+    jobs.spawn(job.job_id, _run())
     return ForgeResult(success=True, data={
         "queued": True, "job_id": job.job_id,
         "docs": len(docs), "pages": total_pages,
@@ -322,13 +336,17 @@ async def fill_missing(request: Request, payload: dict | None = None) -> ForgeRe
             filename=found[doc_id]["filename"],
             categories=[],
             tags=[],
+            job_type="fill-missing", doc_id=doc_id,
+            params={"text": do_text, "visual": do_visual,
+                    "entities": do_entities, "recover_text": do_recover},
         )
-        asyncio.create_task(
+        jobs.spawn(
+            job.job_id,
             pipeline.run_fill_missing(
                 job.job_id, doc_id,
                 do_text=do_text, do_visual=do_visual, do_entities=do_entities,
                 do_recover_text=do_recover,
-            )
+            ),
         )
         queued.append({"doc_id": doc_id, "job_id": job.job_id})
 
@@ -502,13 +520,17 @@ async def rebuild_chunks_bulk(
             filename=info["filename"],
             categories=[],
             tags=[],
+            job_type="rebuild-chunks", doc_id=doc_id,
+            params={"extract_only": extract_only,
+                    "skip_extract": skip_extract},
         )
-        asyncio.create_task(
+        jobs.spawn(
+            job.job_id,
             pipeline.run_rebuild_chunks(
                 job.job_id, doc_id,
                 extract_only=extract_only,
                 skip_extract=skip_extract,
-            )
+            ),
         )
         queued.append({
             "doc_id": doc_id, "job_id": job.job_id,
@@ -552,8 +574,10 @@ async def bulk_reembed(request: Request) -> ForgeResult:
             filename=r["filename"],
             categories=[],
             tags=[],
+            job_type="re-embed", doc_id=r["doc_id"],
         )
-        asyncio.create_task(pipeline.run_embeddings_only(job.job_id, r["doc_id"]))
+        jobs.spawn(job.job_id,
+                   pipeline.run_embeddings_only(job.job_id, r["doc_id"]))
         job_ids.append({"doc_id": r["doc_id"], "job_id": job.job_id})
 
     return ForgeResult(
@@ -610,8 +634,10 @@ async def reembed_text(request: Request, payload: dict | None = None) -> ForgeRe
             filename=r["filename"],
             categories=[],
             tags=[],
+            job_type="text-reembed", doc_id=r["doc_id"],
         )
-        asyncio.create_task(pipeline.run_text_reembed_only(job.job_id, r["doc_id"]))
+        jobs.spawn(job.job_id,
+                   pipeline.run_text_reembed_only(job.job_id, r["doc_id"]))
         job_ids.append({"doc_id": r["doc_id"], "job_id": job.job_id})
 
     return ForgeResult(

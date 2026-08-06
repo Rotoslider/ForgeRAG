@@ -1,12 +1,19 @@
 import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  cancelJob,
   checkDuplicates,
+  getJobControls,
   getJobLogs,
   listCategories,
   listCollections,
   listTags,
   listJobs,
+  pauseAllJobs,
+  pauseJob,
+  restartJob,
+  resumeAllJobs,
+  resumeJob,
   sha256File,
   uploadPdf,
 } from "../api/client";
@@ -26,6 +33,7 @@ export default function Ingest() {
         previous run stopped.
       </p>
       <UploadForm />
+      <ActiveJobs />
       <JobsList />
     </div>
   );
@@ -530,10 +538,109 @@ function DuplicateGate({
   );
 }
 
+// How many active jobs to render as full cards. Bulk drains can queue
+// hundreds; everything past this cap is summarized in one footer line.
+const ACTIVE_JOBS_SHOWN = 8;
+
+function ActiveJobs() {
+  const qc = useQueryClient();
+  const { data: ctlResp } = useQuery({
+    queryKey: ["job-controls"],
+    queryFn: getJobControls,
+    refetchInterval: 3000,
+  });
+  const { data: activeResp } = useQuery({
+    queryKey: ["jobs-active"],
+    queryFn: () => listJobs("active", 100),
+    refetchInterval: 3000,
+  });
+  const controls = ctlResp?.data;
+  const jobs = activeResp?.data || [];
+  const activeTotal = controls?.active ?? jobs.length;
+  const counts = controls?.counts || {};
+  const pauseAll = !!controls?.pause_all;
+
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ["job-controls"] });
+    qc.invalidateQueries({ queryKey: ["jobs-active"] });
+    qc.invalidateQueries({ queryKey: ["jobs"] });
+  };
+  const toggleAll = useMutation({
+    mutationFn: () => (pauseAll ? resumeAllJobs() : pauseAllJobs()),
+    onSettled: refresh,
+  });
+
+  // Backend orders processing → paused → queued, so the cap always keeps
+  // the jobs that are actually doing something.
+  const shown = jobs.slice(0, ACTIVE_JOBS_SHOWN);
+  const hidden = Math.max(0, activeTotal - shown.length);
+
+  return (
+    <div className="mb-8">
+      <div className="flex items-center mb-3 gap-3 flex-wrap">
+        <h2 className="font-semibold">Active Jobs</h2>
+        <span className="text-xs text-forge-muted" title="Jobs currently running, paused, or waiting for a slot">
+          {activeTotal === 0
+            ? "none"
+            : [
+                counts.processing ? `${counts.processing} running` : null,
+                counts.paused ? `${counts.paused} paused` : null,
+                counts.queued ? `${counts.queued} queued` : null,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+        </span>
+        {(activeTotal > 0 || pauseAll) && (
+          <button
+            type="button"
+            onClick={() => toggleAll.mutate()}
+            disabled={toggleAll.isPending}
+            className={`ml-auto text-xs font-semibold rounded px-3 py-1.5 disabled:opacity-50 ${
+              pauseAll
+                ? "bg-emerald-600 text-white hover:brightness-110"
+                : "bg-amber-500 text-black hover:brightness-110"
+            }`}
+            title={
+              pauseAll
+                ? "Continue all paused and held jobs where they left off"
+                : "Every job holds after its current page/batch — frees the GPU for other work. Jobs stay paused (even across restarts) until you resume."
+            }
+          >
+            {pauseAll ? "▶ Resume all" : "⏸ Pause all (free GPU)"}
+          </button>
+        )}
+      </div>
+      {pauseAll && (
+        <div className="mb-3 text-xs rounded border border-amber-500/50 bg-amber-500/10 text-amber-300 px-3 py-2">
+          All job processing is paused — nothing will use the GPU or LLM
+          until you click “Resume all”. This survives service restarts.
+        </div>
+      )}
+      {activeTotal === 0 && !pauseAll && (
+        <div className="text-forge-muted text-sm">
+          No active jobs. Repair jobs started from the Manage tab appear
+          here with live progress and pause/stop controls.
+        </div>
+      )}
+      <div className="space-y-2">
+        {shown.map((j) => (
+          <JobRowCard key={j.job_id} job={j} />
+        ))}
+      </div>
+      {hidden > 0 && (
+        <div className="text-xs text-forge-muted mt-2">
+          …and {hidden} more active job{hidden === 1 ? "" : "s"} not shown
+          (queued jobs drain a few at a time).
+        </div>
+      )}
+    </div>
+  );
+}
+
 function JobsList() {
   const { data, dataUpdatedAt, isFetching } = useQuery({
     queryKey: ["jobs"],
-    queryFn: () => listJobs(undefined, 30),
+    queryFn: () => listJobs("terminal", 30),
     refetchInterval: 3000,
   });
   const jobs = data?.data || [];
@@ -542,7 +649,7 @@ function JobsList() {
   return (
     <div>
       <div className="flex items-center mb-3 gap-3 flex-wrap">
-        <h2 className="font-semibold">Recent Jobs</h2>
+        <h2 className="font-semibold" title="Jobs that finished — completed, failed, or stopped. Running jobs are in Active Jobs above.">Finished Jobs</h2>
         <span className="text-xs text-forge-muted">
           polling every 3s
           {updatedSec !== null ? ` · updated ${updatedSec}s ago` : ""}
@@ -572,7 +679,7 @@ function JobsList() {
         </span>
       </div>
       {jobs.length === 0 && (
-        <div className="text-forge-muted text-sm">No jobs yet.</div>
+        <div className="text-forge-muted text-sm">No finished jobs yet.</div>
       )}
       <div className="space-y-2">
         {jobs.map((j) => (
@@ -612,7 +719,17 @@ const JOB_TYPE_TIPS: Record<string, string> = {
   "build-communities": "Rebuilds the GraphRAG topic communities across the whole library (Leiden clustering + LLM summaries)",
   "rebuild-chunks": "Re-runs Docling chunking + per-chunk summaries + embeddings for a document",
   "fill-missing": "Repair job from the completeness audit: processes ONLY missing artifacts (recovered text, embeddings, entities) — never redoes finished work",
+  "resummarize": "Regenerates chunk summaries that fell back to raw text previews when the LLM failed — re-embeds each repaired chunk",
+  "autotag": "Auto-tags every unorganized document (no collection/categories/tags) via the LLM",
+  "blank-flags": "Backfills the is_blank flag on old pages so blank pages are skipped by visual embedding",
 };
+
+// Job types the backend's restart endpoint can re-launch (kept in sync
+// with RESTARTABLE_JOB_TYPES in backend/routers/ingestion.py).
+const RESTARTABLE = new Set([
+  "ingest", "fill-missing", "extract-entities", "rebuild-chunks",
+  "re-embed", "text-reembed", "resummarize", "autotag", "build-communities",
+]);
 
 const STEP_CIRCLE: Record<StepStatus, string> = {
   done: "bg-emerald-500",
@@ -750,11 +867,96 @@ function JobLogs({ jobId, isActive }: { jobId: string; isActive: boolean }) {
   );
 }
 
+function JobControlButtons({ job }: { job: JobRow }) {
+  const qc = useQueryClient();
+  const [confirmStop, setConfirmStop] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ["jobs-active"] });
+    qc.invalidateQueries({ queryKey: ["jobs"] });
+    qc.invalidateQueries({ queryKey: ["job-controls"] });
+  };
+  const run = useMutation({
+    mutationFn: (fn: () => Promise<{ success: boolean; reason?: string | null }>) => fn(),
+    onSuccess: (res) => setErr(res.success ? null : res.reason || "request failed"),
+    onSettled: refresh,
+  });
+
+  const isActive =
+    job.status === "processing" || job.status === "queued" || job.status === "paused";
+  const canRestart = !isActive && RESTARTABLE.has(job.job_type);
+  const btn =
+    "text-xs border border-forge-edge rounded px-2 py-0.5 hover:bg-forge-edge disabled:opacity-50";
+
+  return (
+    <>
+      {isActive && job.status !== "paused" && (
+        <button
+          type="button"
+          className={btn}
+          disabled={run.isPending}
+          onClick={() => run.mutate(() => pauseJob(job.job_id))}
+          title="Hold this job after its current page/batch. Nothing is lost — Resume continues where it left off."
+        >
+          ⏸ pause
+        </button>
+      )}
+      {job.status === "paused" && (
+        <button
+          type="button"
+          className={`${btn} text-emerald-400 border-emerald-500/50`}
+          disabled={run.isPending}
+          onClick={() => run.mutate(() => resumeJob(job.job_id))}
+          title="Continue this job where it left off (if Pause all is on, it stays held until Resume all)"
+        >
+          ▶ resume
+        </button>
+      )}
+      {isActive && (
+        <button
+          type="button"
+          className={`${btn} ${confirmStop ? "bg-rose-600 text-white border-rose-600" : "text-rose-400"}`}
+          disabled={run.isPending}
+          onClick={() => {
+            if (!confirmStop) {
+              setConfirmStop(true);
+              setTimeout(() => setConfirmStop(false), 4000);
+              return;
+            }
+            setConfirmStop(false);
+            run.mutate(() => cancelJob(job.job_id));
+          }}
+          title="Stop this job. Finished work is kept; a later Restart re-checks what's missing and continues from there."
+        >
+          {confirmStop ? "confirm stop?" : "■ stop"}
+        </button>
+      )}
+      {canRestart && (
+        <button
+          type="button"
+          className={btn}
+          disabled={run.isPending}
+          onClick={() => run.mutate(() => restartJob(job.job_id))}
+          title="Launch this job again as a new job. Repair jobs re-check what's missing, so this continues rather than redoes."
+        >
+          ↻ restart
+        </button>
+      )}
+      {err && (
+        <span className="text-[10px] text-rose-400" title={err}>
+          {err.length > 60 ? err.slice(0, 60) + "…" : err}
+        </span>
+      )}
+    </>
+  );
+}
+
 function JobRowCard({ job }: { job: JobRow }) {
   const [showLogs, setShowLogs] = useState(false);
   const colorMap: Record<string, string> = {
     queued: "bg-forge-muted/60",
     processing: "bg-forge-secondary",
+    paused: "bg-amber-400",
     completed: "bg-emerald-500",
     failed: "bg-forge-danger",
     cancelled: "bg-amber-500",
@@ -762,20 +964,23 @@ function JobRowCard({ job }: { job: JobRow }) {
   const color = colorMap[job.status] || "bg-forge-muted/60";
   const pct = Math.min(100, Math.max(0, job.progress_pct));
 
-  // Derive job type from source_path pattern
-  const jobType = job.source_path?.startsWith("(reembed")
-    ? "re-embed"
-    : job.source_path?.startsWith("(text-reembed")
-    ? "text-reembed"
-    : job.source_path?.startsWith("(extract")
-    ? "extract-entities"
-    : job.source_path?.startsWith("(build-communities")
-    ? "build-communities"
-    : job.source_path?.startsWith("(rebuild-chunks")
-    ? "rebuild-chunks"
-    : job.source_path?.startsWith("(fill-missing")
-    ? "fill-missing"
-    : "ingest";
+  // Job type: recorded on the row for new jobs; derived from the
+  // source_path pattern for jobs that predate the job_type column.
+  const jobType =
+    job.job_type ||
+    (job.source_path?.startsWith("(reembed")
+      ? "re-embed"
+      : job.source_path?.startsWith("(text-reembed")
+      ? "text-reembed"
+      : job.source_path?.startsWith("(extract")
+      ? "extract-entities"
+      : job.source_path?.startsWith("(build-communities")
+      ? "build-communities"
+      : job.source_path?.startsWith("(rebuild-chunks")
+      ? "rebuild-chunks"
+      : job.source_path?.startsWith("(fill-missing")
+      ? "fill-missing"
+      : "ingest");
 
   const typeColors: Record<string, string> = {
     "ingest": "text-forge-secondary",
@@ -785,9 +990,13 @@ function JobRowCard({ job }: { job: JobRow }) {
     "build-communities": "text-emerald-400",
     "rebuild-chunks": "text-forge-accent",
     "fill-missing": "text-emerald-400",
+    "resummarize": "text-forge-accent",
+    "autotag": "text-forge-secondary",
+    "blank-flags": "text-forge-muted",
   };
 
-  const isActive = job.status === "processing" || job.status === "queued";
+  const isActive =
+    job.status === "processing" || job.status === "queued" || job.status === "paused";
 
   return (
     <div className="bg-forge-panel border border-forge-edge rounded p-3">
@@ -804,6 +1013,7 @@ function JobRowCard({ job }: { job: JobRow }) {
           {job.pages_processed}
           {job.pages_total ? ` / ${job.pages_total}` : ""}
         </span>
+        <JobControlButtons job={job} />
         <button
           type="button"
           onClick={() => setShowLogs((v) => !v)}
@@ -821,6 +1031,20 @@ function JobRowCard({ job }: { job: JobRow }) {
           style={{ width: `${pct}%` }}
         />
       </div>
+      {isActive && job.current_item && (
+        <div
+          className="mt-1.5 text-[11px] font-mono text-sky-300 truncate"
+          title="What this job is working on right now"
+        >
+          ▸ {job.current_item}
+        </div>
+      )}
+      {job.status === "paused" && (
+        <div className="mt-1 text-[11px] text-amber-400">
+          paused — finished its current page/batch and is holding; Resume
+          continues from here
+        </div>
+      )}
       {job.steps && job.steps.length > 0 && (
         <>
           <StepCircles steps={job.steps} />

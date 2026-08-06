@@ -135,7 +135,12 @@ class IngestionPipeline:
         Bounded by the ingestion semaphore so a large batch of uploads drains
         a few at a time instead of all at once.
         """
+        # Gate before AND after the semaphore: pause-all must hold queued
+        # jobs where they are, and must also catch a job whose slot came up
+        # while everything was paused.
+        await self.jobs.checkpoint(job_id)
         async with self._ingest_semaphore:
+            await self.jobs.checkpoint(job_id)
             await self._run_job_inner(job_id, collection)
 
     # The full-ingestion plan, in execution order. Written to the job's step
@@ -377,6 +382,9 @@ class IngestionPipeline:
         """
         current_job_id.set(job_id)
         try:
+            # The build itself is one monolithic call — pause/stop can only
+            # take effect before it starts.
+            await self.jobs.checkpoint(job_id)
             await self.jobs.set_steps(job_id, ["building_graph"])
             if self.community_detector is None:
                 raise ValueError("LLM or text embedding unavailable — cannot detect communities")
@@ -464,22 +472,32 @@ class IngestionPipeline:
             failed_ids: list[str] = []
             BATCH = 100
             while True:
+                await self.jobs.checkpoint(job_id)
                 batch = await self.neo4j.run_query(
                     f"""
                     MATCH (c:Chunk)
                     WHERE ({self._FALLBACK_SUMMARY_PREDICATE})
                       AND NOT c.chunk_id IN $skip
+                    OPTIONAL MATCH (d:Document {{doc_id: c.doc_id}})
                     RETURN c.chunk_id AS chunk_id,
                            c.page_number AS page_number,
                            c.chunk_type AS chunk_type,
                            c.text AS text,
-                           c.section_path AS section_path
+                           c.section_path AS section_path,
+                           d.filename AS filename
                     LIMIT $batch
                     """,
                     {"skip": failed_ids, "batch": BATCH},
                 )
                 if not batch:
                     break
+                names = sorted({r.get("filename") for r in batch if r.get("filename")})
+                item = f"chunks {done + 1}–{done + len(batch)} of {total}"
+                if names:
+                    item += f" — {names[0]}"
+                    if len(names) > 1:
+                        item += f" +{len(names) - 1} more doc(s)"
+                await self.jobs.update(job_id, current_item=item)
                 chunks = [
                     StructuralChunk(
                         chunk_id=r["chunk_id"],
@@ -588,7 +606,7 @@ class IngestionPipeline:
                 WHERE coalesce(d.collection, 'default') = 'default'
                   AND NOT (d)-[:IN_CATEGORY]->()
                   AND NOT (d)-[:TAGGED_WITH]->()
-                RETURN d.doc_id AS doc_id
+                RETURN d.doc_id AS doc_id, d.filename AS filename
                 """,
             )
             total = len(rows)
@@ -611,6 +629,12 @@ class IngestionPipeline:
             failed = 0
             no_text = 0
             for r in rows:
+                await self.jobs.checkpoint(job_id)
+                await self.jobs.update(
+                    job_id,
+                    current_item=f"{r.get('filename') or r['doc_id']} "
+                    f"({done + 1}/{total})",
+                )
                 try:
                     detail = await self._auto_tag(r["doc_id"], "default")
                     # suggest_for_doc returns None for docs with no usable
@@ -668,6 +692,7 @@ class IngestionPipeline:
         """
         current_job_id.set(job_id)
         try:
+            await self.jobs.checkpoint(job_id)
             await self.jobs.set_steps(job_id, ["extracting_entities"])
             await self.jobs.update(job_id, status="processing", doc_id=doc_id)
             if self.entity_extractor is None:
@@ -732,6 +757,7 @@ class IngestionPipeline:
             "writing_chunks", "extracting_entities",
         ]
         try:
+            await self.jobs.checkpoint(job_id)
             await self.jobs.set_steps(job_id, REBUILD_PLAN)
             await self.jobs.update(job_id, status="processing", doc_id=doc_id)
 
@@ -1094,6 +1120,9 @@ class IngestionPipeline:
         current_job_id.set(job_id)
         step = None
         try:
+            # Gate BEFORE the destructive clear below — a queued re-embed
+            # stopped or held here has not nulled anything yet.
+            await self.jobs.checkpoint(job_id)
             await self.jobs.set_steps(job_id, ["embedding_text", "embedding_visual"])
             # Look up file_hash from Neo4j
             rows = await self.neo4j.run_query(
@@ -1181,6 +1210,8 @@ class IngestionPipeline:
         """
         current_job_id.set(job_id)
         try:
+            # Gate BEFORE the destructive clear below (see run_embeddings_only).
+            await self.jobs.checkpoint(job_id)
             await self.jobs.set_steps(job_id, ["embedding_text"])
             # Look up file_hash from Neo4j
             rows = await self.neo4j.run_query(
@@ -1238,7 +1269,11 @@ class IngestionPipeline:
         drain a few at a time instead of all at once — the unbounded version
         of this path is what overloaded the LLM server on 2026-08-06.
         """
+        # Same double gate as run_job: hold queued jobs under pause-all, and
+        # re-check when the semaphore slot finally frees.
+        await self.jobs.checkpoint(job_id)
         async with self._ingest_semaphore:
+            await self.jobs.checkpoint(job_id)
             await self._run_fill_missing_inner(
                 job_id, doc_id,
                 do_text=do_text, do_visual=do_visual,
@@ -1750,37 +1785,47 @@ class IngestionPipeline:
         total = len(pages)
         batch_size = self.settings.ingestion.text_embedding_batch_size
 
-        # Embed in batches under the GPU semaphore
-        async with self.gpu.load_scope("text_embedding"):
-            for start in range(0, total, batch_size):
-                batch = pages[start:start + batch_size]
-                texts = [row["text"] for row in batch]
-                ids = [row["page_id"] for row in batch]
+        # Embed in batches. The GPU scope is taken per batch (not around the
+        # whole loop) so a job paused at the checkpoint below never holds
+        # the GPU semaphore — search-time embedding/reranking stays live and
+        # the idle watcher can actually unload the model. The model itself
+        # stays cached across batches by the GPU manager.
+        for start in range(0, total, batch_size):
+            await self.jobs.checkpoint(job_id)
+            batch = pages[start:start + batch_size]
+            texts = [row["text"] for row in batch]
+            ids = [row["page_id"] for row in batch]
+            await self.jobs.update(
+                job_id,
+                current_item=f"text-embedding pages "
+                f"{start + 1}–{min(start + batch_size, total)} of {total}",
+            )
 
+            async with self.gpu.load_scope("text_embedding"):
                 # Embedding is CPU/GPU-bound — run in a worker thread
                 embeddings = await asyncio.to_thread(
                     self.text_embedding.embed_documents, texts, batch_size=batch_size
                 )
 
-                # Write back in one UNWIND query
-                payload = [
-                    {"page_id": pid, "vec": emb.tolist()}
-                    for pid, emb in zip(ids, embeddings, strict=True)
-                ]
-                await self.neo4j.run_write(
-                    """
-                    UNWIND $rows AS row
-                    MATCH (p:Page {page_id: row.page_id})
-                    SET p.text_embedding = row.vec
-                    """,
-                    {"rows": payload},
-                )
+            # Write back in one UNWIND query
+            payload = [
+                {"page_id": pid, "vec": emb.tolist()}
+                for pid, emb in zip(ids, embeddings, strict=True)
+            ]
+            await self.neo4j.run_write(
+                """
+                UNWIND $rows AS row
+                MATCH (p:Page {page_id: row.page_id})
+                SET p.text_embedding = row.vec
+                """,
+                {"rows": payload},
+            )
 
-                done = min(start + batch_size, total)
-                # Text embedding spans 60% -> 75% in full runs, 10% -> 50% in reembed runs
-                await self.jobs.update(
-                    job_id, pages_processed=done
-                )
+            done = min(start + batch_size, total)
+            # Text embedding spans 60% -> 75% in full runs, 10% -> 50% in reembed runs
+            await self.jobs.update(
+                job_id, pages_processed=done
+            )
 
         logger.info("Embedded text for %d pages of doc %s", total, doc_id)
         return total
@@ -1820,42 +1865,50 @@ class IngestionPipeline:
         # Use the appropriate GPU scope name based on model type
         scope_name = "visual_embed" if isinstance(self.colpali, NemotronService) else "colpali"
 
-        async with self.gpu.load_scope(scope_name):
-            for start in range(0, total, batch_size):
-                batch = rows[start:start + batch_size]
-                image_paths = [
-                    self.pdf_processor.page_image_path(file_hash, r["page_number"])
-                    for r in batch
-                ]
-                page_ids = [r["page_id"] for r in batch]
+        # Per-batch GPU scope, same rationale as _embed_text: a paused job
+        # must never hold the GPU semaphore.
+        for start in range(0, total, batch_size):
+            await self.jobs.checkpoint(job_id)
+            batch = rows[start:start + batch_size]
+            image_paths = [
+                self.pdf_processor.page_image_path(file_hash, r["page_number"])
+                for r in batch
+            ]
+            page_ids = [r["page_id"] for r in batch]
+            await self.jobs.update(
+                job_id,
+                current_item=f"visual-embedding pages "
+                f"{start + 1}–{min(start + batch_size, total)} of {total}",
+            )
 
+            async with self.gpu.load_scope(scope_name):
                 # Both models return list of (K, D) float32 arrays
                 embeddings = await asyncio.to_thread(
                     self.colpali.embed_images, image_paths
                 )
 
-                # Serialize — format is identical for both models
-                _serialize = serialize_nemotron if isinstance(self.colpali, NemotronService) else serialize_colpali
-                payload = []
-                for pid, arr in zip(page_ids, embeddings, strict=True):
-                    blob, k = _serialize(arr)
-                    payload.append(
-                        {"page_id": pid, "blob": blob, "count": k, "dim": int(arr.shape[1]) if arr.size else 128}
-                    )
-
-                await self.neo4j.run_write(
-                    """
-                    UNWIND $rows AS row
-                    MATCH (p:Page {page_id: row.page_id})
-                    SET p.colpali_vectors = row.blob,
-                        p.colpali_vector_count = row.count,
-                        p.colpali_vector_dim = row.dim
-                    """,
-                    {"rows": payload},
+            # Serialize — format is identical for both models
+            _serialize = serialize_nemotron if isinstance(self.colpali, NemotronService) else serialize_colpali
+            payload = []
+            for pid, arr in zip(page_ids, embeddings, strict=True):
+                blob, k = _serialize(arr)
+                payload.append(
+                    {"page_id": pid, "blob": blob, "count": k, "dim": int(arr.shape[1]) if arr.size else 128}
                 )
 
-                done = min(start + batch_size, total)
-                await self.jobs.update(job_id, pages_processed=done)
+            await self.neo4j.run_write(
+                """
+                UNWIND $rows AS row
+                MATCH (p:Page {page_id: row.page_id})
+                SET p.colpali_vectors = row.blob,
+                    p.colpali_vector_count = row.count,
+                    p.colpali_vector_dim = row.dim
+                """,
+                {"rows": payload},
+            )
+
+            done = min(start + batch_size, total)
+            await self.jobs.update(job_id, pages_processed=done)
 
         logger.info("Embedded ColPali for %d pages of doc %s", total, doc_id)
         return total
@@ -1922,6 +1975,12 @@ class IngestionPipeline:
                      "clauses": 0, "equipment": 0,
                      "page_rels": 0, "entity_rels": 0}
         for page in pages:
+            await self.jobs.checkpoint(job_id)
+            await self.jobs.update(
+                job_id,
+                current_item=f"page {page['page_number']} "
+                f"({done + 1}/{total}) — {title[:80]}",
+            )
             try:
                 extraction = await self.entity_extractor.extract_page(
                     document_title=title,
@@ -1976,6 +2035,7 @@ class IngestionPipeline:
         # keeps them under the single "building_chunks" dot.
 
         # 1. Docling pass. Runs off the asyncio loop because it's CPU-bound.
+        await self.jobs.checkpoint(job_id)
         await self.jobs.update(job_id, current_step="chunking")
         await self.jobs.update_step(
             job_id, "building_chunks", "running", detail="chunking (Docling parse)"
@@ -1995,6 +2055,7 @@ class IngestionPipeline:
         # 2. Summaries — bounded-concurrency LLM calls. Short chunks skip
         # the LLM and reuse their text (see ChunkSummarizer).
         assert self.chunk_summarizer is not None
+        await self.jobs.checkpoint(job_id)
         await self.jobs.update(job_id, current_step="summarizing", progress_pct=70.0)
         await self.jobs.update_step(
             job_id, "building_chunks", "running",
@@ -2018,6 +2079,7 @@ class IngestionPipeline:
         # independently via the chunk_text_fulltext index.
         assert self.text_embedding is not None
         assert self.gpu is not None
+        await self.jobs.checkpoint(job_id)
         await self.jobs.update(job_id, current_step="embedding_chunks", progress_pct=72.0)
         await self.jobs.update_step(
             job_id, "building_chunks", "running",
@@ -2041,6 +2103,7 @@ class IngestionPipeline:
         BATCH = 200
         total_written = 0
         for i in range(0, len(chunks), BATCH):
+            await self.jobs.checkpoint(job_id)
             batch = chunks[i : i + BATCH]
             rows = []
             for ch, summ, src, vec in zip(

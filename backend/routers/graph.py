@@ -256,7 +256,6 @@ async def build_communities(request: Request) -> ForgeResult:
     LLM summaries for each community, and embeds them. Existing Community
     nodes are wiped and recreated.
     """
-    import asyncio
     jobs = request.app.state.job_manager
     pipeline = request.app.state.pipeline
 
@@ -271,8 +270,9 @@ async def build_communities(request: Request) -> ForgeResult:
         filename="(all documents)",
         categories=[],
         tags=[],
+        job_type="build-communities",
     )
-    asyncio.create_task(pipeline.run_communities_only(job.job_id))
+    jobs.spawn(job.job_id, pipeline.run_communities_only(job.job_id))
     return ForgeResult(
         success=True,
         data={"job_id": job.job_id, "status": "queued"},
