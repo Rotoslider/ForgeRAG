@@ -602,6 +602,10 @@ class IngestionPipeline:
                             """,
                             {"doc_id": doc_id, "rows": rows_to_write},
                         )
+                        # pages_total was set to the chunk count during
+                        # summarizing; keep pages_processed in step so the
+                        # job card shows 26/26 instead of a misleading 0/26.
+                        await self.jobs.update(job_id, pages_processed=end)
                     await self.jobs.update_step(
                         job_id, "writing_chunks", "done",
                         detail=f"{len(chunks)} chunks written",

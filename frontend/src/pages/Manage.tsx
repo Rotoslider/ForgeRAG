@@ -12,6 +12,7 @@ import {
   getBackupSettings,
   listBackups,
   listCollections,
+  listJobs,
   moveDocument,
   removeDocumentTag,
   extractEntities,
@@ -30,7 +31,7 @@ import {
   updateBackupSettings,
 } from "../api/client";
 import type { AuditReport, BackupSettingsData, DocAudit } from "../api/client";
-import type { DocumentRow } from "../api/types";
+import type { DocumentRow, JobRow } from "../api/types";
 
 export default function Manage() {
   return (
@@ -637,13 +638,50 @@ function DocFixButtons({
   );
 }
 
+// Live status of a repair queued from the audit table, resolved by polling
+// the jobs list. Shows queued → running (step + %) → done/failed.
+function RepairStatus({ label, job }: { label: string; job: JobRow | null }) {
+  if (!job || job.status === "queued") {
+    return (
+      <span className="text-forge-muted" title={`${label} queued`}>
+        {label}: queued…
+      </span>
+    );
+  }
+  if (job.status === "processing") {
+    return (
+      <span className="text-sky-300 animate-pulse" title={`${label} running`}>
+        {job.current_step} {Math.round(job.progress_pct)}%
+      </span>
+    );
+  }
+  if (job.status === "failed") {
+    return (
+      <span
+        className="text-rose-400"
+        title={job.error_message || `${label} failed — see its logs on the Ingest page`}
+      >
+        ✗ failed — see logs
+      </span>
+    );
+  }
+  return (
+    <span className="text-emerald-400" title={`${label} finished`}>
+      ✓ done — re-run audit
+    </span>
+  );
+}
+
 function CompletenessCard() {
   const qc = useQueryClient();
   const [showAll, setShowAll] = useState(false);
   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
   const [expandedDoc, setExpandedDoc] = useState<string | null>(null);
-  // doc_id -> human label of what was queued for it this session
-  const [queuedDocs, setQueuedDocs] = useState<Record<string, string>>({});
+  // doc_id -> repair queued for it this session. Tracked jobs are polled so
+  // each audit row shows queued → running → done live, and a banner offers a
+  // one-click re-audit when everything has finished (the table's numbers are
+  // frozen at the last audit run and would otherwise silently go stale).
+  const [tracked, setTracked] = useState<Record<string, { jobId: string | null; label: string }>>({});
   const audit = useQuery({
     queryKey: ["completeness"],
     queryFn: auditCompleteness,
@@ -653,31 +691,39 @@ function CompletenessCard() {
   });
   const report: AuditReport | undefined = audit.data?.data;
 
+  const trackJobs = (
+    jobs: Array<{ doc_id: string; job_id: string }> | undefined,
+    label: string
+  ) => {
+    if (!jobs?.length) return;
+    setTracked((prev) => {
+      const next = { ...prev };
+      for (const j of jobs) next[j.doc_id] = { jobId: j.job_id, label };
+      return next;
+    });
+    qc.invalidateQueries({ queryKey: ["jobs"] });
+  };
+
   const fill = useMutation({
     mutationFn: fillMissingBulk,
-    onSuccess: (res) => {
-      setQueuedMsg(
-        `Queued ${res.data?.queued ?? 0} fill-missing job(s) — track them on the Ingest page, then re-run the audit.`
+    onSuccess: (res, vars) => {
+      setQueuedMsg(`Queued ${res.data?.queued ?? 0} fill-missing job(s).`);
+      trackJobs(
+        res.data?.jobs,
+        vars.entities ? "entity extraction" : "embedding fill"
       );
-      qc.invalidateQueries({ queryKey: ["jobs"] });
     },
   });
   const chunkFix = useMutation({
     mutationFn: (ids: string[]) =>
       rebuildChunksBulk({ doc_ids: ids, skip_extract: true, only_missing: true }),
     onSuccess: (res) => {
-      setQueuedMsg(
-        `Queued ${res.data?.queued ?? 0} chunk-rebuild job(s) — track them on the Ingest page, then re-run the audit.`
-      );
-      qc.invalidateQueries({ queryKey: ["jobs"] });
+      setQueuedMsg(`Queued ${res.data?.queued ?? 0} chunk-rebuild job(s).`);
+      trackJobs(res.data?.jobs, "chunk rebuild");
     },
   });
 
   // ---- per-document repairs (queued from a row's expanded fix panel)
-  const markDocQueued = (docId: string, label: string) => {
-    setQueuedDocs((prev) => ({ ...prev, [docId]: label }));
-    qc.invalidateQueries({ queryKey: ["jobs"] });
-  };
   const fillOne = useMutation({
     mutationFn: (args: { doc_id: string; text: boolean; visual: boolean; entities: boolean }) =>
       fillMissingBulk({
@@ -686,21 +732,54 @@ function CompletenessCard() {
         visual: args.visual,
         entities: args.entities,
       }),
-    onSuccess: (_res, args) =>
-      markDocQueued(
-        args.doc_id,
+    onSuccess: (res, args) =>
+      trackJobs(
+        res.data?.jobs,
         args.entities ? "entity extraction" : "embedding fill"
       ),
   });
   const chunkOne = useMutation({
     mutationFn: (docId: string) => rebuildChunks(docId, { skip_extract: true }),
-    onSuccess: (_res, docId) => markDocQueued(docId, "chunk rebuild"),
+    onSuccess: (res, docId) =>
+      trackJobs(
+        res.data ? [{ doc_id: docId, job_id: res.data.job_id }] : undefined,
+        "chunk rebuild"
+      ),
   });
   const reembedOne = useMutation({
     mutationFn: (docId: string) => reembedDocument(docId),
-    onSuccess: (_res, docId) => markDocQueued(docId, "full re-embed"),
+    onSuccess: (res, docId) =>
+      trackJobs(
+        res.data ? [{ doc_id: docId, job_id: res.data.job_id }] : undefined,
+        "full re-embed"
+      ),
   });
   const rowBusy = fillOne.isPending || chunkOne.isPending || reembedOne.isPending;
+
+  // Poll job status while any tracked repair is outstanding.
+  const trackedIds = Object.values(tracked)
+    .map((t) => t.jobId)
+    .filter(Boolean) as string[];
+  const jobsPoll = useQuery({
+    queryKey: ["completeness-jobs"],
+    queryFn: () => listJobs(undefined, 300),
+    refetchInterval: 4000,
+    enabled: trackedIds.length > 0,
+  });
+  const jobById = new Map<string, JobRow>(
+    (jobsPoll.data?.data ?? []).map((j) => [j.job_id, j])
+  );
+  const trackedJobStatus = (docId: string): JobRow | null => {
+    const t = tracked[docId];
+    if (!t?.jobId) return null;
+    return jobById.get(t.jobId) ?? null;
+  };
+  const outstanding = Object.keys(tracked).filter((docId) => {
+    const j = trackedJobStatus(docId);
+    return !j || j.status === "queued" || j.status === "processing";
+  });
+  const allRepairsFinished =
+    Object.keys(tracked).length > 0 && outstanding.length === 0;
 
   const docsWhere = (aspect: string, statuses: string[]) =>
     (report?.documents ?? [])
@@ -747,10 +826,31 @@ function CompletenessCard() {
         {report && (
           <span className="text-xs text-forge-muted">
             audited {report.summary.documents} docs / {report.summary.total_pages.toLocaleString()} pages
+            {" at "}{new Date(report.generated_at).toLocaleTimeString()}
             {" · "}dims verified: text {report.text_dim}, visual {report.visual_dim}
           </span>
         )}
       </div>
+      {allRepairsFinished && (
+        <div className="border border-emerald-500/50 bg-emerald-500/10 rounded p-3 mb-3 text-xs flex items-center gap-3 flex-wrap">
+          <span className="text-emerald-300 font-semibold">
+            All queued repairs have finished.
+          </span>
+          <span className="text-forge-muted">
+            The numbers below are from the last audit and are now stale.
+          </span>
+          <button
+            onClick={() => {
+              setTracked({});
+              setQueuedMsg(null);
+              audit.refetch();
+            }}
+            className="bg-forge-accent text-black font-semibold rounded px-2.5 py-1 hover:brightness-110"
+          >
+            Re-run audit now
+          </button>
+        </div>
+      )}
       <p className="text-xs text-forge-muted mb-3">
         Checks every document against the graph itself — no re-processing. Each
         step leaves a fingerprint (embeddings, chunks, entity links), so missing
@@ -899,12 +999,13 @@ function CompletenessCard() {
                         {AUDIT_ASPECTS.map((a) => (
                           <AuditCell key={a.key} doc={d} aspect={a.key} />
                         ))}
-                        <td className="px-2 py-1 text-right">
+                        <td className="px-2 py-1 text-right whitespace-nowrap">
                           {d.overall !== "complete" &&
-                            (queuedDocs[d.doc_id] ? (
-                              <span className="text-emerald-400" title={`${queuedDocs[d.doc_id]} queued`}>
-                                ✓ queued
-                              </span>
+                            (tracked[d.doc_id] ? (
+                              <RepairStatus
+                                label={tracked[d.doc_id].label}
+                                job={trackedJobStatus(d.doc_id)}
+                              />
                             ) : (
                               <button
                                 onClick={() =>
@@ -921,13 +1022,13 @@ function CompletenessCard() {
                             ))}
                         </td>
                       </tr>
-                      {expandedDoc === d.doc_id && !queuedDocs[d.doc_id] && (
+                      {expandedDoc === d.doc_id && !tracked[d.doc_id] && (
                         <tr className="border-b border-forge-edge/50 bg-forge-bg/50">
                           <td colSpan={AUDIT_ASPECTS.length + 3} className="px-3 py-1">
                             <DocFixButtons
                               doc={d}
                               busy={rowBusy}
-                              queuedLabel={queuedDocs[d.doc_id] ?? null}
+                              queuedLabel={null}
                               onFill={(opts) =>
                                 fillOne.mutate({ doc_id: d.doc_id, ...opts })
                               }
