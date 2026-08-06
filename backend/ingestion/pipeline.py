@@ -35,6 +35,7 @@ from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pdf_processor import PDFProcessor
 from backend.ingestion.text_extractor import TextExtractor
 from backend.services.colpali_service import ColPaliService, serialize_colpali
+from backend.services.entity_merge import merge_entity
 from backend.services.nemotron_service import NemotronService, serialize_nemotron
 from backend.services.gpu_manager import GPUManager
 from backend.services.llm_service import LLMService
@@ -2263,72 +2264,10 @@ class IngestionPipeline:
                     else:
                         winner_name, loser_name = name, cand_name
 
-                    # Redirect relationships and delete loser. Cypher MERGE
-                    # needs a literal relationship type, so discover the
-                    # types actually touching the loser and redirect each
-                    # one separately (same pattern as
-                    # scripts/canonicalize_entity_apply.py). Type strings
-                    # come from the graph's own type(r) values, never user
-                    # input, so interpolating them is safe.
-                    params = {"winner": winner_name, "loser": loser_name}
-                    incoming = await self.neo4j.run_query(
-                        f"MATCH ()-[r]->(l:{label} {{{pk}: $loser}}) "
-                        "RETURN DISTINCT type(r) AS t",
-                        params,
-                    )
-                    for row in incoming:
-                        await self.neo4j.run_write(
-                            f"""
-                            MATCH (w:{label} {{{pk}: $winner}})
-                            MATCH (l:{label} {{{pk}: $loser}})
-                            OPTIONAL MATCH (src)-[r:{row['t']}]->(l)
-                            WITH w, src, r
-                            WHERE r IS NOT NULL AND src <> w
-                            MERGE (src)-[nr:{row['t']}]->(w)
-                            ON CREATE SET
-                                nr.support_count = coalesce(r.support_count, 0),
-                                nr.context = r.context
-                            ON MATCH SET
-                                nr.support_count = coalesce(nr.support_count, 0)
-                                                 + coalesce(r.support_count, 0)
-                            DELETE r
-                            """,
-                            params,
-                        )
-                    outgoing = await self.neo4j.run_query(
-                        f"MATCH (l:{label} {{{pk}: $loser}})-[r]->(t) "
-                        "RETURN DISTINCT type(r) AS t, labels(t)[0] AS tl",
-                        params,
-                    )
-                    for row in outgoing:
-                        await self.neo4j.run_write(
-                            f"""
-                            MATCH (w:{label} {{{pk}: $winner}})
-                            MATCH (l:{label} {{{pk}: $loser}})
-                            OPTIONAL MATCH (l)-[r:{row['t']}]->(tgt:{row['tl']})
-                            WITH w, tgt, r
-                            WHERE r IS NOT NULL AND tgt <> w
-                            MERGE (w)-[nr:{row['t']}]->(tgt)
-                            ON CREATE SET
-                                nr.support_count = coalesce(r.support_count, 0),
-                                nr.context = r.context
-                            ON MATCH SET
-                                nr.support_count = coalesce(nr.support_count, 0)
-                                                 + coalesce(r.support_count, 0)
-                            DELETE r
-                            """,
-                            params,
-                        )
-                    # Any leftover edges (self-references between the pair)
-                    # go down with the loser node.
-                    await self.neo4j.run_write(
-                        f"""
-                        MATCH (w:{label} {{{pk}: $winner}})
-                        MATCH (l:{label} {{{pk}: $loser}})
-                        SET w.common_names = coalesce(w.common_names, []) + [$loser]
-                        DETACH DELETE l
-                        """,
-                        params,
+                    # Redirect relationships and delete the loser via the
+                    # shared per-type merge (backend/services/entity_merge).
+                    await merge_entity(
+                        self.neo4j, label, pk, winner_name, loser_name
                     )
                     total_merged += 1
                     logger.debug(

@@ -18,12 +18,15 @@ import {
   listCollections,
   listJobs,
   moveDocument,
+  normalizeEntities,
   removeDocumentTag,
   extractEntities,
+  browseDirectories,
   fetchHealth,
   getGpu,
   getSchedule,
   graphStats,
+  openWatchFolder,
   listCommunities,
   listDocuments,
   listEntities,
@@ -41,6 +44,7 @@ import {
 import type {
   AuditReport,
   BackupSettingsData,
+  BrowseListing,
   DocAudit,
   ScheduleConfig,
   WatchConfig,
@@ -241,6 +245,94 @@ function fmtWhen(iso: string): string {
   return `${day} ${d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`;
 }
 
+function FolderBrowser({
+  initialPath,
+  onPick,
+  onClose,
+}: {
+  initialPath?: string;
+  onPick: (path: string) => void;
+  onClose: () => void;
+}) {
+  const [listing, setListing] = useState<BrowseListing | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const navigate = async (path?: string) => {
+    const res = await browseDirectories(path);
+    if (res.success && res.data) {
+      setListing(res.data);
+      setErr(null);
+    } else {
+      setErr(res.reason || "cannot open folder");
+    }
+  };
+  useEffect(() => {
+    navigate(initialPath || undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-6">
+      <div className="bg-forge-panel border border-forge-edge rounded-lg p-4 w-full max-w-lg">
+        <div className="flex items-center gap-2 mb-2">
+          <h3 className="text-sm font-semibold flex-1">Choose a folder</h3>
+          <button
+            type="button"
+            onClick={() => listing && navigate(listing.home)}
+            className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge"
+            title="Jump to your home folder"
+          >
+            home
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge"
+          >
+            close
+          </button>
+        </div>
+        <div className="text-xs font-mono text-forge-muted mb-2 truncate" title={listing?.path}>
+          {listing?.path || "…"}
+        </div>
+        {err && <div className="text-xs text-rose-400 mb-2">{err}</div>}
+        <div className="max-h-64 overflow-y-auto border border-forge-edge rounded bg-forge-bg mb-3">
+          {listing?.parent && (
+            <button
+              type="button"
+              onClick={() => navigate(listing.parent!)}
+              className="w-full text-left px-3 py-1.5 text-sm hover:bg-forge-edge font-mono"
+            >
+              ..
+            </button>
+          )}
+          {listing?.dirs.map((d) => (
+            <button
+              key={d.path}
+              type="button"
+              onClick={() => navigate(d.path)}
+              className="w-full text-left px-3 py-1.5 text-sm hover:bg-forge-edge font-mono truncate"
+              title={d.path}
+            >
+              {d.name}/
+            </button>
+          ))}
+          {listing && listing.dirs.length === 0 && (
+            <div className="px-3 py-2 text-xs text-forge-muted">no subfolders</div>
+          )}
+        </div>
+        <button
+          type="button"
+          disabled={!listing}
+          onClick={() => listing && onPick(listing.path)}
+          className="bg-forge-accent text-black font-semibold rounded px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50"
+        >
+          Use this folder
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function ScheduleCard() {
   const qc = useQueryClient();
   const { data } = useQuery({
@@ -307,6 +399,16 @@ function ScheduleCard() {
 
   const collections = collectionsResp?.data || [];
   const busy = saveSched.isPending || saveWatch.isPending;
+  const [browsing, setBrowsing] = useState(false);
+  const openFolder = useMutation({
+    mutationFn: openWatchFolder,
+    onSuccess: (res) =>
+      setNote(
+        res.success
+          ? { kind: "ok", text: "Opened in the file manager (on the ForgeRAG machine)." }
+          : { kind: "err", text: res.reason || "could not open folder" }
+      ),
+  });
 
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg p-5">
@@ -432,7 +534,7 @@ function ScheduleCard() {
                   checked={watch.enabled}
                   onChange={(e) => setWatch({ ...watch, enabled: e.target.checked })}
                 />
-                <span title="PDFs dropped into the inbox are ingested automatically whenever job processing isn't paused — with a schedule on, they wait for the window. Files are picked up only once fully copied; duplicates are filed to duplicates/ untouched; ingested files move to ingested/.">
+                <span title="PDFs dropped into the inbox (subfolders included) are ingested automatically whenever job processing isn't paused — with a schedule on, they wait for the window. Files are picked up only once fully copied; duplicates are filed to duplicates/ untouched; ingested files move to ingested/ keeping their folder structure.">
                   Auto-ingest PDFs from an inbox folder
                 </span>
               </label>
@@ -447,13 +549,40 @@ function ScheduleCard() {
                 />
                 <button
                   type="button"
+                  onClick={() => setBrowsing(true)}
+                  className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge"
+                  title="Browse the ForgeRAG machine's folders and pick one"
+                >
+                  browse…
+                </button>
+                <button
+                  type="button"
                   onClick={() => setWatch({ ...watch, path: "" })}
                   className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge"
                   title={`Use the default inbox: ${status?.watch.default_path || ""}`}
                 >
                   default
                 </button>
+                <button
+                  type="button"
+                  disabled={!payload?.watch.enabled || !status?.watch.path_ok || openFolder.isPending}
+                  onClick={() => openFolder.mutate()}
+                  className="text-xs border border-forge-edge rounded px-2 py-1 hover:bg-forge-edge disabled:opacity-50"
+                  title="Open the saved inbox folder in the file manager (window appears on the ForgeRAG machine's screen)"
+                >
+                  open
+                </button>
               </div>
+              {browsing && (
+                <FolderBrowser
+                  initialPath={watch.path || status?.watch.default_path}
+                  onPick={(p) => {
+                    setWatch({ ...watch, path: p });
+                    setBrowsing(false);
+                  }}
+                  onClose={() => setBrowsing(false)}
+                />
+              )}
               <div className="flex items-center gap-2 mb-3">
                 <span className="text-xs text-forge-muted">collection</span>
                 <input
@@ -833,6 +962,16 @@ const VERIFY_FIXES: Record<string, {
     note: "Computes is_blank from the reduced images — a few minutes of CPU.",
     run: () => backfillBlankFlags(),
   },
+  no_temp_rel_garbage: {
+    label: (v) => `Normalize entities now (${v.toLocaleString()} junk edges)`,
+    note: "Converts the junk __TEMP_REL edges back into real page links, then merges case/whitespace duplicate entities. Runs synchronously — usually well under a minute.",
+    run: () => normalizeEntities(),
+  },
+  entities_case_deduped: {
+    label: (v) => `Normalize entities now (${v.toLocaleString()} duplicates)`,
+    note: "Merges entities that differ only by case/whitespace onto the most-mentioned spelling — every relationship is redirected, nothing is lost. Runs synchronously.",
+    run: () => normalizeEntities(),
+  },
 };
 
 // Loose response shape shared by the verify-fix drains — queued is a count
@@ -840,7 +979,12 @@ const VERIFY_FIXES: Record<string, {
 interface ForgeResultShape {
   success: boolean;
   reason?: string | null;
-  data?: { queued?: number | boolean; pages?: number };
+  data?: {
+    queued?: number | boolean;
+    pages?: number;
+    merged?: number;
+    temp_rels_recovered?: number;
+  };
 }
 
 function VerificationCard() {

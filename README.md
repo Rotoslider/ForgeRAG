@@ -74,7 +74,7 @@ Recent additions since the Phase 9 baseline:
 - **OCR text recovery for scanned PDFs** — scanned documents have no text layer, so page-level extraction finds nothing; but Docling OCRs the page images during chunking, so the real text lives on the Chunk nodes. The audit flags these ("page text" column), and a one-click repair copies the OCR text back onto the pages, then embeds it and extracts entities from it — turning image-only books into fully searchable ones.
 - **Deep Verification** — a Manage-page card (and `GET /admin/verify`) that proves the database is intact with exact counts and zero sampling: page counts and numbering, duplicates and orphans, every page image on disk, text consistency, embedding presence at exact dimensions, visual-embedding blob byte-integrity, chunk completeness, extraction coverage, and index health. The verdict is PASS only at literally zero violations.
 - **Job control (pause / stop / restart)** — every background job is a tracked task. The Ingest tab's **Active Jobs** panel shows what each job is working on *right now* ("page 267 (4/368) — ASM Handbook Vol 3"), with per-job pause/resume/stop buttons and a restart button on finished jobs. Pause and stop are cooperative — the current page/batch finishes first, so nothing is half-written — and every repair recomputes its missing-work set, so a stopped job restarted later continues instead of redoing. **Pause all (free GPU)** holds the entire queue (persists across service restarts; jobs launched while paused hold immediately), letting you keep the GPU free during the day and run repairs overnight with one click.
-- **Schedule & Automation** — a Manage-page card that automates the pause/resume switch on a daily **processing window** ("run jobs 21:00 → 06:30 on these days", overnight windows supported). The scheduler fires at window boundaries, catches up after a reboot, and leaves manual pause/resume clicks in force until the next boundary. The same card configures a **watch folder**: PDFs dropped into an inbox are auto-ingested through the normal pipeline (same concurrency caps) whenever processing is allowed — with a schedule on, files dropped during the day simply wait for the window. Files are picked up only once fully copied, hash-checked so already-ingested PDFs are filed to `duplicates/` without spending any GPU, and moved to `ingested/` when queued. A live event log shows everything the scheduler has done.
+- **Schedule & Automation** — a Manage-page card that automates the pause/resume switch on a daily **processing window** ("run jobs 21:00 → 06:30 on these days", overnight windows supported). The scheduler fires at window boundaries, catches up after a reboot, and leaves manual pause/resume clicks in force until the next boundary. The same card configures a **watch folder**: PDFs dropped into an inbox (subfolders included) are auto-ingested through the normal pipeline (same concurrency caps) whenever processing is allowed — with a schedule on, files dropped during the day simply wait for the window. Files are picked up only once fully copied, hash-checked so already-ingested PDFs are filed to `duplicates/` without spending any GPU, and moved to `ingested/` when queued (folder structure preserved). A built-in folder browser picks the inbox path; an **open** button pops it up in the file manager. A live event log shows everything the scheduler has done.
 
 ## Architecture
 
@@ -467,7 +467,7 @@ Manage → **Schedule & Automation** automates the same switch on a daily **proc
 - catches up after a restart — if the machine was off when the window opened, the boundary is applied on startup;
 - applies the current window state immediately when you enable or edit the schedule (the status chip on the card shows the result).
 
-The **watch folder** on the same card gives you an auto-ingest inbox. Drop PDFs into it (default `data/ingest-inbox/`, or any folder you choose) and they are ingested through the normal upload pipeline — same few-at-a-time concurrency, same LLM caps, visible as regular jobs on the Ingest tab — whenever processing is allowed. With a schedule on, that means files dropped during the day queue up the moment the window opens, after any already-queued work. Safety rails: a file is only picked up once its size stops changing (never mid-copy), already-ingested PDFs (by content hash) are filed to `duplicates/` without touching the GPU, queued originals move to `ingested/`, and a **scan now** button processes the inbox on demand. Recent scheduler activity (windows opened/closed, files queued, duplicates filed) is shown in the card's event log.
+The **watch folder** on the same card gives you an auto-ingest inbox. Drop PDFs into it — subfolders included — and they are ingested through the normal upload pipeline — same few-at-a-time concurrency, same LLM caps, visible as regular jobs on the Ingest tab — whenever processing is allowed. With a schedule on, that means files dropped during the day queue up the moment the window opens, after any already-queued work. The default inbox is `data/ingest-inbox/`; use **browse…** to pick any folder on the machine and **open** to pop the inbox open in the file manager (on the ForgeRAG machine's screen). Safety rails: a file is only picked up once its size stops changing (never mid-copy), already-ingested PDFs (by content hash) are filed to `duplicates/` without touching the GPU, queued originals move to `ingested/` (keeping their subfolder structure in both cases), and a **scan now** button processes the inbox on demand. Recent scheduler activity (windows opened/closed, files queued, duplicates filed) is shown in the card's event log.
 
 Prefer external tooling? The same switch is scriptable: `curl -X POST localhost:8200/ingest/jobs/resume-all` and `.../pause-all`.
 
@@ -485,7 +485,7 @@ Queued repairs appear in the Ingest page's Active Jobs panel with their own step
 
 ### Deep Verification — proving the database is intact
 
-Manage → **Deep Verification** → *Run verification* is the strictest check in the system: ~19 read-only integrity checks with exact counts and **zero sampling** across the whole library. Where the completeness audit answers "which steps ran per document", verification answers "is every artifact the pipeline claims to have produced actually present and well-formed":
+Manage → **Deep Verification** → *Run verification* is the strictest check in the system: 24 read-only integrity checks with exact counts and **zero sampling** across the whole library. Where the completeness audit answers "which steps ran per document", verification answers "is every artifact the pipeline claims to have produced actually present and well-formed":
 
 - page counts match the PDFs; page numbering contiguous; no duplicate pages, no orphan pages or chunks
 - every page's full-resolution and reduced image exists **on disk**
@@ -707,8 +707,10 @@ Schedule & Automation, endpoints below) instead of external cron.
 |--------|------|-------------|
 | GET | `/schedule` | Schedule + watch-folder config and live status (window open/closed, next boundary, inbox counts, recent events) |
 | PUT | `/schedule` | Update the processing window. Body: `{enabled, start "HH:MM", end "HH:MM", days [0-6, Mon=0]}` — overnight windows supported; takes effect within seconds |
-| PUT | `/schedule/watch` | Update the auto-ingest inbox. Body: `{enabled, path, collection}` — empty path selects the default inbox (created for you) |
+| PUT | `/schedule/watch` | Update the auto-ingest inbox. Body: `{enabled, path, collection}` — empty path selects the default inbox (created for you); subfolders are scanned too |
 | POST | `/schedule/watch/scan-now` | Scan the inbox immediately, skipping the file-stability wait |
+| GET | `/schedule/browse` | List server-side subdirectories (`?path=`) — backs the GUI folder picker |
+| POST | `/schedule/watch/open-folder` | Open the inbox in the file manager on the ForgeRAG machine |
 
 ### Knowledge Graph
 | Method | Path | Description |
@@ -736,7 +738,7 @@ Schedule & Automation, endpoints below) instead of external cron.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/admin/audit/completeness` | Audit every document's pipeline completeness from graph state (embedding dims verified) |
-| GET | `/admin/verify` | Deep verification: ~19 exact-count integrity checks (images on disk, embedding dims, blob byte-integrity, duplicates/orphans, extraction coverage, index health). PASS requires zero violations |
+| GET | `/admin/verify` | Deep verification: 24 exact-count integrity checks (images on disk, embedding dims, blob byte-integrity, duplicates/orphans, extraction coverage, entity hygiene, index health). PASS requires zero violations |
 | POST | `/admin/extract-missing-entities` | Queue entity extraction for every doc with unextracted text pages (server finds them). Long-running background LLM work, resumable |
 | POST | `/admin/resummarize-fallbacks` | One global job that regenerates chunk summaries which fell back to text previews (LLM failures), re-embedding each repaired chunk. Resumable |
 | POST | `/admin/autotag-missing` | One global job that auto-tags every unorganized document (default collection, no categories/tags). Resumable |

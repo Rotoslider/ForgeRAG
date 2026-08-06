@@ -320,6 +320,12 @@ export const restartJob = (id: string) =>
     { method: "POST" }
   );
 
+export const normalizeEntities = () =>
+  request<{ merged: number; temp_rels_recovered: number }>(
+    "/admin/normalize-entities",
+    { method: "POST" }
+  );
+
 // ---- Schedule & automation ----
 export interface ScheduleConfig {
   enabled: boolean;
@@ -371,6 +377,24 @@ export const scanWatchNow = () =>
     "/schedule/watch/scan-now",
     { method: "POST" }
   );
+
+export interface BrowseListing {
+  path: string;
+  parent: string | null;
+  dirs: Array<{ name: string; path: string }>;
+  home: string;
+  default: string;
+}
+
+export const browseDirectories = (path?: string) =>
+  request<BrowseListing>(
+    `/schedule/browse${path ? `?path=${encodeURIComponent(path)}` : ""}`
+  );
+
+export const openWatchFolder = () =>
+  request<{ opened: string }>("/schedule/watch/open-folder", {
+    method: "POST",
+  });
 
 // ---- Search ----
 export const searchSemantic = (query: string, limit = 10) =>

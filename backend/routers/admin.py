@@ -368,27 +368,35 @@ async def fill_missing(request: Request, payload: dict | None = None) -> ForgeRe
 async def normalize_entities(request: Request) -> ForgeResult:
     """Merge duplicate entities that differ only by case or whitespace.
 
-    Finds pairs like 'Aluminum' and 'aluminum', 'GTAW ' and 'GTAW',
-    merges their relationships onto the canonical (most-mentioned) version,
-    and deletes the duplicate. Idempotent.
+    Finds groups like 'Aluminum' / 'aluminum' / 'GTAW ', keeps the
+    most-mentioned spelling, and redirects EVERY relationship from the
+    duplicates onto it (per actual relationship type, accumulating
+    support_count) before deleting them — no mentions are lost. Also
+    repairs the damage the previous, broken version of this endpoint
+    could leave behind: junk ``<Label>__TEMP_REL`` edges are converted
+    back to the proper page relationship first. Idempotent.
     """
+    from backend.services.entity_merge import (
+        ENTITY_LABELS,
+        merge_entity,
+        recover_temp_rels,
+    )
+
     neo4j = request.app.state.neo4j
+
+    temp_recovered = await recover_temp_rels(neo4j)
     total_merged = 0
 
-    for label, pk in [
-        ("Material", "name"),
-        ("Process", "name"),
-        ("Standard", "code"),
-        ("Equipment", "name"),
-    ]:
+    for label, pk in ENTITY_LABELS:
         # Find groups that differ only by case/whitespace
         rows = await neo4j.run_query(
             f"""
             MATCH (e:{label})
-            WITH toLower(trim(e.{pk})) AS normalized, collect(e) AS nodes
-            WHERE size(nodes) > 1
-            RETURN normalized, [n IN nodes | n.{pk}] AS names, size(nodes) AS count
+            WITH toLower(trim(e.{pk})) AS normalized, collect(e.{pk}) AS names
+            WHERE size(names) > 1
+            RETURN normalized, names
             """,
+            timeout=600.0,
         )
 
         for group in rows:
@@ -410,43 +418,19 @@ async def normalize_entities(request: Request) -> ForgeResult:
                     best_count = mentions
                     best = name
 
-            # Merge all others into the best one
             for name in names:
                 if name == best:
                     continue
-                # Transfer page relationships from duplicate to canonical
-                await neo4j.run_write(
-                    f"""
-                    MATCH (dup:{label} {{{pk}: $dup_name}})
-                    MATCH (keep:{label} {{{pk}: $keep_name}})
-                    OPTIONAL MATCH (p:Page)-[r]->(dup)
-                    WITH dup, keep, p, type(r) AS rel_type
-                    WHERE p IS NOT NULL
-                    CALL {{
-                        WITH p, keep, rel_type
-                        WITH p, keep, rel_type
-                        WHERE rel_type IS NOT NULL
-                        MERGE (p)-[:{label}__TEMP_REL]->(keep)
-                    }}
-                    """,
-                    {"dup_name": name, "keep_name": best},
-                )
-                # Actually, Cypher can't dynamically create relationship types.
-                # Simpler approach: just delete the duplicate. Page relationships
-                # that pointed to it are lost, but the canonical entity already
-                # has its own mentions from its pages.
-                await neo4j.run_write(
-                    f"MATCH (e:{label} {{{pk}: $name}}) DETACH DELETE e",
-                    {"name": name},
-                )
+                await merge_entity(neo4j, label, pk, best, name)
                 total_merged += 1
-                logger.info(
-                    "Merged %s duplicate '%s' into '%s'", label, name, best
-                )
 
+    logger.info(
+        "normalize-entities: merged %d duplicate(s), recovered %d temp rel(s)",
+        total_merged, temp_recovered,
+    )
     return ForgeResult(
         success=True,
-        data={"merged": total_merged},
+        data={"merged": total_merged, "temp_rels_recovered": temp_recovered},
     )
 
 

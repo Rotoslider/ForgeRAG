@@ -7,8 +7,9 @@ own /schedule prefix (proxied in vite.config.ts for dev).
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 
 from backend.models.common import ForgeResult
 
@@ -67,6 +68,61 @@ async def put_watch(request: Request, payload: dict) -> ForgeResult:
     return ForgeResult(success=True, data={
         "watch": sched.watch, "status": sched.status(),
     })
+
+
+@router.get("/browse")
+async def browse_directories(
+    request: Request,
+    path: str | None = Query(None, description="Directory to list; omit for a sensible start"),
+) -> ForgeResult:
+    """List subdirectories of a server-side folder — the GUI's folder
+    picker for choosing the watch inbox. Directories only, no files."""
+    sched = request.app.state.scheduler
+    if path:
+        base = Path(path).expanduser()
+    elif sched.watch.get("path"):
+        base = Path(sched.watch["path"])
+    else:
+        base = sched.default_watch_path().parent
+    try:
+        base = base.resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not base.is_dir():
+        raise HTTPException(
+            status_code=400, detail=f"not a directory: {base}"
+        )
+    try:
+        dirs = sorted(
+            (d for d in base.iterdir()
+             if d.is_dir() and not d.name.startswith(".")),
+            key=lambda d: d.name.lower(),
+        )
+    except PermissionError:
+        raise HTTPException(
+            status_code=400, detail=f"permission denied: {base}"
+        )
+    return ForgeResult(success=True, data={
+        "path": str(base),
+        "parent": str(base.parent) if base.parent != base else None,
+        "dirs": [{"name": d.name, "path": str(d)} for d in dirs],
+        "home": str(Path.home()),
+        "default": str(sched.default_watch_path()),
+    })
+
+
+@router.post("/watch/open-folder")
+async def open_watch_folder(request: Request) -> ForgeResult:
+    """Open the inbox folder in the desktop file manager (on the ForgeRAG
+    machine itself — this is a single-box deployment)."""
+    sched = request.app.state.scheduler
+    try:
+        sched.open_watch_folder()
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:  # xdg-open missing, no display, ...
+        raise HTTPException(status_code=500, detail=f"could not open: {exc}") from exc
+    return ForgeResult(success=True, data={"opened": sched.watch["path"]})
 
 
 @router.post("/watch/scan-now")

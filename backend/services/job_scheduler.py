@@ -28,8 +28,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import shutil
+import subprocess
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -153,6 +155,11 @@ class JobScheduler:
         self._last_scan_at: datetime | None = None
         self._last_scan_note: str = ""
         self._scan_lock = asyncio.Lock()
+        # Injectable for tests; opens the file manager in production.
+        self._opener = lambda cmd, env: subprocess.Popen(
+            cmd, env=env, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
     # ------------------------------------------------------------ lifecycle
 
@@ -362,14 +369,39 @@ class JobScheduler:
 
     # ----------------------------------------------------------- watch folder
 
-    @staticmethod
-    def _list_inbox(inbox: Path) -> list[Path]:
-        """Top-level PDFs in the inbox (subfolders like ingested/ excluded)."""
-        return sorted(
-            p
-            for p in inbox.iterdir()
-            if p.is_file() and p.suffix.lower() == ".pdf"
+    # Output subtrees the scanner must never re-scan.
+    _SKIP_DIRS = frozenset({"ingested", "duplicates"})
+
+    @classmethod
+    def _list_inbox(cls, inbox: Path) -> list[Path]:
+        """PDFs anywhere under the inbox (subfolders included), excluding
+        the ingested/ and duplicates/ output trees."""
+        out = []
+        for p in sorted(inbox.rglob("*")):
+            if not (p.is_file() and p.suffix.lower() == ".pdf"):
+                continue
+            rel = p.relative_to(inbox)
+            if rel.parts[0] in cls._SKIP_DIRS:
+                continue
+            out.append(p)
+        return out
+
+    def open_watch_folder(self) -> None:
+        """Open the inbox in the desktop file manager. ForgeRAG is a
+        single-box deployment, so the window opens on the server's own
+        desktop session — the GUI env vars are filled in because the
+        systemd service doesn't inherit them."""
+        path = self.watch.get("path")
+        if not path or not Path(path).is_dir():
+            raise ValueError("watch folder is not configured or missing")
+        uid = os.getuid()
+        env = dict(os.environ)
+        env.setdefault("DISPLAY", ":0")
+        env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{uid}")
+        env.setdefault(
+            "DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus"
         )
+        self._opener(["xdg-open", path], env)
 
     async def scan_watch_folder(self, force: bool = False) -> dict[str, Any]:
         """One scan pass. `force` skips the stability wait (used by the
@@ -427,7 +459,9 @@ class JobScheduler:
 
     async def _ingest_inbox_file(self, inbox: Path, p: Path) -> bool:
         """Queue one inbox PDF. Returns False if it was a duplicate (filed
-        to duplicates/ without creating a job)."""
+        to duplicates/ without creating a job). Files from subfolders keep
+        their relative path under ingested/ and duplicates/."""
+        rel = p.relative_to(inbox)
         file_hash = await _sha256_helper(p)
         existing = await self.pipeline.neo4j.run_query(
             "MATCH (d:Document {file_hash: $h}) "
@@ -435,10 +469,10 @@ class JobScheduler:
             {"h": file_hash},
         )
         if existing:
-            dest = _move_out(p, inbox / "duplicates")
+            _move_out(p, inbox / "duplicates" / rel.parent)
             await self._event(
-                f"duplicate skipped: {p.name} (already ingested as "
-                f"“{existing[0]['title']}”) — moved to {dest.parent.name}/"
+                f"duplicate skipped: {rel} (already ingested as "
+                f"“{existing[0]['title']}”) — moved to duplicates/"
             )
             return False
 
@@ -459,8 +493,8 @@ class JobScheduler:
         self.jobs.spawn(
             job.job_id, self.pipeline.run_job(job.job_id, collection=collection)
         )
-        _move_out(p, inbox / "ingested")
-        await self._event(f"queued from inbox: {p.name}")
+        _move_out(p, inbox / "ingested" / rel.parent)
+        await self._event(f"queued from inbox: {rel}")
         return True
 
 

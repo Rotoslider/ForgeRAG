@@ -307,6 +307,51 @@ async def run_verification(neo4j, settings) -> dict:
         bad_entities, samples=ent_samples[:SAMPLE],
     ))
 
+    # Junk relationships left by the pre-2026-08-06 normalize-entities bug
+    # (it invented <Label>__TEMP_REL edges instead of real page links).
+    temp_total = 0
+    temp_samples: list = []
+    for label in ("Material", "Process", "Standard", "Equipment"):
+        rows = await q(
+            f"MATCH ()-[r:{label}__TEMP_REL]->() RETURN count(r) AS n"
+        )
+        n = rows[0]["n"] if rows else 0
+        if n:
+            temp_total += n
+            temp_samples.append({"label": label, "count": n})
+    checks.append(_check(
+        "no_temp_rel_garbage",
+        "No junk <Label>__TEMP_REL relationships exist (artifact of the old "
+        "normalize-entities bug)",
+        temp_total, samples=temp_samples,
+        detail="run 'Normalize entities' — it converts these back to real "
+        "page links" if temp_total else None,
+    ))
+
+    # Case/whitespace duplicate entities. These accumulate because the
+    # post-ingest dedup step was broken (invalid MERGE) from 2026-05-05 to
+    # 2026-08-06 — hygiene, not data loss, so a warning rather than a fail.
+    dup_extra = 0
+    dup_samples: list = []
+    for label, pk in [("Material", "name"), ("Process", "name"),
+                      ("Standard", "code"), ("Equipment", "name")]:
+        rows = await q(f"""
+            MATCH (e:{label})
+            WITH toLower(trim(e.{pk})) AS k, collect(e.{pk}) AS names
+            WHERE size(names) > 1
+            RETURN '{label}' AS label, names LIMIT 1000
+        """)
+        dup_extra += sum(len(r["names"]) - 1 for r in rows)
+        dup_samples.extend(rows[:3])
+    checks.append(_check(
+        "entities_case_deduped",
+        "No two entities of one type differ only by case/whitespace",
+        dup_extra, samples=dup_samples[:SAMPLE],
+        status="warn" if dup_extra else "pass",
+        detail="run 'Normalize entities' to merge them (mentions are "
+        "preserved)" if dup_extra else None,
+    ))
+
     # ---------------------------------------------------------- communities
     rows = await q("""
         MATCH (c:Community)

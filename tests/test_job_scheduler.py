@@ -298,3 +298,60 @@ async def test_put_watch_and_scan_now(api, tmp_path):
 
     r = await client.put("/schedule/watch", json={"enabled": True, "path": "/nope"})
     assert r.status_code == 400
+
+
+# ----------------------------------------------------- subfolders / browse
+
+
+@pytest.mark.asyncio
+async def test_watch_scan_recurses_and_preserves_structure(scheduler):
+    sched, manager, pipeline, _ = scheduler
+    await sched.update_watch({"enabled": True, "path": ""})
+    inbox = sched.default_watch_path()
+    (inbox / "robotics" / "gaits").mkdir(parents=True)
+    (inbox / "robotics" / "gaits" / "trot.pdf").write_bytes(b"%PDF-1.4 trot")
+    # Files inside the output trees must never be re-scanned.
+    (inbox / "ingested").mkdir()
+    (inbox / "ingested" / "old.pdf").write_bytes(b"%PDF-1.4 old")
+
+    result = await sched.scan_watch_folder(force=True)
+    assert result["queued"] == 1
+    assert (inbox / "ingested" / "robotics" / "gaits" / "trot.pdf").exists()
+    assert (inbox / "ingested" / "old.pdf").exists()  # untouched
+    jobs = await manager.list_recent(limit=5)
+    assert jobs[0].filename == "trot.pdf"
+
+
+@pytest.mark.asyncio
+async def test_browse_endpoint_lists_directories(api, tmp_path):
+    client, _ = api
+    (tmp_path / "alpha").mkdir()
+    (tmp_path / "beta").mkdir()
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / "file.txt").write_text("x")
+
+    r = await client.get("/schedule/browse", params={"path": str(tmp_path)})
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert [d["name"] for d in data["dirs"]] == ["alpha", "beta"]
+    assert data["parent"] == str(tmp_path.parent)
+
+    r = await client.get("/schedule/browse", params={"path": str(tmp_path / "nope")})
+    assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_open_folder_endpoint(api):
+    client, sched = api
+    # Not configured yet -> 409
+    r = await client.post("/schedule/watch/open-folder")
+    assert r.status_code == 409
+
+    await sched.update_watch({"enabled": True, "path": ""})
+    calls = []
+    sched._opener = lambda cmd, env: calls.append((cmd, env))
+    r = await client.post("/schedule/watch/open-folder")
+    assert r.status_code == 200
+    assert calls and calls[0][0][0] == "xdg-open"
+    assert calls[0][0][1] == sched.watch["path"]
+    assert "DISPLAY" in calls[0][1]
