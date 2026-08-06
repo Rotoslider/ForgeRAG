@@ -690,7 +690,9 @@ function DocFixButtons({
     Math.max(0, (a[k]?.needed ?? 0) - (a[k]?.done ?? 0));
   const textGap = gap("text_embedding");
   const visualGap = gap("visual_embedding");
-  const entityGap = gap("entities");
+  const entityGap =
+    a.entities?.status !== "na" &&
+    (a.entities?.needed ?? 0) > (a.entities?.done ?? 0);
   const chunksMissing = a.chunks?.status === "missing";
   const chunksPartial = a.chunks?.status === "partial";
   const dimError =
@@ -943,7 +945,15 @@ function CompletenessCard() {
         ])
       )
     : [];
-  const entityGapDocs = docsWhere("entities", ["missing", "partial"]);
+  // Any deficit counts, not just below-threshold statuses — a doc at 80%
+  // entity coverage still has unextracted pages, and 100% completeness
+  // (the deep-verification bar) requires draining those too.
+  const entityGapDocs = (report?.documents ?? [])
+    .filter((d) => {
+      const a = d.aspects.entities;
+      return a && a.status !== "na" && a.needed > a.done;
+    })
+    .map((d) => d.doc_id);
   const chunkGapDocs = docsWhere("chunks", ["missing"]);
   const recoverDocs = (report?.documents ?? [])
     .filter((d) => d.recoverable_text_pages > 0)
