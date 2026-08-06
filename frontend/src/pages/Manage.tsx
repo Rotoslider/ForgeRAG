@@ -24,6 +24,7 @@ import {
   browseDirectories,
   fetchHealth,
   getGpu,
+  getJobControls,
   getSchedule,
   graphStats,
   openWatchFolder,
@@ -1022,6 +1023,7 @@ function VerificationCard() {
 
   return (
     <div className="bg-forge-panel border border-forge-edge rounded-lg p-5">
+      <PausedJobsWarning />
       <div className="flex items-center gap-3 flex-wrap mb-2">
         <h2 className="font-semibold">Deep Verification</h2>
         <button
@@ -1251,7 +1253,8 @@ function DocFixButtons({
   if (queuedLabel) {
     return (
       <div className="text-xs text-emerald-400 py-1">
-        ✓ {queuedLabel} queued — watch it on the Ingest page, then re-run the audit.
+        ✓ {queuedLabel} queued — its live status shows in this row; re-run the
+        audit after it reads “done”.
       </div>
     );
   }
@@ -1348,13 +1351,45 @@ function DocFixButtons({
   );
 }
 
+// Amber banner shown on the repair cards while the global pause is on —
+// without it, "queue a fix" looks like "run a fix" and nothing visibly
+// happens (the exact confusion behind the 2026-08-06 "fixed but not
+// fixed" reports).
+function PausedJobsWarning() {
+  const { data } = useQuery({
+    queryKey: ["job-controls"],
+    queryFn: getJobControls,
+    refetchInterval: 5000,
+  });
+  if (!data?.data?.pause_all) return null;
+  return (
+    <div className="mb-3 text-xs rounded border border-amber-500/50 bg-amber-500/10 text-amber-300 px-3 py-2">
+      Job processing is <b>paused</b> — repairs you queue here are created but
+      hold at "⏸ held" and the audit numbers will NOT change until you click
+      “Resume all” on the Ingest page (or your schedule window opens).
+    </div>
+  );
+}
+
 // Live status of a repair queued from the audit table, resolved by polling
-// the jobs list. Shows queued → running (step + %) → done/failed.
+// the jobs list. Every status is spelled out — a job that is held, stopped,
+// or killed must NEVER read as done (that exact confusion is how "fixed"
+// jobs silently went nowhere during the 2026-08-06 incident).
 function RepairStatus({ label, job }: { label: string; job: JobRow | null }) {
   if (!job || job.status === "queued") {
     return (
-      <span className="text-forge-muted" title={`${label} queued`}>
+      <span className="text-forge-muted" title={`${label} queued — waiting for a slot; drains a few at a time`}>
         {label}: queued…
+      </span>
+    );
+  }
+  if (job.status === "paused") {
+    return (
+      <span
+        className="text-amber-400"
+        title={`${label} is held because job processing is paused. Click "Resume all" on the Ingest page (or wait for the schedule window) and it will run.`}
+      >
+        ⏸ held — jobs are paused
       </span>
     );
   }
@@ -1372,6 +1407,13 @@ function RepairStatus({ label, job }: { label: string; job: JobRow | null }) {
         title={job.error_message || `${label} failed — see its logs on the Ingest page`}
       >
         ✗ failed — see logs
+      </span>
+    );
+  }
+  if (job.status === "cancelled") {
+    return (
+      <span className="text-amber-400" title={`${label} was stopped before finishing`}>
+        ■ stopped
       </span>
     );
   }
@@ -1565,6 +1607,7 @@ function CompletenessCard() {
           </span>
         )}
       </div>
+      <PausedJobsWarning />
       {allRepairsFinished && (
         <div className="border border-emerald-500/50 bg-emerald-500/10 rounded p-3 mb-3 text-xs flex items-center gap-3 flex-wrap">
           <span className="text-emerald-300 font-semibold">
