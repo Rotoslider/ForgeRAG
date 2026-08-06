@@ -471,33 +471,6 @@ Queued repairs appear on the Ingest page with their own step circles and logs. R
 - **Communities**: rebuild GraphRAG summaries from the entity graph
 - **Entities**: browse Materials, Processes, Standards, Equipment with page mention counts
 
-### Rebuild existing documents for Phase 9
-
-Documents ingested before Phase 9 only have Page-level embeddings. To get them onto the new chunked + RRF retrieval path:
-
-**GUI path** — Manage tab, select docs, click "rebuild". Progress in the Ingest tab.
-
-**CLI path**:
-
-```bash
-# Full rebuild of every doc — runs overnight at scale
-NEO4J_PASSWORD=... ./venv/bin/python scripts/rebuild_chunks.py
-
-# Just the docs that don't have chunks yet (resume)
-NEO4J_PASSWORD=... ./venv/bin/python scripts/rebuild_chunks.py --only-missing
-
-# One specific doc
-NEO4J_PASSWORD=... ./venv/bin/python scripts/rebuild_chunks.py --doc-id DOC_XXX
-
-# Cheap retry: only re-extract entities on pages that failed
-NEO4J_PASSWORD=... ./venv/bin/python scripts/rebuild_chunks.py --doc-id DOC_XXX --extract-only
-```
-
-Flags:
-- `--only-missing` — skip docs that already have Chunk nodes
-- `--skip-extract` — chunks + summaries + embeddings only (no entity re-extraction)
-- `--extract-only` — only re-extract entities on pages missing `topic_tags` (inverse of `--skip-extract`)
-
 ### Backfill tags/categories on older documents
 
 Documents ingested before the auto-tagger existed — or ingested with manual tags that were later deleted — can be backfilled without a full rebuild. Per-doc via the Manage UI's **suggest** button, or bulk via the script:
