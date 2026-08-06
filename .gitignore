@@ -15,9 +15,9 @@ __pycache__/
 .env.local
 config/forgerag.toml
 
-# Data
-data/page_images/
-data/reduced_images/
+# Data — all runtime state (page images, uploads, job DB, backups)
+data/
+config/backup_settings.json
 data/highlighted_images/
 data/uploads/
 data/*.sqlite
