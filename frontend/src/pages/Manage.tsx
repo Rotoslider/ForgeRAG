@@ -6,6 +6,7 @@ import {
   applyTags,
   auditCompleteness,
   buildCommunities,
+  deepVerify,
   deleteDocument,
   fillMissingBulk,
   getBackupProgress,
@@ -44,6 +45,7 @@ export default function Manage() {
       </div>
       <BackupRestoreCard />
       <CompletenessCard />
+      <VerificationCard />
       <DocumentsTable />
       <EntitiesPanel />
     </div>
@@ -476,6 +478,123 @@ function BackupRestoreCard() {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ------------------------------------------------------------ verification
+
+function VerificationCard() {
+  const verify = useQuery({
+    queryKey: ["deep-verify"],
+    queryFn: deepVerify,
+    enabled: false, // full scans incl. on-disk file checks — on demand only
+    staleTime: Infinity,
+    retry: false,
+  });
+  const report = verify.data?.data;
+  const [showPassed, setShowPassed] = useState(false);
+
+  return (
+    <div className="bg-forge-panel border border-forge-edge rounded-lg p-5">
+      <div className="flex items-center gap-3 flex-wrap mb-2">
+        <h2 className="font-semibold">Deep Verification</h2>
+        <button
+          onClick={() => verify.refetch()}
+          disabled={verify.isFetching}
+          className="bg-forge-accent text-black font-semibold rounded px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50"
+        >
+          {verify.isFetching ? "Verifying… (full scans, ~1-2 min)" : "Run verification"}
+        </button>
+        {report && (
+          <span
+            className={`text-sm font-bold px-3 py-0.5 rounded border ${
+              report.verdict === "PASS"
+                ? "text-emerald-300 border-emerald-500/60 bg-emerald-500/10"
+                : "text-rose-300 border-rose-500/60 bg-rose-500/10"
+            }`}
+          >
+            {report.verdict} — {report.checks_passed}/{report.checks_total} checks
+            {report.checks_warned > 0 ? ` (${report.checks_warned} warnings)` : ""}
+          </span>
+        )}
+        {report && (
+          <span className="text-xs text-forge-muted">
+            at {new Date(report.generated_at).toLocaleTimeString()}
+          </span>
+        )}
+      </div>
+      <p className="text-xs text-forge-muted mb-3">
+        Verifies every pipeline invariant with exact counts and zero sampling:
+        page counts and numbering, duplicates and orphans, images on disk, text
+        consistency, embedding dimensions and blob byte-integrity, chunk
+        completeness, entity extraction coverage, community summaries, and
+        index health. PASS means zero violations anywhere.
+      </p>
+      {verify.isError && (
+        <div className="text-sm text-rose-400 mb-3">
+          Verification failed to run: {(verify.error as Error).message}
+        </div>
+      )}
+      {report && !verify.isFetching && (
+        <>
+          <label className="flex items-center gap-1.5 cursor-pointer text-xs text-forge-muted mb-2">
+            <input
+              type="checkbox"
+              checked={showPassed}
+              onChange={(e) => setShowPassed(e.target.checked)}
+            />
+            show passed checks too
+          </label>
+          <div className="space-y-1">
+            {report.checks
+              .filter((c) => showPassed || c.status !== "pass")
+              .map((c) => (
+                <div
+                  key={c.name}
+                  className="flex items-start gap-2 text-xs border border-forge-edge/60 rounded px-2 py-1.5"
+                >
+                  <span
+                    className={`h-2.5 w-2.5 rounded-full shrink-0 mt-0.5 ${
+                      c.status === "pass"
+                        ? "bg-emerald-500"
+                        : c.status === "warn"
+                        ? "bg-amber-500"
+                        : "bg-rose-500"
+                    }`}
+                  />
+                  <div className="min-w-0">
+                    <span className="font-mono">{c.name}</span>
+                    <span className="text-forge-muted"> — {c.description}</span>
+                    {c.violations > 0 && (
+                      <span className={c.status === "warn" ? "text-amber-400" : "text-rose-400"}>
+                        {" "}({c.violations.toLocaleString()} violation{c.violations === 1 ? "" : "s"})
+                      </span>
+                    )}
+                    {c.detail && (
+                      <div className="text-forge-muted">{c.detail}</div>
+                    )}
+                    {c.samples.length > 0 && (
+                      <details className="text-forge-muted">
+                        <summary className="cursor-pointer">sample offenders</summary>
+                        <pre className="whitespace-pre-wrap break-all text-[10px] mt-1">
+                          {JSON.stringify(c.samples, null, 1)}
+                        </pre>
+                      </details>
+                    )}
+                  </div>
+                </div>
+              ))}
+            {report.verdict === "PASS" &&
+              report.checks_warned === 0 &&
+              !showPassed && (
+                <div className="text-sm text-emerald-400">
+                  Every check passed with zero violations.
+                </div>
+              )}
+          </div>
+        </>
+      )}
     </div>
   );
 }

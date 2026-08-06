@@ -55,6 +55,27 @@ async def audit_completeness(request: Request) -> ForgeResult:
     return ForgeResult(success=True, data=report)
 
 
+@router.get("/verify")
+async def deep_verify(request: Request) -> ForgeResult:
+    """Deep pipeline verification — every invariant, exact counts, no sampling.
+
+    Read-only. Slower than the completeness audit (full scans including
+    on-disk image checks and blob byte-size validation); expect a minute or
+    two on a ~100k-page library. Returns PASS only when every check has
+    zero violations.
+    """
+    from backend.services.verification import run_verification
+
+    report = await run_verification(
+        request.app.state.neo4j, request.app.state.settings
+    )
+    logger.info(
+        "Deep verification: %s (%d/%d checks passed)",
+        report["verdict"], report["checks_passed"], report["checks_total"],
+    )
+    return ForgeResult(success=True, data=report)
+
+
 @router.post("/fill-missing")
 async def fill_missing(request: Request, payload: dict | None = None) -> ForgeResult:
     """Queue incremental gap-filling jobs for the given documents.

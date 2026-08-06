@@ -368,6 +368,30 @@ export interface AuditReport {
 export const auditCompleteness = () =>
   request<AuditReport>("/admin/audit/completeness", { timeoutMs: 15 * 60 * 1000 });
 
+// ---- Deep verification ----
+export interface VerifyCheck {
+  name: string;
+  description: string;
+  status: "pass" | "fail" | "warn";
+  violations: number;
+  total: number | null;
+  samples: Array<Record<string, unknown>>;
+  detail: string | null;
+}
+
+export interface VerifyReport {
+  generated_at: string;
+  verdict: "PASS" | "FAIL";
+  checks_total: number;
+  checks_passed: number;
+  checks_failed: number;
+  checks_warned: number;
+  checks: VerifyCheck[];
+}
+
+export const deepVerify = () =>
+  request<VerifyReport>("/admin/verify", { timeoutMs: 15 * 60 * 1000 });
+
 export const fillMissingBulk = (body: {
   doc_ids: string[];
   text?: boolean;
