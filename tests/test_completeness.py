@@ -22,7 +22,9 @@ def _row(**overrides) -> dict:
         "visual_embedded_ok": 95,
         "pages_with_chunks": 90,
         "pages_with_entities": 80,
+        "pages_extraction_done": 80,
         "pages_with_topic_tags": 80,
+        "chunks_built": False,
     }
     base.update(overrides)
     return base
@@ -103,8 +105,56 @@ def test_no_chunks_is_missing():
 
 
 def test_low_entity_coverage_is_partial():
-    d = _audit(_row(pages_with_entities=10))
+    d = _audit(_row(pages_with_entities=10, pages_extraction_done=10))
     assert d["aspects"]["entities"]["status"] == "partial"
+
+
+def test_extraction_marker_completes_entities_despite_empty_pages():
+    """Pages where extraction ran but found nothing (stamped with
+    entities_extracted_at) count as done — a scanned doc whose only text
+    page has no entities must converge to green, not loop forever."""
+    d = _audit(_row(pages_with_text=11, pages_with_entities=5,
+                    pages_extraction_done=11))
+    a = d["aspects"]["entities"]
+    assert a["status"] == "done"
+    assert a["done"] == 11
+    assert "6 extracted with no entities found" in a["detail"]
+
+
+def test_chunks_built_marker_completes_chunks():
+    """A completed chunk build is final even if some pages yielded no
+    chunks — Docling assigns chunks to the pages that have content."""
+    d = _audit(
+        _row(pages_with_text=7, pages_with_chunks=5, chunks_built=True),
+        chunk_count=26,
+    )
+    a = d["aspects"]["chunks"]
+    assert a["status"] == "done"
+    assert "build completed" in a["detail"]
+    assert "2 pages yielded none" in a["detail"]
+
+
+def test_scanned_doc_with_docling_chunks_beyond_text_pages():
+    """Scanned PDF: 1 text page per PyMuPDF but Docling chunked 391 pages.
+    The chunk denominator must grow to the chunked pages (391/391 done,
+    not the absurd 391/1), and one extraction-marked text page satisfies
+    entities."""
+    d = _audit(
+        _row(pages=499, declared_pages=499, source_type="scanned",
+             pages_with_text=1, blank_pages=0,
+             text_embedded=1, text_embedded_ok=1,
+             visual_embedded=499, visual_embedded_ok=499,
+             pages_with_chunks=391, pages_with_entities=0,
+             pages_extraction_done=1, pages_with_topic_tags=0),
+        chunk_count=4922,
+    )
+    c = d["aspects"]["chunks"]
+    assert c["status"] == "done"
+    assert c["done"] == 391 and c["needed"] == 391
+    e = d["aspects"]["entities"]
+    assert e["status"] == "done"
+    assert e["done"] == 1 and e["needed"] == 1
+    assert d["overall"] == "complete"
 
 
 def test_summarize_rolls_up_gaps():

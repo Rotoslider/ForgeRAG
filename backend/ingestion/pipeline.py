@@ -606,6 +606,15 @@ class IngestionPipeline:
                         # summarizing; keep pages_processed in step so the
                         # job card shows 26/26 instead of a misleading 0/26.
                         await self.jobs.update(job_id, pages_processed=end)
+                    # Mark the doc as chunk-built so the completeness audit
+                    # treats whatever coverage Docling achieved as final —
+                    # some pages legitimately yield no chunks, and without
+                    # the marker those docs read as forever-incomplete.
+                    await self.neo4j.run_write(
+                        "MATCH (d:Document {doc_id: $id}) "
+                        "SET d.chunks_built_at = datetime()",
+                        {"id": doc_id},
+                    )
                     await self.jobs.update_step(
                         job_id, "writing_chunks", "done",
                         detail=f"{len(chunks)} chunks written",
@@ -663,6 +672,11 @@ class IngestionPipeline:
                             )
                             await self.graph_builder.write_page(
                                 page_id=p["page_id"], extraction=extraction,
+                            )
+                            await self.neo4j.run_write(
+                                "MATCH (p:Page {page_id: $pid}) "
+                                "SET p.entities_extracted_at = datetime()",
+                                {"pid": p["page_id"]},
                             )
                         except Exception as exc:  # noqa: BLE001
                             logger.warning(
@@ -1464,6 +1478,7 @@ class IngestionPipeline:
             MATCH (d:Document {doc_id: $doc_id})
             OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
             WHERE p.text_char_count > 0
+              AND p.entities_extracted_at IS NULL
               AND NOT EXISTS {
                 (p)-[:MENTIONS_MATERIAL|DESCRIBES_PROCESS|REFERENCES_STANDARD|MENTIONS_EQUIPMENT]->()
               }
@@ -1510,6 +1525,16 @@ class IngestionPipeline:
                 )
                 for k, v in counts.items():
                     aggregate[k] = aggregate.get(k, 0) + v
+                # Stamp the page as extracted even when zero entities were
+                # found — otherwise "ran and found nothing" is
+                # indistinguishable from "never ran", the completeness audit
+                # reports it as a gap forever, and repair jobs re-pay the
+                # LLM for the same empty pages on every run.
+                await self.neo4j.run_write(
+                    "MATCH (p:Page {page_id: $pid}) "
+                    "SET p.entities_extracted_at = datetime()",
+                    {"pid": page["page_id"]},
+                )
             except Exception as exc:  # noqa: BLE001
                 failed += 1
                 logger.warning("Entity extraction failed for page %d: %s",
@@ -1640,6 +1665,12 @@ class IngestionPipeline:
             )
             total_written += len(rows)
 
+        if total_written:
+            await self.neo4j.run_write(
+                "MATCH (d:Document {doc_id: $id}) "
+                "SET d.chunks_built_at = datetime()",
+                {"id": doc_id},
+            )
         logger.info(
             "Wrote %d chunks for doc %s (types: %s)",
             total_written, doc_id,
