@@ -76,6 +76,71 @@ async def deep_verify(request: Request) -> ForgeResult:
     return ForgeResult(success=True, data=report)
 
 
+@router.post("/backfill-blank-flags")
+async def backfill_blank_flags(request: Request) -> ForgeResult:
+    """Compute is_blank on every page that doesn't have it yet.
+
+    Pages ingested before the blank-page filter existed have is_blank NULL;
+    the flag only matters for skipping blank pages on future re-embeds, but
+    backfilling it clears the deep-verification warning and makes the data
+    uniform. Runs as a background job (loads each affected page's reduced
+    image to measure grayscale variance).
+    """
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    docs = await neo4j.run_query(
+        """
+        MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
+        WHERE p.is_blank IS NULL
+        RETURN d.doc_id AS doc_id, d.file_hash AS file_hash,
+               count(p) AS pages
+        """,
+    )
+    if not docs:
+        return ForgeResult(success=True, data={"queued": False, "docs": 0,
+                                               "reason": "nothing to backfill"})
+
+    total_pages = sum(r["pages"] for r in docs)
+    job = await jobs.create(
+        source_path="(blank-flag backfill)",
+        filename=f"(blank flags on {len(docs)} docs)",
+        categories=[], tags=[],
+    )
+
+    async def _run() -> None:
+        from backend.ingestion.job_logs import current_job_id
+        current_job_id.set(job.job_id)
+        try:
+            await jobs.set_steps(job.job_id, ["extracting_text"])
+            await jobs.update(job.job_id, status="processing",
+                              current_step="extracting_text",
+                              pages_total=total_pages)
+            await jobs.update_step(job.job_id, "extracting_text", "running",
+                                   detail="computing is_blank flags")
+            done = 0
+            for r in docs:
+                await pipeline._backfill_blank_flags(r["doc_id"], r["file_hash"])
+                done += r["pages"]
+                await jobs.update(
+                    job.job_id, pages_processed=done,
+                    progress_pct=min(99.0, 100.0 * done / max(total_pages, 1)),
+                )
+            await jobs.update_step(job.job_id, "extracting_text", "done",
+                                   detail=f"{total_pages} pages flagged")
+            await jobs.complete(job.job_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Blank-flag backfill failed")
+            await jobs.fail(job.job_id, str(exc))
+
+    asyncio.create_task(_run())
+    return ForgeResult(success=True, data={
+        "queued": True, "job_id": job.job_id,
+        "docs": len(docs), "pages": total_pages,
+    })
+
+
 @router.post("/fill-missing")
 async def fill_missing(request: Request, payload: dict | None = None) -> ForgeResult:
     """Queue incremental gap-filling jobs for the given documents.
