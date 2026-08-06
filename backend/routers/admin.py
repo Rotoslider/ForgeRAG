@@ -295,8 +295,10 @@ async def fill_missing(request: Request, payload: dict | None = None) -> ForgeRe
         "text": true,               # fill missing text embeddings
         "visual": true,             # fill missing visual embeddings
         "entities": false,          # re-run extraction on unextracted pages
-        "recover_text": false       # copy Docling OCR text from chunks onto
+        "recover_text": false,      # copy Docling OCR text from chunks onto
                                     # textless pages (scanned PDFs) first
+        "priority": false           # "run now": skip the FIFO queue AND the
+                                    # pause-all hold — for docs needed today
       }
     """
     if not isinstance(payload, dict):
@@ -306,6 +308,7 @@ async def fill_missing(request: Request, payload: dict | None = None) -> ForgeRe
     do_visual = bool(payload.get("visual", True))
     do_entities = bool(payload.get("entities", False))
     do_recover = bool(payload.get("recover_text", False))
+    priority = bool(payload.get("priority", False))
 
     if not isinstance(doc_ids, list) or not doc_ids:
         return ForgeResult(success=False, reason="doc_ids must be a non-empty list",
@@ -340,9 +343,15 @@ async def fill_missing(request: Request, payload: dict | None = None) -> ForgeRe
             params={"text": do_text, "visual": do_visual,
                     "entities": do_entities, "recover_text": do_recover},
         )
+        runner = pipeline.run_fill_missing
+        if priority:
+            # "Run now": exempt from pause-all BEFORE spawning, and use the
+            # priority lane that skips the FIFO ingest queue.
+            jobs.exempt_from_pause(job.job_id)
+            runner = pipeline.run_fill_missing_now
         jobs.spawn(
             job.job_id,
-            pipeline.run_fill_missing(
+            runner(
                 job.job_id, doc_id,
                 do_text=do_text, do_visual=do_visual, do_entities=do_entities,
                 do_recover_text=do_recover,

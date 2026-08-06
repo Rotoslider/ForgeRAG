@@ -519,6 +519,8 @@ export const fillMissingBulk = (body: {
   visual?: boolean;
   entities?: boolean;
   recover_text?: boolean;
+  // "run now": skip the FIFO queue and the pause-all hold
+  priority?: boolean;
 }) =>
   request<{ queued: number; not_found: number; jobs: Array<{ doc_id: string; job_id: string }> }>(
     "/admin/fill-missing",

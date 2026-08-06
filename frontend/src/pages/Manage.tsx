@@ -1246,10 +1246,14 @@ function DocFixButtons({
     visual: boolean;
     entities: boolean;
     recover_text?: boolean;
+    priority?: boolean;
   }) => void;
   onChunks: () => void;
   onReembed: () => void;
 }) {
+  // "Run now": skip the FIFO repair queue AND the pause-all hold — for a
+  // document the user needs today, instead of behind tonight's backlog.
+  const [runNow, setRunNow] = useState(false);
   if (queuedLabel) {
     return (
       <div className="text-xs text-emerald-400 py-1">
@@ -1276,6 +1280,9 @@ function DocFixButtons({
   const btn =
     "text-xs border border-forge-edge rounded px-2.5 py-1 hover:bg-forge-edge disabled:opacity-50";
 
+  const fillable =
+    doc.recoverable_text_pages > 0 || textGap || visualGap || entityGap;
+
   return (
     <div className="flex items-center gap-2 flex-wrap py-1">
       {broken && (
@@ -1284,11 +1291,24 @@ function DocFixButtons({
           the PDF; nothing can be repaired in place.
         </span>
       )}
+      {fillable && (
+        <label
+          className="flex items-center gap-1.5 text-xs cursor-pointer text-amber-300"
+          title="Normally repairs join the FIFO queue and respect Pause all. Check this to run THIS document's repair immediately — it skips the queue and runs even while jobs are paused (still capped so it can't overload the LLM). For documents you need today."
+        >
+          <input
+            type="checkbox"
+            checked={runNow}
+            onChange={(e) => setRunNow(e.target.checked)}
+          />
+          ⚡ run immediately (skip queue &amp; pause)
+        </label>
+      )}
       {doc.recoverable_text_pages > 0 && (
         <button
           disabled={busy}
           onClick={() =>
-            onFill({ text: true, visual: false, entities: true, recover_text: true })
+            onFill({ text: true, visual: false, entities: true, recover_text: true, priority: runNow })
           }
           className={btn}
           title="Copies Docling OCR text from this document's chunks onto its textless pages, then embeds and extracts entities from the recovered text — one job"
@@ -1299,7 +1319,7 @@ function DocFixButtons({
       {(textGap || visualGap) && (
         <button
           disabled={busy}
-          onClick={() => onFill({ text: textGap, visual: visualGap, entities: false })}
+          onClick={() => onFill({ text: textGap, visual: visualGap, entities: false, priority: runNow })}
           className={btn}
           title="Embeds only the pages that have no embedding — existing work untouched"
         >
@@ -1313,7 +1333,7 @@ function DocFixButtons({
       {entityGap && (
         <button
           disabled={busy}
-          onClick={() => onFill({ text: false, visual: false, entities: true })}
+          onClick={() => onFill({ text: false, visual: false, entities: true, priority: runNow })}
           className={btn}
           title="Runs LLM extraction only on pages without entity relationships"
         >
@@ -1467,7 +1487,11 @@ function CompletenessCard() {
   const fill = useMutation({
     mutationFn: fillMissingBulk,
     onSuccess: (res, vars) => {
-      setQueuedMsg(`Queued ${res.data?.queued ?? 0} fill-missing job(s).`);
+      setQueuedMsg(
+        vars.priority
+          ? `Started ${res.data?.queued ?? 0} repair(s) immediately — skipping the queue and the pause.`
+          : `Queued ${res.data?.queued ?? 0} fill-missing job(s).`
+      );
       trackJobs(
         res.data?.jobs,
         vars.recover_text
@@ -1489,17 +1513,33 @@ function CompletenessCard() {
 
   // ---- per-document repairs (queued from a row's expanded fix panel)
   const fillOne = useMutation({
-    mutationFn: (args: { doc_id: string; text: boolean; visual: boolean; entities: boolean }) =>
+    // Forward EVERY option — this used to rebuild the payload with only
+    // three fields, silently dropping recover_text (so the per-row OCR
+    // recovery button ran without OCR recovery) and priority.
+    mutationFn: (args: {
+      doc_id: string;
+      text: boolean;
+      visual: boolean;
+      entities: boolean;
+      recover_text?: boolean;
+      priority?: boolean;
+    }) =>
       fillMissingBulk({
         doc_ids: [args.doc_id],
         text: args.text,
         visual: args.visual,
         entities: args.entities,
+        recover_text: args.recover_text,
+        priority: args.priority,
       }),
     onSuccess: (res, args) =>
       trackJobs(
         res.data?.jobs,
-        args.entities ? "entity extraction" : "embedding fill"
+        args.recover_text
+          ? "OCR text recovery"
+          : args.entities
+          ? "entity extraction"
+          : "embedding fill"
       ),
   });
   const chunkOne = useMutation({

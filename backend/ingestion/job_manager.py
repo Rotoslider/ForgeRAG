@@ -129,6 +129,11 @@ class JobManager:
         self._paused_jobs: set[str] = set()
         # Jobs whose next checkpoint() should stop the task.
         self._cancel_requested: set[str] = set()
+        # Priority jobs the user explicitly ran while everything is paused
+        # ("run now") — exempt from pause-all, but not from their own
+        # per-job pause or stop. Cleared whenever pause-all is switched ON,
+        # because a fresh "Pause all" click means stop everything.
+        self._pause_exempt: set[str] = set()
         # Global pause switch ("free the GPU"). Persisted in the meta table
         # so a service restart doesn't silently resume queued work.
         self._pause_all = False
@@ -407,6 +412,7 @@ class JobManager:
             self._tasks.pop(jid, None)
             self._paused_jobs.discard(jid)
             self._cancel_requested.discard(jid)
+            self._pause_exempt.discard(jid)
 
         task.add_done_callback(_cleanup)
         return task
@@ -416,7 +422,14 @@ class JobManager:
         return self._pause_all
 
     def is_pause_requested(self, job_id: str) -> bool:
-        return self._pause_all or job_id in self._paused_jobs
+        if job_id in self._paused_jobs:
+            return True
+        return self._pause_all and job_id not in self._pause_exempt
+
+    def exempt_from_pause(self, job_id: str) -> None:
+        """Let one job run despite pause-all (the "run now" lane). Call
+        BEFORE spawning so the job never holds at its first checkpoint."""
+        self._pause_exempt.add(job_id)
 
     async def checkpoint(self, job_id: str) -> None:
         """Cooperative pause/stop gate, called by pipelines between units of
@@ -487,7 +500,11 @@ class JobManager:
         """Global pause switch. Persisted so it survives restarts — 'I
         paused everything to use the GPU' must not silently un-pause."""
         self._pause_all = paused
-        if not paused:
+        if paused:
+            # A fresh "Pause all" means stop everything — including any
+            # jobs previously fast-tracked with "run now".
+            self._pause_exempt.clear()
+        else:
             self._paused_jobs.clear()
         async with self._write_lock, self._connect() as db:
             await db.execute(

@@ -129,6 +129,10 @@ class IngestionPipeline:
         self._ingest_semaphore = asyncio.Semaphore(
             max(1, settings.ingestion.max_concurrent_ingestions)
         )
+        # Separate, small lane for user-triggered "run now" repairs so they
+        # never wait behind a hundreds-deep FIFO drain queue. The LLM
+        # request cap and GPU manager still bound the actual load.
+        self._priority_semaphore = asyncio.Semaphore(2)
 
     async def run_job(self, job_id: str, collection: str = "default") -> None:
         """Run the full pipeline for a queued job. Catches and records errors.
@@ -1274,6 +1278,29 @@ class IngestionPipeline:
         # re-check when the semaphore slot finally frees.
         await self.jobs.checkpoint(job_id)
         async with self._ingest_semaphore:
+            await self.jobs.checkpoint(job_id)
+            await self._run_fill_missing_inner(
+                job_id, doc_id,
+                do_text=do_text, do_visual=do_visual,
+                do_entities=do_entities, do_recover_text=do_recover_text,
+            )
+
+    async def run_fill_missing_now(
+        self, job_id: str, doc_id: str, *,
+        do_text: bool = True,
+        do_visual: bool = True,
+        do_entities: bool = False,
+        do_recover_text: bool = False,
+    ) -> None:
+        """Priority ("run now") variant of run_fill_missing: skips the FIFO
+        ingest queue so a user-triggered repair for a document they need
+        RIGHT NOW doesn't wait behind a hundreds-deep drain backlog, and
+        (via JobManager.exempt_from_pause, set by the caller) runs even
+        while pause-all is on. Bounded by its own small semaphore; the LLM
+        request cap and GPU manager bound the real resource load, same
+        rationale as run_resummarize not taking the ingest semaphore.
+        """
+        async with self._priority_semaphore:
             await self.jobs.checkpoint(job_id)
             await self._run_fill_missing_inner(
                 job_id, doc_id,

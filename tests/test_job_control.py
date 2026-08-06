@@ -430,3 +430,39 @@ def _status_is(manager: JobManager, job_id: str, status: str):
         return job is not None and job.status == status
 
     return check
+
+
+# ------------------------------------------------------------- run-now lane
+
+
+@pytest.mark.asyncio
+async def test_pause_exemption_lets_one_job_run(manager):
+    """"Run now" contract: an exempted job passes checkpoints under
+    pause-all while everything else stays held."""
+    await manager.init()
+    await manager.set_pause_all(True)
+
+    fast_id = await _make_job(manager)
+    slow_id = await _make_job(manager)
+    manager.exempt_from_pause(fast_id)
+
+    fast = {"count": 0, "target": 3}
+    slow = {"count": 0, "target": 3}
+    manager.spawn(fast_id, _counting_worker(manager, fast_id, fast))
+    manager.spawn(slow_id, _counting_worker(manager, slow_id, slow))
+
+    await _wait_for(_status_is(manager, fast_id, "completed"))
+    assert slow["count"] == 0  # held at its first checkpoint
+    await _wait_for(_status_is(manager, slow_id, "paused"))
+
+    # An exempted job still honors its own per-job pause and stop.
+    assert fast_id not in manager._pause_exempt  # cleaned up on completion
+
+    # Turning pause-all ON again clears any standing exemptions.
+    third_id = await _make_job(manager)
+    manager.exempt_from_pause(third_id)
+    await manager.set_pause_all(True)
+    assert manager.is_pause_requested(third_id)
+
+    await manager.set_pause_all(False)
+    await _wait_for(_status_is(manager, slow_id, "completed"))
