@@ -633,11 +633,7 @@ async def semantic_search(body: SemanticSearchRequest, request: Request) -> Forg
 
     Queries chunk_embedding (BGE-M3 1024-dim) and dedupes to unique
     pages. Falls back to page_text_embedding only if the chunk index
-    returns nothing — useful for docs that haven't been rebuilt into
-    chunks yet (though those also need 1024-dim page embeddings for
-    the fallback to work; currently page embeddings are stale 768-dim,
-    so the fallback is a no-op until we rerun text embedding on all
-    pages — the rebuild_chunks script populates chunks but not pages).
+    returns nothing — useful for docs that have no chunks yet.
     """
     text_emb = getattr(request.app.state, "text_embedding", None)
     neo4j = request.app.state.neo4j

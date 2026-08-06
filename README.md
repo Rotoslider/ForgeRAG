@@ -747,7 +747,6 @@ ForgeRAG/
 +-- scripts/
 |   +-- install_neo4j.sh                  Neo4j Community 5.x installer
 |   +-- seed_schema.py                    Apply Neo4j schema (idempotent)
-|   +-- rebuild_chunks.py                 Phase 9 CLI rebuild: chunks + summaries
 |   |                                      + BGE-M3 embeddings + entity re-extraction.
 |   |                                      Flags: --doc-id, --only-missing, --skip-extract,
 |   |                                      --extract-only

@@ -432,9 +432,8 @@ class IngestionPipeline:
           (cheap resume after an extractor bug fix)
         - skip_extract=True: chunks/summaries/embeddings only (no entity work)
 
-        Mirrors scripts/rebuild_chunks.py's behavior but uses the long-lived
-        in-process services so the GUI-triggered rebuild doesn't re-download
-        models or re-apply schema on every run.
+        Runs on the long-lived in-process services so a GUI-triggered
+        rebuild doesn't re-download models or re-apply schema on every run.
         """
         current_job_id.set(job_id)
         step = None
