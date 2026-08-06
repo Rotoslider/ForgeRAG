@@ -459,6 +459,8 @@ Every active job has **pause** and **stop** buttons; finished jobs have **restar
 
 The **Pause all (free GPU)** button in the Active Jobs header holds the entire queue — no LLM or embedding calls are made while paused, and idle models unload automatically a few minutes later. The switch is persistent: it survives service restarts, and any job (or bulk drain) launched while it's on holds immediately until **Resume all**. Typical day/night workflow: queue big repairs any time, leave everything paused while you need the GPU, click Resume all when you're done for the day.
 
+Need one document repaired *today* while everything else stays paused? The audit page's per-document fix panel has a **"⚡ run immediately (skip queue & pause)"** checkbox — the repair runs right away through a small priority lane (two at a time, still bounded by the LLM caps) instead of waiting behind the queued backlog. A fresh "Pause all" click stops priority jobs too.
+
 ### Scheduling — hands-free day/night operation
 
 Manage → **Schedule & Automation** automates the same switch on a daily **processing window**: pick a start time, an end time (overnight is fine — 21:00 → 06:30 runs into the next morning), and the days it applies. Jobs resume at the window start and pause at the end. The scheduler:
@@ -744,7 +746,7 @@ Schedule & Automation, endpoints below) instead of external cron.
 | POST | `/admin/autotag-missing` | One global job that auto-tags every unorganized document (default collection, no categories/tags). Resumable |
 | POST | `/admin/recover-stranded-text` | Queue OCR text recovery + embedding for every doc with pages whose text exists only in chunks |
 | POST | `/admin/backfill-blank-flags` | Compute is_blank on pages missing it (trackable background job) |
-| POST | `/admin/fill-missing` | Queue incremental gap-filling jobs. Body: `{doc_ids, text?, visual?, entities?}` — only missing pages are processed, nothing is cleared |
+| POST | `/admin/fill-missing` | Queue incremental gap-filling jobs. Body: `{doc_ids, text?, visual?, entities?, recover_text?, priority?}` — only missing pages are processed, nothing is cleared. `priority: true` is the "run now" lane: skips the FIFO queue and the pause-all hold (two at a time; the GUI's "⚡ run immediately" checkbox) for a document you need today |
 | POST | `/admin/normalize-entities` | Merge duplicate entities that differ only by case/whitespace |
 | POST | `/admin/bulk-reembed` | Queue re-embed jobs for every document |
 | POST | `/admin/reembed-text` | Text-only re-embed (no visual, no entity extraction). Body: `{doc_id?}` |
