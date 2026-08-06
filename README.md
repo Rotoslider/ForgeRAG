@@ -62,6 +62,7 @@ Recent additions since the Phase 9 baseline:
 - **Pipeline Completeness audit** — one click on the Manage page audits every document against the graph itself (no re-processing): page counts, text/visual embedding coverage with dimension verification, chunk coverage, and entity coverage. A ~100k-page library audits in seconds.
 - **Incremental gap repair** — fill-missing jobs process *only* pages lacking an artifact, never redoing finished work. Bulk buttons repair every affected doc at once; each problem row also has a per-document "fix" panel offering exactly the repairs that apply (fill embeddings, extract missing entities, build/rebuild chunks, or full re-embed for wrong-dimension vectors).
 - **OCR text recovery for scanned PDFs** — scanned documents have no text layer, so page-level extraction finds nothing; but Docling OCRs the page images during chunking, so the real text lives on the Chunk nodes. The audit flags these ("page text" column), and a one-click repair copies the OCR text back onto the pages, then embeds it and extracts entities from it — turning image-only books into fully searchable ones.
+- **Deep Verification** — a Manage-page card (and `GET /admin/verify`) that proves the database is intact with exact counts and zero sampling: page counts and numbering, duplicates and orphans, every page image on disk, text consistency, embedding presence at exact dimensions, visual-embedding blob byte-integrity, chunk completeness, extraction coverage, and index health. The verdict is PASS only at literally zero violations.
 
 ## Architecture
 
@@ -653,6 +654,7 @@ When ForgeRAG starts with an empty database (0 documents, 0 pages), the GUI show
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/admin/audit/completeness` | Audit every document's pipeline completeness from graph state (embedding dims verified) |
+| GET | `/admin/verify` | Deep verification: ~19 exact-count integrity checks (images on disk, embedding dims, blob byte-integrity, duplicates/orphans, extraction coverage, index health). PASS requires zero violations |
 | POST | `/admin/fill-missing` | Queue incremental gap-filling jobs. Body: `{doc_ids, text?, visual?, entities?}` — only missing pages are processed, nothing is cleared |
 | POST | `/admin/normalize-entities` | Merge duplicate entities that differ only by case/whitespace |
 | POST | `/admin/bulk-reembed` | Queue re-embed jobs for every document |
