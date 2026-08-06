@@ -677,6 +677,14 @@ function CompletenessCard() {
   const [showAll, setShowAll] = useState(false);
   const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
   const [expandedDoc, setExpandedDoc] = useState<string | null>(null);
+  // The expanded fix panel can open below the fold of the table's scroll
+  // area (always, for the last row) — bring it into view on expand.
+  const expandedRowRef = useRef<HTMLTableRowElement | null>(null);
+  useEffect(() => {
+    // Instant, not smooth — smooth scrolls can be silently cancelled by
+    // competing scroll activity, leaving the panel hidden below the fold.
+    expandedRowRef.current?.scrollIntoView({ block: "nearest" });
+  }, [expandedDoc]);
   // doc_id -> repair queued for it this session. Tracked jobs are polled so
   // each audit row shows queued → running → done live, and a banner offers a
   // one-click re-audit when everything has finished (the table's numbers are
@@ -1023,7 +1031,10 @@ function CompletenessCard() {
                         </td>
                       </tr>
                       {expandedDoc === d.doc_id && !tracked[d.doc_id] && (
-                        <tr className="border-b border-forge-edge/50 bg-forge-bg/50">
+                        <tr
+                          ref={expandedRowRef}
+                          className="border-b border-forge-edge/50 bg-forge-bg/50"
+                        >
                           <td colSpan={AUDIT_ASPECTS.length + 3} className="px-3 py-1">
                             <DocFixButtons
                               doc={d}
