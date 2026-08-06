@@ -30,6 +30,7 @@ from backend.ingestion.chunker import StructuralChunker, StructuralChunk
 from backend.ingestion.community_detector import CommunityDetector
 from backend.ingestion.entity_extractor import EntityExtractor
 from backend.ingestion.graph_builder import GraphBuilder
+from backend.ingestion.job_logs import current_job_id
 from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pdf_processor import PDFProcessor
 from backend.ingestion.text_extractor import TextExtractor
@@ -137,16 +138,41 @@ class IngestionPipeline:
         async with self._ingest_semaphore:
             await self._run_job_inner(job_id, collection)
 
+    # The full-ingestion plan, in execution order. Written to the job's step
+    # ledger up front so the UI can show every step — including ones that end
+    # up skipped — with an explicit status instead of silently omitting them.
+    FULL_PLAN = [
+        "registering",
+        "rendering_pages",
+        "extracting_text",
+        "auto_tagging",
+        "embedding_text",
+        "building_chunks",
+        "embedding_visual",
+        "extracting_entities",
+        "dedup_entities",
+    ]
+
     async def _run_job_inner(self, job_id: str, collection: str = "default") -> None:
+        current_job_id.set(job_id)  # route log records into this job's log
+        step = None  # ledger name of the in-flight fatal step, for the except
         try:
             job = await self.jobs.get(job_id)
             if job is None:
                 logger.error("Job %s not found", job_id)
                 return
 
-            await self.jobs.update(job_id, status="processing", current_step="registering")
-            doc_id, file_hash, page_count = await self._register(job, collection=collection)
+            await self.jobs.set_steps(job_id, self.FULL_PLAN)
 
+            step = "registering"
+            await self.jobs.update(job_id, status="processing", current_step="registering")
+            await self.jobs.update_step(job_id, "registering", "running")
+            doc_id, file_hash, page_count = await self._register(job, collection=collection)
+            await self.jobs.update_step(
+                job_id, "registering", "done", detail=f"{page_count} pages"
+            )
+
+            step = "rendering_pages"
             await self.jobs.update(
                 job_id,
                 current_step="rendering_pages",
@@ -155,62 +181,140 @@ class IngestionPipeline:
                 file_hash=file_hash,
                 pages_total=page_count,
             )
+            await self.jobs.update_step(job_id, "rendering_pages", "running")
             await self._rasterize(job_id, job.source_path, file_hash, page_count)
+            await self.jobs.update_step(
+                job_id, "rendering_pages", "done", detail=f"{page_count} pages rendered"
+            )
 
+            step = "extracting_text"
             await self.jobs.update(
                 job_id, current_step="extracting_text", progress_pct=40.0
             )
-            await self._extract_text(job_id, job.source_path, doc_id, file_hash)
+            await self.jobs.update_step(job_id, "extracting_text", "running")
+            text_detail = await self._extract_text(job_id, job.source_path, doc_id, file_hash)
+            await self.jobs.update_step(
+                job_id, "extracting_text", "done", detail=text_detail
+            )
 
             # Auto-tag if the user didn't manually specify tags/categories
             # and the LLM is available. Runs after text extraction so we have
             # page text to analyze.
-            if (
-                self.auto_tagger is not None
-                and not job.requested_categories
-                and not job.requested_tags
-                and collection == "default"
-            ):
+            if self.auto_tagger is None:
+                await self.jobs.update_step(
+                    job_id, "auto_tagging", "skipped", detail="LLM service not available"
+                )
+            elif job.requested_categories or job.requested_tags:
+                await self.jobs.update_step(
+                    job_id, "auto_tagging", "skipped",
+                    detail="manual categories/tags provided",
+                )
+            elif collection != "default":
+                await self.jobs.update_step(
+                    job_id, "auto_tagging", "skipped",
+                    detail=f"explicit collection '{collection}' selected",
+                )
+            else:
+                await self.jobs.update(job_id, current_step="auto_tagging")
+                await self.jobs.update_step(job_id, "auto_tagging", "running")
                 try:
-                    await self._auto_tag(doc_id, collection)
+                    tag_detail = await self._auto_tag(doc_id, collection)
+                    await self.jobs.update_step(
+                        job_id, "auto_tagging", "done", detail=tag_detail
+                    )
                 except Exception as exc:
                     logger.warning("Auto-tagging failed (continuing): %s", exc)
+                    await self.jobs.update_step(
+                        job_id, "auto_tagging", "error", detail=str(exc)
+                    )
 
             # Phase 3 steps — only run if services are wired up
-            if self.text_embedding is not None:
+            if self.text_embedding is None:
+                await self.jobs.update_step(
+                    job_id, "embedding_text", "skipped",
+                    detail="text embedding service not available",
+                )
+            else:
+                step = "embedding_text"
                 await self.jobs.update(
                     job_id, current_step="embedding_text", progress_pct=60.0
                 )
-                await self._embed_text(job_id, doc_id)
+                await self.jobs.update_step(job_id, "embedding_text", "running")
+                n = await self._embed_text(job_id, doc_id)
+                await self.jobs.update_step(
+                    job_id, "embedding_text", "done",
+                    detail=f"{n} pages embedded" if n else "all pages already embedded",
+                )
 
             # Phase 5: structural chunking + per-chunk summarization + embedding.
             # Replaces whole-page text as the primary retrieval target. Runs
             # only if all pieces are wired (chunker, summarizer, embedder).
-            if (
-                self.chunk_summarizer is not None
-                and self.text_embedding is not None
-            ):
+            if self.chunk_summarizer is None or self.text_embedding is None:
+                await self.jobs.update_step(
+                    job_id, "building_chunks", "skipped",
+                    detail="LLM or text embedding service not available",
+                )
+            else:
                 await self.jobs.update(
                     job_id, current_step="building_chunks", progress_pct=68.0
                 )
+                await self.jobs.update_step(job_id, "building_chunks", "running")
                 try:
-                    await self._build_chunks(job_id, doc_id, file_hash, job.source_path)
+                    counts = await self._build_chunks(job_id, doc_id, file_hash, job.source_path)
+                    n_chunks = counts.get("chunks", 0)
+                    await self.jobs.update_step(
+                        job_id, "building_chunks",
+                        "done" if n_chunks else "warning",
+                        detail=f"{n_chunks} chunks written" if n_chunks
+                        else "chunker produced no chunks",
+                    )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Chunking failed for doc %s (continuing): %s", doc_id, exc
                     )
+                    await self.jobs.update_step(
+                        job_id, "building_chunks", "error", detail=str(exc)
+                    )
 
-            if self.colpali is not None:
+            if self.colpali is None:
+                await self.jobs.update_step(
+                    job_id, "embedding_visual", "skipped",
+                    detail="visual embedding service not available",
+                )
+            else:
+                step = "embedding_visual"
                 await self.jobs.update(
                     job_id, current_step="embedding_visual", progress_pct=75.0
                 )
-                await self._embed_visual(job_id, doc_id, file_hash)
+                await self.jobs.update_step(job_id, "embedding_visual", "running")
+                n = await self._embed_visual(job_id, doc_id, file_hash)
+                await self.jobs.update_step(
+                    job_id, "embedding_visual", "done",
+                    detail=f"{n} pages embedded" if n else "all pages already embedded",
+                )
 
-            if self.entity_extractor is not None:
+            if self.entity_extractor is None:
+                await self.jobs.update_step(
+                    job_id, "extracting_entities", "skipped",
+                    detail="LLM service not available",
+                )
+            else:
+                step = "extracting_entities"
                 await self.jobs.update(
                     job_id, current_step="extracting_entities", progress_pct=88.0
                 )
-                await self._extract_entities(job_id, doc_id)
+                await self.jobs.update_step(job_id, "extracting_entities", "running")
+                done, failed = await self._extract_entities(job_id, doc_id)
+                if failed:
+                    await self.jobs.update_step(
+                        job_id, "extracting_entities", "warning",
+                        detail=f"{failed} of {done} pages failed — see logs",
+                    )
+                else:
+                    await self.jobs.update_step(
+                        job_id, "extracting_entities", "done",
+                        detail=f"{done} pages extracted",
+                    )
 
             # Post-extraction: merge near-duplicate entities created by this doc.
             # Runs a lightweight dedup pass on entities linked to this document
@@ -220,17 +324,27 @@ class IngestionPipeline:
                 await self.jobs.update(
                     job_id, current_step="dedup_entities", progress_pct=95.0
                 )
+                await self.jobs.update_step(job_id, "dedup_entities", "running")
                 merged = await self._dedup_doc_entities(doc_id)
                 if merged:
                     logger.info("Post-ingestion dedup merged %d entities for doc %s", merged, doc_id)
+                await self.jobs.update_step(
+                    job_id, "dedup_entities", "done",
+                    detail=f"{merged} duplicate entities merged",
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Post-ingestion dedup failed (non-fatal): %s", exc)
+                await self.jobs.update_step(
+                    job_id, "dedup_entities", "error", detail=str(exc)
+                )
 
             await self.jobs.complete(job_id)
             logger.info("Job %s completed successfully", job_id)
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Job %s failed", job_id)
+            if step is not None:
+                await self.jobs.update_step(job_id, step, "error", detail=str(exc))
             await self.jobs.fail(job_id, str(exc))
 
     async def run_communities_only(self, job_id: str) -> None:
@@ -240,20 +354,27 @@ class IngestionPipeline:
         because engineering topics connect across handbooks. The job is
         scoped to tracking the long operation, not to a specific doc.
         """
+        current_job_id.set(job_id)
         try:
+            await self.jobs.set_steps(job_id, ["building_graph"])
             if self.community_detector is None:
                 raise ValueError("LLM or text embedding unavailable — cannot detect communities")
             await self.jobs.update(
                 job_id, status="processing", current_step="building_graph", progress_pct=5.0
             )
+            await self.jobs.update_step(job_id, "building_graph", "running")
             assert self.gpu is not None
             async with self.gpu.load_scope("text_embedding"):
                 counts = await self.community_detector.build()
             logger.info("Community detection complete: %s", counts)
+            await self.jobs.update_step(
+                job_id, "building_graph", "done", detail=str(counts)
+            )
             await self.jobs.complete(job_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Community job %s failed", job_id)
             msg = str(exc) or f"{type(exc).__name__} (no message)"
+            await self.jobs.update_step(job_id, "building_graph", "error", detail=msg)
             await self.jobs.fail(job_id, msg)
 
     async def run_extraction_only(self, job_id: str, doc_id: str) -> None:
@@ -261,7 +382,9 @@ class IngestionPipeline:
 
         Used by POST /documents/{doc_id}/extract-entities.
         """
+        current_job_id.set(job_id)
         try:
+            await self.jobs.set_steps(job_id, ["extracting_entities"])
             await self.jobs.update(job_id, status="processing", doc_id=doc_id)
             if self.entity_extractor is None:
                 raise ValueError("LLM service not configured — cannot extract entities")
@@ -274,11 +397,25 @@ class IngestionPipeline:
             await self.jobs.update(
                 job_id, current_step="extracting_entities", progress_pct=10.0
             )
-            await self._extract_entities(job_id, doc_id)
+            await self.jobs.update_step(job_id, "extracting_entities", "running")
+            done, failed = await self._extract_entities(job_id, doc_id)
+            if failed:
+                await self.jobs.update_step(
+                    job_id, "extracting_entities", "warning",
+                    detail=f"{failed} of {done} pages failed — see logs",
+                )
+            else:
+                await self.jobs.update_step(
+                    job_id, "extracting_entities", "done",
+                    detail=f"{done} pages extracted",
+                )
             await self.jobs.complete(job_id)
             logger.info("Extraction-only job %s completed for doc %s", job_id, doc_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Extraction-only job %s failed", job_id)
+            await self.jobs.update_step(
+                job_id, "extracting_entities", "error", detail=str(exc)
+            )
             await self.jobs.fail(job_id, str(exc))
 
     async def run_rebuild_chunks(
@@ -299,7 +436,14 @@ class IngestionPipeline:
         in-process services so the GUI-triggered rebuild doesn't re-download
         models or re-apply schema on every run.
         """
+        current_job_id.set(job_id)
+        step = None
+        REBUILD_PLAN = [
+            "chunking", "summarizing", "embedding_chunks",
+            "writing_chunks", "extracting_entities",
+        ]
         try:
+            await self.jobs.set_steps(job_id, REBUILD_PLAN)
             await self.jobs.update(job_id, status="processing", doc_id=doc_id)
 
             if extract_only and skip_extract:
@@ -342,15 +486,22 @@ class IngestionPipeline:
                 )
             pdf_path = candidates[0]
 
-            if not extract_only:
+            if extract_only:
+                for name in ("chunking", "summarizing", "embedding_chunks", "writing_chunks"):
+                    await self.jobs.update_step(
+                        job_id, name, "skipped", detail="extract_only mode"
+                    )
+            else:
                 if self.text_embedding is None or self.chunk_summarizer is None:
                     raise ValueError(
                         "text_embedding or chunk_summarizer not configured — "
                         "cannot build chunks"
                     )
+                step = "chunking"
                 await self.jobs.update(
                     job_id, current_step="chunking", progress_pct=5.0,
                 )
+                await self.jobs.update_step(job_id, "chunking", "running")
                 chunks = await asyncio.to_thread(
                     self.structural_chunker.chunk_pdf, pdf_path, file_hash,
                 )
@@ -358,18 +509,37 @@ class IngestionPipeline:
                     logger.warning(
                         "Chunker produced no chunks for doc %s", doc_id,
                     )
+                    await self.jobs.update_step(
+                        job_id, "chunking", "warning",
+                        detail="chunker produced no chunks",
+                    )
+                    for name in ("summarizing", "embedding_chunks", "writing_chunks"):
+                        await self.jobs.update_step(
+                            job_id, name, "skipped", detail="no chunks to process"
+                        )
                 else:
+                    await self.jobs.update_step(
+                        job_id, "chunking", "done", detail=f"{len(chunks)} chunks"
+                    )
+                    step = "summarizing"
                     await self.jobs.update(
                         job_id, current_step="summarizing",
                         pages_total=len(chunks), progress_pct=20.0,
                     )
+                    await self.jobs.update_step(job_id, "summarizing", "running")
                     summaries = await self.chunk_summarizer.summarize_batch(
                         chunks, concurrency=4,
                     )
+                    await self.jobs.update_step(
+                        job_id, "summarizing", "done",
+                        detail=f"{len(summaries)} summaries",
+                    )
+                    step = "embedding_chunks"
                     await self.jobs.update(
                         job_id, current_step="embedding_chunks",
                         progress_pct=55.0,
                     )
+                    await self.jobs.update_step(job_id, "embedding_chunks", "running")
                     embed_inputs = [
                         f"{s}\n\n{c.text[:2000]}"
                         for s, c in zip(summaries, chunks)
@@ -381,10 +551,16 @@ class IngestionPipeline:
                             embed_inputs,
                             batch_size=self.settings.ingestion.text_embedding_batch_size,
                         )
+                    await self.jobs.update_step(
+                        job_id, "embedding_chunks", "done",
+                        detail=f"{len(vectors)} vectors",
+                    )
+                    step = "writing_chunks"
                     await self.jobs.update(
                         job_id, current_step="writing_chunks",
                         progress_pct=65.0,
                     )
+                    await self.jobs.update_step(job_id, "writing_chunks", "running")
                     BATCH = 200
                     for i in range(0, len(chunks), BATCH):
                         end = min(i + BATCH, len(chunks))
@@ -427,16 +603,34 @@ class IngestionPipeline:
                             """,
                             {"doc_id": doc_id, "rows": rows_to_write},
                         )
+                    await self.jobs.update_step(
+                        job_id, "writing_chunks", "done",
+                        detail=f"{len(chunks)} chunks written",
+                    )
+                    step = None
 
-            if not skip_extract:
+            if skip_extract:
+                await self.jobs.update_step(
+                    job_id, "extracting_entities", "skipped",
+                    detail="skip_extract mode",
+                )
+            else:
                 if self.entity_extractor is None:
                     logger.warning(
                         "Entity extractor not configured — skipping re-extraction"
                     )
+                    await self.jobs.update_step(
+                        job_id, "extracting_entities", "skipped",
+                        detail="LLM service not available",
+                    )
                 else:
+                    step = "extracting_entities"
                     await self.jobs.update(
                         job_id, current_step="extracting_entities",
                         progress_pct=75.0,
+                    )
+                    await self.jobs.update_step(
+                        job_id, "extracting_entities", "running"
                     )
                     # Re-extract only pages missing topic_tags — keeps retries cheap
                     todo = await self.neo4j.run_query(
@@ -484,11 +678,22 @@ class IngestionPipeline:
                             "rebuild-chunks: %d/%d page extractions failed",
                             failed, total,
                         )
+                        await self.jobs.update_step(
+                            job_id, "extracting_entities", "warning",
+                            detail=f"{failed} of {total} pages failed — see logs",
+                        )
+                    else:
+                        await self.jobs.update_step(
+                            job_id, "extracting_entities", "done",
+                            detail=f"{total} pages extracted",
+                        )
 
             await self.jobs.complete(job_id)
             logger.info("Rebuild-chunks job %s completed for doc %s", job_id, doc_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Rebuild-chunks job %s failed", job_id)
+            if step is not None:
+                await self.jobs.update_step(job_id, step, "error", detail=str(exc))
             await self.jobs.fail(job_id, str(exc))
 
     async def _page_count(self, doc_id: str) -> int:
@@ -559,7 +764,10 @@ class IngestionPipeline:
         model (e.g., switching from ColPali to Nemotron) actually re-processes
         all pages instead of skipping them.
         """
+        current_job_id.set(job_id)
+        step = None
         try:
+            await self.jobs.set_steps(job_id, ["embedding_text", "embedding_visual"])
             # Look up file_hash from Neo4j
             rows = await self.neo4j.run_query(
                 "MATCH (d:Document {doc_id: $id}) RETURN d.file_hash AS h",
@@ -592,22 +800,44 @@ class IngestionPipeline:
             # waste GPU cycles on pages that are visually empty.
             await self._backfill_blank_flags(doc_id, file_hash)
 
-            if self.text_embedding is not None:
+            if self.text_embedding is None:
+                await self.jobs.update_step(
+                    job_id, "embedding_text", "skipped",
+                    detail="text embedding service not available",
+                )
+            else:
+                step = "embedding_text"
                 await self.jobs.update(
                     job_id, current_step="embedding_text", progress_pct=10.0
                 )
-                await self._embed_text(job_id, doc_id)
+                await self.jobs.update_step(job_id, "embedding_text", "running")
+                n = await self._embed_text(job_id, doc_id)
+                await self.jobs.update_step(
+                    job_id, "embedding_text", "done", detail=f"{n} pages embedded"
+                )
 
-            if self.colpali is not None:
+            if self.colpali is None:
+                await self.jobs.update_step(
+                    job_id, "embedding_visual", "skipped",
+                    detail="visual embedding service not available",
+                )
+            else:
+                step = "embedding_visual"
                 await self.jobs.update(
                     job_id, current_step="embedding_visual", progress_pct=50.0
                 )
-                await self._embed_visual(job_id, doc_id, file_hash)
+                await self.jobs.update_step(job_id, "embedding_visual", "running")
+                n = await self._embed_visual(job_id, doc_id, file_hash)
+                await self.jobs.update_step(
+                    job_id, "embedding_visual", "done", detail=f"{n} pages embedded"
+                )
 
             await self.jobs.complete(job_id)
             logger.info("Reembed job %s completed for doc %s", job_id, doc_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Reembed job %s failed", job_id)
+            if step is not None:
+                await self.jobs.update_step(job_id, step, "error", detail=str(exc))
             await self.jobs.fail(job_id, str(exc))
 
     async def run_text_reembed_only(self, job_id: str, doc_id: str) -> None:
@@ -622,7 +852,9 @@ class IngestionPipeline:
         from nomic 768-d to bge-m3 1024-d) to avoid hours of GPU time
         re-generating visual embeddings that haven't changed.
         """
+        current_job_id.set(job_id)
         try:
+            await self.jobs.set_steps(job_id, ["embedding_text"])
             # Look up file_hash from Neo4j
             rows = await self.neo4j.run_query(
                 "MATCH (d:Document {doc_id: $id}) RETURN d.file_hash AS h",
@@ -650,12 +882,139 @@ class IngestionPipeline:
             await self.jobs.update(
                 job_id, current_step="embedding_text", progress_pct=10.0
             )
-            await self._embed_text(job_id, doc_id)
+            await self.jobs.update_step(job_id, "embedding_text", "running")
+            n = await self._embed_text(job_id, doc_id)
+            await self.jobs.update_step(
+                job_id, "embedding_text", "done", detail=f"{n} pages embedded"
+            )
 
             await self.jobs.complete(job_id)
             logger.info("Text-only reembed job %s completed for doc %s", job_id, doc_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Text-only reembed job %s failed", job_id)
+            await self.jobs.update_step(
+                job_id, "embedding_text", "error", detail=str(exc)
+            )
+            await self.jobs.fail(job_id, str(exc))
+
+    async def run_fill_missing(
+        self, job_id: str, doc_id: str, *,
+        do_text: bool = True,
+        do_visual: bool = True,
+        do_entities: bool = False,
+    ) -> None:
+        """Fill ONLY missing artifacts for an already-ingested document.
+
+        Never clears existing work — the underlying steps are incremental
+        (_embed_text filters text_embedding IS NULL, _embed_visual filters
+        colpali_vector_count 0/NULL, _extract_entities skips pages with
+        entity relationships), so pages that are already complete cost
+        nothing. This is the repair path for completeness-audit gaps; use
+        run_embeddings_only instead when the embedding MODEL changed and
+        everything must be regenerated.
+        """
+        current_job_id.set(job_id)
+        step = None
+        plan = []
+        if do_text:
+            plan.append("embedding_text")
+        if do_visual:
+            plan.append("embedding_visual")
+        if do_entities:
+            plan.append("extracting_entities")
+        try:
+            await self.jobs.set_steps(job_id, plan)
+            rows = await self.neo4j.run_query(
+                "MATCH (d:Document {doc_id: $id}) RETURN d.file_hash AS h",
+                {"id": doc_id},
+            )
+            if not rows:
+                raise ValueError(f"Document {doc_id} not found")
+            file_hash = rows[0]["h"]
+            await self.jobs.update(
+                job_id, status="processing", doc_id=doc_id, file_hash=file_hash
+            )
+            if await self._page_count(doc_id) == 0:
+                raise ValueError(
+                    f"Document {doc_id} has 0 pages — it was only partially "
+                    "ingested. Delete it and re-ingest the PDF; there is "
+                    "nothing to fill."
+                )
+
+            if do_text:
+                if self.text_embedding is None:
+                    await self.jobs.update_step(
+                        job_id, "embedding_text", "skipped",
+                        detail="text embedding service not available",
+                    )
+                else:
+                    step = "embedding_text"
+                    await self.jobs.update(
+                        job_id, current_step="embedding_text", progress_pct=5.0
+                    )
+                    await self.jobs.update_step(job_id, "embedding_text", "running")
+                    n = await self._embed_text(job_id, doc_id)
+                    await self.jobs.update_step(
+                        job_id, "embedding_text", "done",
+                        detail=f"{n} missing pages embedded" if n
+                        else "nothing missing",
+                    )
+
+            if do_visual:
+                if self.colpali is None:
+                    await self.jobs.update_step(
+                        job_id, "embedding_visual", "skipped",
+                        detail="visual embedding service not available",
+                    )
+                else:
+                    step = "embedding_visual"
+                    await self.jobs.update(
+                        job_id, current_step="embedding_visual", progress_pct=40.0
+                    )
+                    await self.jobs.update_step(job_id, "embedding_visual", "running")
+                    # Populate is_blank on old pages first so blank pages are
+                    # excluded rather than embedded (or endlessly re-queued).
+                    await self._backfill_blank_flags(doc_id, file_hash)
+                    n = await self._embed_visual(job_id, doc_id, file_hash)
+                    await self.jobs.update_step(
+                        job_id, "embedding_visual", "done",
+                        detail=f"{n} missing pages embedded" if n
+                        else "nothing missing",
+                    )
+
+            if do_entities:
+                if self.entity_extractor is None:
+                    await self.jobs.update_step(
+                        job_id, "extracting_entities", "skipped",
+                        detail="LLM service not available",
+                    )
+                else:
+                    step = "extracting_entities"
+                    await self.jobs.update(
+                        job_id, current_step="extracting_entities", progress_pct=70.0
+                    )
+                    await self.jobs.update_step(
+                        job_id, "extracting_entities", "running"
+                    )
+                    done, failed = await self._extract_entities(job_id, doc_id)
+                    if failed:
+                        await self.jobs.update_step(
+                            job_id, "extracting_entities", "warning",
+                            detail=f"{failed} of {done} pages failed — see logs",
+                        )
+                    else:
+                        await self.jobs.update_step(
+                            job_id, "extracting_entities", "done",
+                            detail=f"{done} pages extracted" if done
+                            else "nothing missing",
+                        )
+
+            await self.jobs.complete(job_id)
+            logger.info("Fill-missing job %s completed for doc %s", job_id, doc_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Fill-missing job %s failed", job_id)
+            if step is not None:
+                await self.jobs.update_step(job_id, step, "error", detail=str(exc))
             await self.jobs.fail(job_id, str(exc))
 
     # ------------------------------------------------------------------ step 1
@@ -780,13 +1139,15 @@ class IngestionPipeline:
 
     # ------------------------------------------------------------------ step 3
 
-    async def _auto_tag(self, doc_id: str, current_collection: str) -> None:
-        """Use the LLM to suggest collection, categories, and tags from page text."""
+    async def _auto_tag(self, doc_id: str, current_collection: str) -> str:
+        """Use the LLM to suggest collection, categories, and tags from page text.
+
+        Returns a short human-readable summary for the step ledger."""
         assert self.auto_tagger is not None
 
         result = await self.auto_tagger.suggest_for_doc(self.neo4j, doc_id)
         if result is None:
-            return
+            return "no suggestions from LLM"
 
         # Apply collection if suggested and currently default
         if result.collection and result.collection != "default" and current_collection == "default":
@@ -823,16 +1184,22 @@ class IngestionPipeline:
             "Auto-tagged doc %s: collection=%s, categories=%s, tags=%s",
             doc_id, result.collection, result.categories, result.tags,
         )
+        return (
+            f"collection={result.collection or current_collection}, "
+            f"{len(result.categories)} categories, {len(result.tags)} tags"
+        )
 
     async def _extract_text(
         self, job_id: str, source_path: str, doc_id: str, file_hash: str
-    ) -> None:
+    ) -> str:
         """Extract text per page and create :Page nodes linked to :Document.
 
         Skips extraction entirely if the document already has :Page nodes
         (the previous ingestion run already created them). Avoids creating
         duplicate Pages on resume after a failed ColPali / entity-extraction
         step.
+
+        Returns a short summary string for the step ledger.
         """
         existing = await self.neo4j.run_query(
             """
@@ -850,7 +1217,7 @@ class IngestionPipeline:
             await self.jobs.update(
                 job_id, progress_pct=55.0, pages_processed=existing_count
             )
-            return
+            return f"reused {existing_count} existing pages"
 
         extraction = await asyncio.to_thread(
             self.text_extractor.extract_sync, Path(source_path)
@@ -927,11 +1294,17 @@ class IngestionPipeline:
             "Created %d :Page nodes for doc %s (source=%s)",
             extraction.page_count, doc_id, extraction.document_source_type,
         )
+        detail = f"{extraction.page_count} pages ({extraction.document_source_type})"
+        if blank_count:
+            detail += f", {blank_count} blank"
+        return detail
 
     # ------------------------------------------------------------------ step 4
 
-    async def _embed_text(self, job_id: str, doc_id: str) -> None:
-        """Embed page texts and store on Page.text_embedding (Neo4j vector index)."""
+    async def _embed_text(self, job_id: str, doc_id: str) -> int:
+        """Embed page texts and store on Page.text_embedding (Neo4j vector index).
+
+        Returns the number of pages embedded (0 if all were already done)."""
         assert self.text_embedding is not None
         assert self.gpu is not None
 
@@ -947,7 +1320,7 @@ class IngestionPipeline:
         )
         if not pages:
             logger.info("No pages need text embedding for doc %s", doc_id)
-            return
+            return 0
 
         total = len(pages)
         batch_size = self.settings.ingestion.text_embedding_batch_size
@@ -985,14 +1358,17 @@ class IngestionPipeline:
                 )
 
         logger.info("Embedded text for %d pages of doc %s", total, doc_id)
+        return total
 
     # ------------------------------------------------------------------ step 5
 
-    async def _embed_visual(self, job_id: str, doc_id: str, file_hash: str) -> None:
+    async def _embed_visual(self, job_id: str, doc_id: str, file_hash: str) -> int:
         """Generate visual embeddings for every page and store as bytes on Page.
 
         Works with both Nemotron ColEmbed and ColPali — both implement
         embed_images() returning list[np.ndarray] of (K, D) float32.
+
+        Returns the number of pages embedded (0 if all were already done).
         """
         assert self.colpali is not None
         assert self.gpu is not None
@@ -1011,7 +1387,7 @@ class IngestionPipeline:
         )
         if not rows:
             logger.info("No pages need visual embedding for doc %s", doc_id)
-            return
+            return 0
 
         total = len(rows)
         batch_size = self.settings.ingestion.colpali_batch_size
@@ -1057,16 +1433,20 @@ class IngestionPipeline:
                 await self.jobs.update(job_id, pages_processed=done)
 
         logger.info("Embedded ColPali for %d pages of doc %s", total, doc_id)
+        return total
 
     # ------------------------------------------------------------------ step 6
 
-    async def _extract_entities(self, job_id: str, doc_id: str) -> None:
+    async def _extract_entities(self, job_id: str, doc_id: str) -> tuple[int, int]:
         """Run LLM entity extraction on each page and write results into the graph.
 
         I/O-bound on the LLM endpoint. Sequential per page (local LLM
         serves one request at a time). Skips pages that already have any
         MENTIONS_* outgoing relationship so re-runs after a partial failure
         don't double-count support_count on existing edges.
+
+        Returns (pages_processed, pages_failed) so callers can surface
+        partial failures instead of reporting a clean run.
         """
         assert self.entity_extractor is not None
 
@@ -1091,13 +1471,13 @@ class IngestionPipeline:
         )
         if not rows:
             logger.warning("No document %s found for entity extraction", doc_id)
-            return
+            return 0, 0
         title = rows[0]["title"] or "(untitled)"
         pages = [p for p in rows[0]["pages"] if p["page_id"] is not None]
 
         if not pages:
             logger.info("Document %s has no pages with text — skipping extraction", doc_id)
-            return
+            return 0, 0
 
         total = len(pages)
         logger.info(
@@ -1111,6 +1491,7 @@ class IngestionPipeline:
         await self.jobs.update(job_id, pages_total=total)
 
         done = 0
+        failed = 0
         aggregate = {"materials": 0, "processes": 0, "standards": 0,
                      "clauses": 0, "equipment": 0,
                      "page_rels": 0, "entity_rels": 0}
@@ -1127,6 +1508,7 @@ class IngestionPipeline:
                 for k, v in counts.items():
                     aggregate[k] = aggregate.get(k, 0) + v
             except Exception as exc:  # noqa: BLE001
+                failed += 1
                 logger.warning("Entity extraction failed for page %d: %s",
                                page["page_number"], exc)
 
@@ -1137,7 +1519,9 @@ class IngestionPipeline:
                 job_id, progress_pct=progress, pages_processed=done
             )
 
-        logger.info("Entity extraction complete for doc %s: %s", doc_id, aggregate)
+        logger.info("Entity extraction complete for doc %s: %s (%d/%d pages failed)",
+                    doc_id, aggregate, failed, total)
+        return done, failed
 
     # --------------------------------------------------------- chunk building
 
@@ -1150,7 +1534,16 @@ class IngestionPipeline:
         doc updates chunks in place instead of duplicating them. Safe to rerun
         after a partial failure.
         """
+        # Sub-phases surface via current_step (and the running step's detail)
+        # so the UI shows chunking/summarizing/embedding/writing live instead
+        # of one opaque "building_chunks" for the whole stretch. The ledger
+        # keeps them under the single "building_chunks" dot.
+
         # 1. Docling pass. Runs off the asyncio loop because it's CPU-bound.
+        await self.jobs.update(job_id, current_step="chunking")
+        await self.jobs.update_step(
+            job_id, "building_chunks", "running", detail="chunking (Docling parse)"
+        )
         chunks: list[StructuralChunk] = await asyncio.to_thread(
             self.structural_chunker.chunk_pdf, pdf_path, file_hash,
         )
@@ -1166,6 +1559,11 @@ class IngestionPipeline:
         # 2. Summaries — bounded-concurrency LLM calls. Short chunks skip
         # the LLM and reuse their text (see ChunkSummarizer).
         assert self.chunk_summarizer is not None
+        await self.jobs.update(job_id, current_step="summarizing", progress_pct=70.0)
+        await self.jobs.update_step(
+            job_id, "building_chunks", "running",
+            detail=f"summarizing {len(chunks)} chunks via LLM",
+        )
         summaries = await self.chunk_summarizer.summarize_batch(chunks, concurrency=4)
 
         # 3. Embed (summary + text concatenated produces the retrieval vector).
@@ -1174,6 +1572,11 @@ class IngestionPipeline:
         # independently via the chunk_text_fulltext index.
         assert self.text_embedding is not None
         assert self.gpu is not None
+        await self.jobs.update(job_id, current_step="embedding_chunks", progress_pct=72.0)
+        await self.jobs.update_step(
+            job_id, "building_chunks", "running",
+            detail=f"embedding {len(chunks)} chunk summaries",
+        )
         embed_inputs = [
             f"{s}\n\n{c.text[:2000]}" for s, c in zip(summaries, chunks)
         ]
@@ -1185,6 +1588,10 @@ class IngestionPipeline:
 
         # 4. Map each chunk to its Page node via (file_hash, page_number).
         # Write in batches to keep Neo4j write latency low.
+        await self.jobs.update(job_id, current_step="writing_chunks", progress_pct=74.0)
+        await self.jobs.update_step(
+            job_id, "building_chunks", "running", detail="writing chunks to graph"
+        )
         BATCH = 200
         total_written = 0
         for i in range(0, len(chunks), BATCH):

@@ -37,6 +37,26 @@ export interface PageDetail extends PageMeta {
 
 // --- Ingest jobs ---
 export type JobStatus = "queued" | "processing" | "completed" | "failed" | "cancelled";
+
+// Per-step ledger. "warning" = ran but some units failed; "skipped" = the
+// pipeline deliberately didn't run it (detail says why).
+export type StepStatus = "pending" | "running" | "done" | "warning" | "skipped" | "error";
+
+export interface JobStepRecord {
+  name: string;
+  status: StepStatus;
+  detail: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface JobLogLine {
+  ts: string;
+  level: string;
+  logger: string;
+  message: string;
+}
+
 export interface JobRow {
   job_id: string;
   status: JobStatus;
@@ -53,6 +73,7 @@ export interface JobRow {
   requested_tags: string[];
   doc_id: string | null;
   file_hash: string | null;
+  steps: JobStepRecord[];
 }
 
 // --- Search ---

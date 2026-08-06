@@ -128,6 +128,30 @@ async def get_job(job_id: str, request: Request) -> ForgeResult:
     return ForgeResult(success=True, data=job.model_dump(mode="json"))
 
 
+@router.get("/jobs/{job_id}/logs")
+async def get_job_logs(
+    job_id: str,
+    request: Request,
+    limit: int = Query(500, ge=1, le=5000),
+) -> ForgeResult:
+    """Return captured log lines for a job, oldest first.
+
+    Lines are captured live while the job runs (INFO and above from every
+    backend module active during the job), so this works both for watching
+    a running job and for post-mortem on a finished one. Jobs that ran
+    before log capture existed return an empty list.
+    """
+    jobs = request.app.state.job_manager
+    job = await jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    lines = await jobs.get_logs(job_id, limit=limit)
+    return ForgeResult(
+        success=True,
+        data={"job_id": job_id, "filename": job.filename, "lines": lines},
+    )
+
+
 @router.get("/jobs")
 async def list_jobs(
     request: Request,

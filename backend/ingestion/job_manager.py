@@ -10,8 +10,10 @@ inspect history via GET /ingest/jobs.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +21,8 @@ from typing import Any
 
 import aiosqlite
 
-from backend.models.ingestion import Job, JobStatus, JobStep
+from backend.ingestion.job_logs import LogRow, make_log_buffer
+from backend.models.ingestion import Job, JobStatus, JobStep, StepRecord, StepStatus
 
 logger = logging.getLogger(__name__)
 
@@ -47,12 +50,30 @@ CREATE TABLE IF NOT EXISTS jobs (
     doc_id TEXT,
     file_hash TEXT,
     pages_processed INTEGER NOT NULL DEFAULT 0,
-    pages_total INTEGER NOT NULL DEFAULT 0
+    pages_total INTEGER NOT NULL DEFAULT 0,
+    steps TEXT NOT NULL DEFAULT '[]'                  -- JSON array of StepRecord
 );
 
 CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
 CREATE INDEX IF NOT EXISTS jobs_created_idx ON jobs(created_at);
+
+CREATE TABLE IF NOT EXISTS job_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id TEXT NOT NULL,
+    ts TEXT NOT NULL,
+    level TEXT NOT NULL,
+    logger TEXT NOT NULL,
+    message TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS job_logs_job_idx ON job_logs(job_id, id);
 """
+
+# How many jobs keep their logs around. Older jobs' logs are pruned at
+# startup so the DB doesn't grow forever.
+_LOG_RETAIN_JOBS = 300
+# Per-job line cap, enforced when a job finishes.
+_LOG_RETAIN_LINES = 5000
 
 
 def _utcnow_iso() -> str:
@@ -70,6 +91,9 @@ class JobManager:
         # contention entirely; the busy_timeout below covers other processes
         # (e.g. the maintenance scripts) that open the same file.
         self._write_lock = asyncio.Lock()
+        # Per-job log lines captured by JobLogHandler (see job_logs.py).
+        # Drained into the job_logs table on every job write and log read.
+        self.log_buffer: deque[LogRow] = make_log_buffer()
 
     @asynccontextmanager
     async def _connect(self):
@@ -95,24 +119,58 @@ class JobManager:
         async with self._write_lock, self._connect() as db:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.executescript(_SCHEMA)
+            # Migration: the steps column was added after the first release;
+            # CREATE TABLE IF NOT EXISTS doesn't alter existing tables.
+            cur = await db.execute("PRAGMA table_info(jobs)")
+            cols = {row[1] for row in await cur.fetchall()}
+            if "steps" not in cols:
+                await db.execute(
+                    "ALTER TABLE jobs ADD COLUMN steps TEXT NOT NULL DEFAULT '[]'"
+                )
+                logger.info("Migrated jobs table: added steps column")
             # Mark in-flight jobs from the previous run as failed. Any
             # background task they were running was killed at shutdown;
             # without this cleanup the Ingest UI would show them stuck.
-            cursor = await db.execute(
-                """UPDATE jobs
-                   SET status = 'failed',
-                       current_step = 'error',
-                       error_message = coalesce(error_message,
-                           'Service restarted while job was running'),
-                       updated_at = ?
-                   WHERE status IN ('processing', 'queued')""",
-                (_utcnow_iso(),),
+            # Their step ledgers get the same treatment: whichever step was
+            # 'running' when the process died is marked as an error.
+            cur = await db.execute(
+                """SELECT job_id, steps FROM jobs
+                   WHERE status IN ('processing', 'queued')"""
+            )
+            stale = await cur.fetchall()
+            for job_id, steps_json in stale:
+                try:
+                    steps = json.loads(steps_json or "[]")
+                except json.JSONDecodeError:
+                    steps = []
+                for s in steps:
+                    if s.get("status") == "running":
+                        s["status"] = "error"
+                        s["detail"] = "Service restarted while step was running"
+                        s["finished_at"] = _utcnow_iso()
+                await db.execute(
+                    """UPDATE jobs
+                       SET status = 'failed',
+                           current_step = 'error',
+                           error_message = coalesce(error_message,
+                               'Service restarted while job was running'),
+                           steps = ?,
+                           updated_at = ?
+                       WHERE job_id = ?""",
+                    (json.dumps(steps), _utcnow_iso(), job_id),
+                )
+            # Prune logs of jobs that have aged out of the recent list.
+            await db.execute(
+                """DELETE FROM job_logs WHERE job_id NOT IN (
+                       SELECT job_id FROM jobs
+                       ORDER BY created_at DESC LIMIT ?
+                   )""",
+                (_LOG_RETAIN_JOBS,),
             )
             await db.commit()
-            restarted = cursor.rowcount
-            if restarted > 0:
+            if stale:
                 logger.info(
-                    "Marked %d stale in-flight job(s) as failed", restarted
+                    "Marked %d stale in-flight job(s) as failed", len(stale)
                 )
         self._ready = True
         logger.info("JobManager initialized at %s", self.db_path)
@@ -218,6 +276,116 @@ class JobManager:
             await db.execute(
                 f"UPDATE jobs SET {', '.join(sets)} WHERE job_id = ?", params
             )
+            await self._drain_logs_locked(db)
+            await db.commit()
+
+    # ------------------------------------------------------------ step ledger
+
+    async def set_steps(self, job_id: str, step_names: list[str]) -> None:
+        """Initialize the per-step ledger with all steps pending.
+
+        Called once at the start of each pipeline run with the planned steps
+        for that job type, so the UI can show what will (and won't) happen.
+        """
+        steps = [StepRecord(name=n).model_dump() for n in step_names]
+        async with self._write_lock, self._connect() as db:
+            await db.execute(
+                "UPDATE jobs SET steps = ?, updated_at = ? WHERE job_id = ?",
+                (json.dumps(steps), _utcnow_iso(), job_id),
+            )
+            await self._drain_logs_locked(db)
+            await db.commit()
+
+    async def update_step(
+        self,
+        job_id: str,
+        name: str,
+        status: StepStatus,
+        detail: str | None = None,
+    ) -> None:
+        """Set one step's status in the ledger (read-modify-write under the
+        write lock). A step not present in the plan is appended — that keeps
+        the ledger honest if a pipeline runs a step it didn't announce."""
+        now = _utcnow_iso()
+        async with self._write_lock, self._connect() as db:
+            cur = await db.execute(
+                "SELECT steps FROM jobs WHERE job_id = ?", (job_id,)
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return
+            try:
+                steps = json.loads(row[0] or "[]")
+            except json.JSONDecodeError:
+                steps = []
+
+            entry = next((s for s in steps if s.get("name") == name), None)
+            if entry is None:
+                entry = StepRecord(name=name).model_dump()
+                steps.append(entry)
+            entry["status"] = status
+            if detail is not None:
+                entry["detail"] = detail
+            if status == "running" and not entry.get("started_at"):
+                entry["started_at"] = now
+            if status in ("done", "warning", "skipped", "error"):
+                entry["finished_at"] = now
+
+            await db.execute(
+                "UPDATE jobs SET steps = ?, updated_at = ? WHERE job_id = ?",
+                (json.dumps(steps), now, job_id),
+            )
+            await self._drain_logs_locked(db)
+            await db.commit()
+
+    # -------------------------------------------------------------- job logs
+
+    async def _drain_logs_locked(self, db: aiosqlite.Connection) -> None:
+        """Persist buffered log lines. Caller must hold the write lock and
+        commit afterwards. deque.popleft is thread-safe against the handler
+        appending from worker threads."""
+        rows: list[LogRow] = []
+        while True:
+            try:
+                rows.append(self.log_buffer.popleft())
+            except IndexError:
+                break
+        if rows:
+            await db.executemany(
+                """INSERT INTO job_logs (job_id, ts, level, logger, message)
+                   VALUES (?, ?, ?, ?, ?)""",
+                rows,
+            )
+
+    async def get_logs(
+        self, job_id: str, limit: int = 1000
+    ) -> list[dict[str, str]]:
+        """Return the last `limit` captured log lines for a job, oldest
+        first. Flushes the in-memory buffer first so the result is live."""
+        async with self._write_lock, self._connect() as db:
+            await self._drain_logs_locked(db)
+            await db.commit()
+            cur = await db.execute(
+                """SELECT ts, level, logger, message FROM job_logs
+                   WHERE job_id = ? ORDER BY id DESC LIMIT ?""",
+                (job_id, limit),
+            )
+            rows = await cur.fetchall()
+        return [
+            {"ts": r[0], "level": r[1], "logger": r[2], "message": r[3]}
+            for r in reversed(rows)
+        ]
+
+    async def _prune_job_logs(self, job_id: str) -> None:
+        """Cap a finished job's stored log lines at _LOG_RETAIN_LINES."""
+        async with self._write_lock, self._connect() as db:
+            await db.execute(
+                """DELETE FROM job_logs WHERE job_id = ? AND id NOT IN (
+                       SELECT id FROM job_logs WHERE job_id = ?
+                       ORDER BY id DESC LIMIT ?
+                   )""",
+                (job_id, job_id, _LOG_RETAIN_LINES),
+            )
             await db.commit()
 
     async def fail(self, job_id: str, error_message: str) -> None:
@@ -227,6 +395,7 @@ class JobManager:
             current_step="error",
             error_message=error_message,
         )
+        await self._prune_job_logs(job_id)
 
     async def complete(self, job_id: str) -> None:
         await self.update(
@@ -235,11 +404,17 @@ class JobManager:
             current_step="done",
             progress_pct=100.0,
         )
+        await self._prune_job_logs(job_id)
+
+
+def _parse_steps(raw: str | None) -> list[StepRecord]:
+    try:
+        return [StepRecord(**s) for s in json.loads(raw or "[]")]
+    except Exception:  # noqa: BLE001 — a corrupt ledger shouldn't hide the job
+        return []
 
 
 def _row_to_job(row: aiosqlite.Row) -> Job:
-    import json
-
     return Job(
         job_id=row["job_id"],
         status=row["status"],
@@ -256,4 +431,5 @@ def _row_to_job(row: aiosqlite.Row) -> Job:
         file_hash=row["file_hash"],
         pages_processed=row["pages_processed"],
         pages_total=row["pages_total"],
+        steps=_parse_steps(row["steps"]),
     )

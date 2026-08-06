@@ -26,6 +26,111 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
+@router.get("/audit/completeness")
+async def audit_completeness(request: Request) -> ForgeResult:
+    """Audit every document's pipeline completeness from graph state.
+
+    No re-processing — each pipeline step leaves a fingerprint on the graph
+    (Page properties, Chunk nodes, entity relationships), so this derives
+    which steps are missing/partial/complete per document, including
+    embedding-dimension verification against the configured models.
+
+    Slow-ish by design (full Page scan, ~100k pages ≈ tens of seconds);
+    call it on demand, not on a poll loop.
+    """
+    from backend.services.completeness import run_audit
+
+    settings = request.app.state.settings
+    neo4j = request.app.state.neo4j
+    report = await run_audit(
+        neo4j,
+        text_dim=settings.models.text_embedding_dim,
+        visual_dim=settings.models.visual_embed_dim,
+    )
+    logger.info(
+        "Completeness audit: %(complete)d complete, %(incomplete)d incomplete, "
+        "%(error)d error of %(documents)d documents",
+        report["summary"],
+    )
+    return ForgeResult(success=True, data=report)
+
+
+@router.post("/fill-missing")
+async def fill_missing(request: Request, payload: dict | None = None) -> ForgeResult:
+    """Queue incremental gap-filling jobs for the given documents.
+
+    Unlike /bulk-reembed (which CLEARS embeddings first — for model
+    switches), fill-missing never deletes anything: the embed/extract steps
+    already filter to pages missing the artifact, so completed pages cost
+    nothing. Safe to run on every document with gaps.
+
+    Body:
+      {
+        "doc_ids": ["...", ...],   # required
+        "text": true,               # fill missing text embeddings
+        "visual": true,             # fill missing visual embeddings
+        "entities": false           # re-run extraction on unextracted pages
+      }
+    """
+    if not isinstance(payload, dict):
+        payload = {}
+    doc_ids = payload.get("doc_ids") or []
+    do_text = bool(payload.get("text", True))
+    do_visual = bool(payload.get("visual", True))
+    do_entities = bool(payload.get("entities", False))
+
+    if not isinstance(doc_ids, list) or not doc_ids:
+        return ForgeResult(success=False, reason="doc_ids must be a non-empty list",
+                           data={"queued": 0})
+    if not (do_text or do_visual or do_entities):
+        return ForgeResult(success=False, reason="nothing to do — enable at least one of text/visual/entities",
+                           data={"queued": 0})
+
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    rows = await neo4j.run_query(
+        """
+        UNWIND $ids AS id
+        MATCH (d:Document {doc_id: id})
+        RETURN d.doc_id AS doc_id, d.filename AS filename
+        """,
+        {"ids": doc_ids},
+    )
+    found = {r["doc_id"]: r for r in rows}
+    queued = []
+    for doc_id in doc_ids:
+        if doc_id not in found:
+            continue
+        job = await jobs.create(
+            source_path=f"(fill-missing of {doc_id})",
+            filename=found[doc_id]["filename"],
+            categories=[],
+            tags=[],
+        )
+        asyncio.create_task(
+            pipeline.run_fill_missing(
+                job.job_id, doc_id,
+                do_text=do_text, do_visual=do_visual, do_entities=do_entities,
+            )
+        )
+        queued.append({"doc_id": doc_id, "job_id": job.job_id})
+
+    logger.info(
+        "Queued %d fill-missing job(s) (text=%s visual=%s entities=%s)",
+        len(queued), do_text, do_visual, do_entities,
+    )
+    return ForgeResult(
+        success=True,
+        data={
+            "queued": len(queued),
+            "not_found": len(doc_ids) - len(queued),
+            "jobs": queued,
+        },
+    )
+
+
 @router.post("/normalize-entities")
 async def normalize_entities(request: Request) -> ForgeResult:
     """Merge duplicate entities that differ only by case or whitespace.

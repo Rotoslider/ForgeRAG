@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.config import DEFAULT_CONFIG_PATH, get_settings
+from backend.ingestion.job_logs import install_job_log_handler
 from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pipeline import IngestionPipeline
 from backend.routers import admin, documents, graph, health, images, ingestion, search, skills, system
@@ -108,6 +109,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     job_manager = JobManager(data_dir / "jobs.sqlite")
     await job_manager.init()
     app.state.job_manager = job_manager
+    # Capture per-job logs: while a pipeline run is active, INFO+ records
+    # from any module are routed into the job_logs table for the GUI's
+    # per-job log viewer.
+    install_job_log_handler(job_manager.log_buffer)
 
     # GPU manager + ML services (created regardless, actual model loading is lazy)
     gpu = GPUManager(idle_unload_seconds=settings.gpu.model_idle_unload_seconds)

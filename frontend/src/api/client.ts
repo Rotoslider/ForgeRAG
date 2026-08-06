@@ -7,6 +7,7 @@ import type {
   GraphStats,
   HealthPayload,
   HybridStrategy,
+  JobLogLine,
   JobRow,
   PageDetail,
   PageMeta,
@@ -287,6 +288,10 @@ export const listJobs = (status?: string, limit = 50) => {
   if (status) q.set("status", status);
   return request<JobRow[]>(`/ingest/jobs?${q}`);
 };
+export const getJobLogs = (id: string, limit = 1000) =>
+  request<{ job_id: string; filename: string; lines: JobLogLine[] }>(
+    `/ingest/jobs/${id}/logs?limit=${limit}`
+  );
 
 // ---- Search ----
 export const searchSemantic = (query: string, limit = 10) =>
@@ -322,6 +327,56 @@ export const searchAnswer = (query: string, limit = 5, search_mode = "semantic")
     method: "POST",
     body: JSON.stringify({ query, limit, search_mode }),
   });
+
+// ---- Completeness audit ----
+export interface AuditAspect {
+  status: "done" | "partial" | "missing" | "error" | "na";
+  done: number;
+  needed: number;
+  detail: string | null;
+}
+
+export interface DocAudit {
+  doc_id: string;
+  title: string;
+  collection: string;
+  source_type: string | null;
+  pages: number;
+  declared_pages: number;
+  chunk_count: number;
+  overall: "complete" | "incomplete" | "error";
+  aspects: Record<string, AuditAspect>;
+}
+
+export interface AuditReport {
+  generated_at: string;
+  text_dim: number;
+  visual_dim: number;
+  summary: {
+    documents: number;
+    complete: number;
+    incomplete: number;
+    error: number;
+    total_pages: number;
+    gaps: Record<string, { docs: number; pages_missing: number }>;
+  };
+  documents: DocAudit[];
+}
+
+// Full Page scan on the server — allow well beyond the default timeout.
+export const auditCompleteness = () =>
+  request<AuditReport>("/admin/audit/completeness", { timeoutMs: 15 * 60 * 1000 });
+
+export const fillMissingBulk = (body: {
+  doc_ids: string[];
+  text?: boolean;
+  visual?: boolean;
+  entities?: boolean;
+}) =>
+  request<{ queued: number; not_found: number; jobs: Array<{ doc_id: string; job_id: string }> }>(
+    "/admin/fill-missing",
+    { method: "POST", body: JSON.stringify(body) }
+  );
 
 export const cleanupUploads = () =>
   request<{ deleted: number; freed_bytes: number; freed_mb: number }>(

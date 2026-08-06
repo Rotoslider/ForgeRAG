@@ -1,11 +1,13 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   addDocumentTag,
   applyTags,
+  auditCompleteness,
   buildCommunities,
   deleteDocument,
+  fillMissingBulk,
   getBackupProgress,
   getBackupSettings,
   listBackups,
@@ -27,7 +29,7 @@ import {
   unloadModel,
   updateBackupSettings,
 } from "../api/client";
-import type { BackupSettingsData } from "../api/client";
+import type { AuditReport, BackupSettingsData, DocAudit } from "../api/client";
 import type { DocumentRow } from "../api/types";
 
 export default function Manage() {
@@ -40,6 +42,7 @@ export default function Manage() {
         <CommunitiesCard />
       </div>
       <BackupRestoreCard />
+      <CompletenessCard />
       <DocumentsTable />
       <EntitiesPanel />
     </div>
@@ -472,6 +475,476 @@ function BackupRestoreCard() {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- audit
+
+const AUDIT_ASPECTS: Array<{ key: string; label: string }> = [
+  { key: "pages", label: "pages" },
+  { key: "text_embedding", label: "text embed" },
+  { key: "visual_embedding", label: "visual embed" },
+  { key: "chunks", label: "chunks" },
+  { key: "entities", label: "entities" },
+];
+
+const AUDIT_CIRCLE: Record<string, string> = {
+  done: "bg-emerald-500",
+  partial: "bg-amber-500",
+  missing: "bg-rose-500",
+  error: "bg-rose-500 ring-2 ring-rose-300/50",
+  na: "border border-forge-muted/40 bg-transparent",
+};
+
+function AuditCell({ doc, aspect }: { doc: DocAudit; aspect: string }) {
+  const a = doc.aspects[aspect];
+  if (!a) return <td className="px-2 py-1" />;
+  const counts =
+    a.status === "na"
+      ? "—"
+      : a.needed > 0
+      ? `${a.done}/${a.needed}`
+      : `${a.done}`;
+  return (
+    <td
+      className="px-2 py-1"
+      title={`${aspect}: ${a.status}${a.detail ? ` — ${a.detail}` : ""}`}
+    >
+      <span className="flex items-center gap-1.5">
+        <span
+          className={`h-2.5 w-2.5 rounded-full shrink-0 ${
+            AUDIT_CIRCLE[a.status] || AUDIT_CIRCLE.na
+          }`}
+        />
+        <span
+          className={`tabular-nums ${
+            a.status === "missing" || a.status === "error"
+              ? "text-rose-400"
+              : a.status === "partial"
+              ? "text-amber-400"
+              : "text-forge-muted"
+          }`}
+        >
+          {counts}
+        </span>
+      </span>
+    </td>
+  );
+}
+
+// Per-doc repair panel shown when a row's "fix" button is expanded. Renders
+// one button per detected gap; each queues a job for just this document.
+// New aspect types added later only need a branch here to become fixable.
+function DocFixButtons({
+  doc,
+  busy,
+  queuedLabel,
+  onFill,
+  onChunks,
+  onReembed,
+}: {
+  doc: DocAudit;
+  busy: boolean;
+  queuedLabel: string | null;
+  onFill: (opts: { text: boolean; visual: boolean; entities: boolean }) => void;
+  onChunks: () => void;
+  onReembed: () => void;
+}) {
+  if (queuedLabel) {
+    return (
+      <div className="text-xs text-emerald-400 py-1">
+        ✓ {queuedLabel} queued — watch it on the Ingest page, then re-run the audit.
+      </div>
+    );
+  }
+  const a = doc.aspects;
+  const gap = (k: string) => ["missing", "partial"].includes(a[k]?.status);
+  const missingCount = (k: string) =>
+    Math.max(0, (a[k]?.needed ?? 0) - (a[k]?.done ?? 0));
+  const textGap = gap("text_embedding");
+  const visualGap = gap("visual_embedding");
+  const entityGap = gap("entities");
+  const chunksMissing = a.chunks?.status === "missing";
+  const chunksPartial = a.chunks?.status === "partial";
+  const dimError =
+    a.text_embedding?.status === "error" || a.visual_embedding?.status === "error";
+  const broken = a.pages?.status === "error";
+
+  const btn =
+    "text-xs border border-forge-edge rounded px-2.5 py-1 hover:bg-forge-edge disabled:opacity-50";
+
+  return (
+    <div className="flex items-center gap-2 flex-wrap py-1">
+      {broken && (
+        <span className="text-xs text-rose-400">
+          No pages exist — delete this document in the table below and re-ingest
+          the PDF; nothing can be repaired in place.
+        </span>
+      )}
+      {(textGap || visualGap) && (
+        <button
+          disabled={busy}
+          onClick={() => onFill({ text: textGap, visual: visualGap, entities: false })}
+          className={btn}
+          title="Embeds only the pages that have no embedding — existing work untouched"
+        >
+          Fill missing embeddings
+          {" "}({[
+            textGap ? `${missingCount("text_embedding")} text` : null,
+            visualGap ? `${missingCount("visual_embedding")} visual` : null,
+          ].filter(Boolean).join(", ")} pages)
+        </button>
+      )}
+      {entityGap && (
+        <button
+          disabled={busy}
+          onClick={() => onFill({ text: false, visual: false, entities: true })}
+          className={btn}
+          title="Runs LLM extraction only on pages without entity relationships"
+        >
+          Extract missing entities (~{missingCount("entities")} pages)
+        </button>
+      )}
+      {(chunksMissing || chunksPartial) && (
+        <button
+          disabled={busy}
+          onClick={onChunks}
+          className={btn}
+          title={
+            chunksPartial
+              ? "Re-runs Docling + summaries + embeddings for ALL of this document's chunks"
+              : "Builds chunks + summaries + embeddings for this document"
+          }
+        >
+          {chunksMissing ? "Build chunks" : "Rebuild chunks (redoes all summaries)"}
+        </button>
+      )}
+      {dimError && (
+        <button
+          disabled={busy}
+          onClick={onReembed}
+          className={`${btn} border-rose-500/60 text-rose-300`}
+          title="Clears ALL embeddings for this document and regenerates with the current models — the only fix for wrong-dimension vectors"
+        >
+          Re-embed (clears + regenerates)
+        </button>
+      )}
+      {!broken && !textGap && !visualGap && !entityGap && !chunksMissing && !chunksPartial && !dimError && (
+        <span className="text-xs text-forge-muted">nothing fixable — all gaps resolved</span>
+      )}
+    </div>
+  );
+}
+
+function CompletenessCard() {
+  const qc = useQueryClient();
+  const [showAll, setShowAll] = useState(false);
+  const [queuedMsg, setQueuedMsg] = useState<string | null>(null);
+  const [expandedDoc, setExpandedDoc] = useState<string | null>(null);
+  // doc_id -> human label of what was queued for it this session
+  const [queuedDocs, setQueuedDocs] = useState<Record<string, string>>({});
+  const audit = useQuery({
+    queryKey: ["completeness"],
+    queryFn: auditCompleteness,
+    enabled: false, // full page scan — run only on demand
+    staleTime: Infinity,
+    retry: false,
+  });
+  const report: AuditReport | undefined = audit.data?.data;
+
+  const fill = useMutation({
+    mutationFn: fillMissingBulk,
+    onSuccess: (res) => {
+      setQueuedMsg(
+        `Queued ${res.data?.queued ?? 0} fill-missing job(s) — track them on the Ingest page, then re-run the audit.`
+      );
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+    },
+  });
+  const chunkFix = useMutation({
+    mutationFn: (ids: string[]) =>
+      rebuildChunksBulk({ doc_ids: ids, skip_extract: true, only_missing: true }),
+    onSuccess: (res) => {
+      setQueuedMsg(
+        `Queued ${res.data?.queued ?? 0} chunk-rebuild job(s) — track them on the Ingest page, then re-run the audit.`
+      );
+      qc.invalidateQueries({ queryKey: ["jobs"] });
+    },
+  });
+
+  // ---- per-document repairs (queued from a row's expanded fix panel)
+  const markDocQueued = (docId: string, label: string) => {
+    setQueuedDocs((prev) => ({ ...prev, [docId]: label }));
+    qc.invalidateQueries({ queryKey: ["jobs"] });
+  };
+  const fillOne = useMutation({
+    mutationFn: (args: { doc_id: string; text: boolean; visual: boolean; entities: boolean }) =>
+      fillMissingBulk({
+        doc_ids: [args.doc_id],
+        text: args.text,
+        visual: args.visual,
+        entities: args.entities,
+      }),
+    onSuccess: (_res, args) =>
+      markDocQueued(
+        args.doc_id,
+        args.entities ? "entity extraction" : "embedding fill"
+      ),
+  });
+  const chunkOne = useMutation({
+    mutationFn: (docId: string) => rebuildChunks(docId, { skip_extract: true }),
+    onSuccess: (_res, docId) => markDocQueued(docId, "chunk rebuild"),
+  });
+  const reembedOne = useMutation({
+    mutationFn: (docId: string) => reembedDocument(docId),
+    onSuccess: (_res, docId) => markDocQueued(docId, "full re-embed"),
+  });
+  const rowBusy = fillOne.isPending || chunkOne.isPending || reembedOne.isPending;
+
+  const docsWhere = (aspect: string, statuses: string[]) =>
+    (report?.documents ?? [])
+      .filter((d) => statuses.includes(d.aspects[aspect]?.status))
+      .map((d) => d.doc_id);
+
+  const embedGapDocs = report
+    ? Array.from(
+        new Set([
+          ...docsWhere("text_embedding", ["missing", "partial"]),
+          ...docsWhere("visual_embedding", ["missing", "partial"]),
+        ])
+      )
+    : [];
+  const entityGapDocs = docsWhere("entities", ["missing", "partial"]);
+  const chunkGapDocs = docsWhere("chunks", ["missing"]);
+  const wrongDimDocs = report
+    ? (report.documents ?? []).filter(
+        (d) =>
+          d.aspects.text_embedding?.status === "error" ||
+          d.aspects.visual_embedding?.status === "error"
+      )
+    : [];
+  const brokenDocs = docsWhere("pages", ["error"]);
+
+  const problems = (report?.documents ?? []).filter((d) => d.overall !== "complete");
+  const shown = showAll ? report?.documents ?? [] : problems;
+  const busy = fill.isPending || chunkFix.isPending;
+
+  return (
+    <div className="bg-forge-panel border border-forge-edge rounded-lg p-5">
+      <div className="flex items-center gap-3 flex-wrap mb-2">
+        <h2 className="font-semibold">Pipeline Completeness</h2>
+        <button
+          onClick={() => {
+            setQueuedMsg(null);
+            audit.refetch();
+          }}
+          disabled={audit.isFetching}
+          className="bg-forge-accent text-black font-semibold rounded px-3 py-1.5 text-sm hover:brightness-110 disabled:opacity-50"
+        >
+          {audit.isFetching ? "Auditing… (full page scan)" : report ? "Re-run audit" : "Run audit"}
+        </button>
+        {report && (
+          <span className="text-xs text-forge-muted">
+            audited {report.summary.documents} docs / {report.summary.total_pages.toLocaleString()} pages
+            {" · "}dims verified: text {report.text_dim}, visual {report.visual_dim}
+          </span>
+        )}
+      </div>
+      <p className="text-xs text-forge-muted mb-3">
+        Checks every document against the graph itself — no re-processing. Each
+        step leaves a fingerprint (embeddings, chunks, entity links), so missing
+        work is visible without re-ingesting. Repairs are incremental: only
+        pages missing an artifact get processed, existing work is never redone.
+      </p>
+
+      {audit.isError && (
+        <div className="text-sm text-rose-400 mb-3">
+          Audit failed: {(audit.error as Error).message}
+        </div>
+      )}
+      {report && !audit.isFetching && (
+        <>
+          <div className="flex items-center gap-2 flex-wrap mb-3 text-xs">
+            <span className="border border-emerald-500/50 text-emerald-400 rounded px-2 py-0.5">
+              {report.summary.complete} complete
+            </span>
+            <span className="border border-amber-500/50 text-amber-400 rounded px-2 py-0.5">
+              {report.summary.incomplete} incomplete
+            </span>
+            <span className="border border-rose-500/50 text-rose-400 rounded px-2 py-0.5">
+              {report.summary.error} error
+            </span>
+            <label className="ml-auto flex items-center gap-1.5 cursor-pointer text-forge-muted">
+              <input
+                type="checkbox"
+                checked={showAll}
+                onChange={(e) => setShowAll(e.target.checked)}
+              />
+              show complete docs too
+            </label>
+          </div>
+
+          <div className="flex gap-2 flex-wrap mb-3">
+            {embedGapDocs.length > 0 && (
+              <button
+                disabled={busy}
+                onClick={() =>
+                  fill.mutate({ doc_ids: embedGapDocs, text: true, visual: true })
+                }
+                className="text-xs border border-forge-edge rounded px-3 py-1.5 hover:bg-forge-edge disabled:opacity-50"
+              >
+                Fill missing embeddings ({embedGapDocs.length} docs)
+              </button>
+            )}
+            {entityGapDocs.length > 0 && (
+              <button
+                disabled={busy}
+                onClick={() =>
+                  fill.mutate({
+                    doc_ids: entityGapDocs,
+                    text: false,
+                    visual: false,
+                    entities: true,
+                  })
+                }
+                className="text-xs border border-forge-edge rounded px-3 py-1.5 hover:bg-forge-edge disabled:opacity-50"
+              >
+                Extract missing entities ({entityGapDocs.length} docs)
+              </button>
+            )}
+            {chunkGapDocs.length > 0 && (
+              <button
+                disabled={busy}
+                onClick={() => chunkFix.mutate(chunkGapDocs)}
+                className="text-xs border border-forge-edge rounded px-3 py-1.5 hover:bg-forge-edge disabled:opacity-50"
+              >
+                Build missing chunks ({chunkGapDocs.length} docs)
+              </button>
+            )}
+          </div>
+
+          {queuedMsg && (
+            <div className="text-xs text-emerald-400 mb-3">{queuedMsg}</div>
+          )}
+          {(fill.isError || chunkFix.isError) && (
+            <div className="text-xs text-rose-400 mb-3">
+              {((fill.error || chunkFix.error) as Error)?.message}
+            </div>
+          )}
+          {wrongDimDocs.length > 0 && (
+            <div className="border border-rose-500/50 bg-rose-500/10 rounded p-3 mb-3 text-xs">
+              <span className="text-rose-300 font-semibold">
+                {wrongDimDocs.length} document(s) have wrong-dimension embeddings
+              </span>{" "}
+              <span className="text-forge-muted">
+                — stale vectors from an older model. Filling can't fix these
+                (the vectors aren't empty); use the per-document re-embed
+                actions below, which clear and regenerate.
+              </span>
+            </div>
+          )}
+          {brokenDocs.length > 0 && (
+            <div className="border border-rose-500/50 bg-rose-500/10 rounded p-3 mb-3 text-xs">
+              <span className="text-rose-300 font-semibold">
+                {brokenDocs.length} document(s) have no pages at all
+              </span>{" "}
+              <span className="text-forge-muted">
+                — ingestion died before page creation. Delete them below and
+                re-ingest the PDFs; nothing can be filled.
+              </span>
+            </div>
+          )}
+
+          {shown.length === 0 ? (
+            <div className="text-sm text-emerald-400">
+              Every document has all pipeline steps complete.
+            </div>
+          ) : (
+            <div className="max-h-96 overflow-y-auto border border-forge-edge rounded">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-forge-panel">
+                  <tr className="text-left text-forge-muted border-b border-forge-edge">
+                    <th className="px-2 py-1.5 font-normal">document</th>
+                    <th className="px-2 py-1.5 font-normal">collection</th>
+                    {AUDIT_ASPECTS.map((a) => (
+                      <th key={a.key} className="px-2 py-1.5 font-normal">
+                        {a.label}
+                      </th>
+                    ))}
+                    <th className="px-2 py-1.5 font-normal" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {shown.map((d) => (
+                    <Fragment key={d.doc_id}>
+                      <tr className="border-b border-forge-edge/50 last:border-b-0">
+                        <td className="px-2 py-1 max-w-[16rem]">
+                          <span className="flex items-center gap-1.5">
+                            <span
+                              className={`h-2 w-2 rounded-full shrink-0 ${
+                                d.overall === "complete"
+                                  ? "bg-emerald-500"
+                                  : d.overall === "error"
+                                  ? "bg-rose-500"
+                                  : "bg-amber-500"
+                              }`}
+                            />
+                            <span className="truncate" title={d.title}>
+                              {d.title}
+                            </span>
+                          </span>
+                        </td>
+                        <td className="px-2 py-1 text-forge-muted">{d.collection}</td>
+                        {AUDIT_ASPECTS.map((a) => (
+                          <AuditCell key={a.key} doc={d} aspect={a.key} />
+                        ))}
+                        <td className="px-2 py-1 text-right">
+                          {d.overall !== "complete" &&
+                            (queuedDocs[d.doc_id] ? (
+                              <span className="text-emerald-400" title={`${queuedDocs[d.doc_id]} queued`}>
+                                ✓ queued
+                              </span>
+                            ) : (
+                              <button
+                                onClick={() =>
+                                  setExpandedDoc(
+                                    expandedDoc === d.doc_id ? null : d.doc_id
+                                  )
+                                }
+                                className={`border border-forge-edge rounded px-2 py-0.5 hover:bg-forge-edge ${
+                                  expandedDoc === d.doc_id ? "bg-forge-edge" : ""
+                                }`}
+                              >
+                                fix {expandedDoc === d.doc_id ? "▾" : "▸"}
+                              </button>
+                            ))}
+                        </td>
+                      </tr>
+                      {expandedDoc === d.doc_id && !queuedDocs[d.doc_id] && (
+                        <tr className="border-b border-forge-edge/50 bg-forge-bg/50">
+                          <td colSpan={AUDIT_ASPECTS.length + 3} className="px-3 py-1">
+                            <DocFixButtons
+                              doc={d}
+                              busy={rowBusy}
+                              queuedLabel={queuedDocs[d.doc_id] ?? null}
+                              onFill={(opts) =>
+                                fillOne.mutate({ doc_id: d.doc_id, ...opts })
+                              }
+                              onChunks={() => chunkOne.mutate(d.doc_id)}
+                              onReembed={() => reembedOne.mutate(d.doc_id)}
+                            />
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
     </div>
   );
 }

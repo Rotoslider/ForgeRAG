@@ -1,7 +1,8 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   checkDuplicates,
+  getJobLogs,
   listCategories,
   listCollections,
   listTags,
@@ -10,7 +11,7 @@ import {
   uploadPdf,
 } from "../api/client";
 import type { DuplicateInfo } from "../api/client";
-import type { JobRow } from "../api/types";
+import type { JobRow, JobStepRecord, StepStatus } from "../api/types";
 
 const fileKey = (f: File) => `${f.name}|${f.size}`;
 
@@ -540,7 +541,7 @@ function JobsList() {
 
   return (
     <div>
-      <div className="flex items-center mb-3 gap-3">
+      <div className="flex items-center mb-3 gap-3 flex-wrap">
         <h2 className="font-semibold">Recent Jobs</h2>
         <span className="text-xs text-forge-muted">
           polling every 3s
@@ -552,6 +553,23 @@ function JobsList() {
             title="refetching"
           />
         )}
+        <span className="text-[10px] text-forge-muted ml-auto flex items-center gap-2">
+          <span className="flex items-center gap-1">
+            <span className="h-2 w-2 rounded-full bg-emerald-500 inline-block" /> done
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="h-2 w-2 rounded-full bg-amber-500 inline-block" /> partial
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="h-2 w-2 rounded-full bg-rose-500 inline-block" /> failed
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="h-2 w-2 rounded-full border border-amber-500/70 inline-block" /> skipped
+          </span>
+          <span className="flex items-center gap-1">
+            <span className="h-2 w-2 rounded-full border border-forge-muted/50 inline-block" /> not run
+          </span>
+        </span>
       </div>
       {jobs.length === 0 && (
         <div className="text-forge-muted text-sm">No jobs yet.</div>
@@ -565,7 +583,164 @@ function JobsList() {
   );
 }
 
+// Human labels for pipeline step names (ledger + current_step values).
+const STEP_LABELS: Record<string, string> = {
+  registering: "register",
+  rendering_pages: "render pages",
+  extracting_text: "extract text",
+  auto_tagging: "auto-tag",
+  embedding_text: "text embed",
+  building_chunks: "chunks",
+  embedding_visual: "visual embed",
+  extracting_entities: "entities",
+  dedup_entities: "dedup",
+  chunking: "chunking",
+  summarizing: "summaries",
+  embedding_chunks: "chunk embed",
+  writing_chunks: "write chunks",
+  building_graph: "communities",
+};
+
+const stepLabel = (name: string) => STEP_LABELS[name] || name.replace(/_/g, " ");
+
+const STEP_CIRCLE: Record<StepStatus, string> = {
+  done: "bg-emerald-500",
+  warning: "bg-amber-500",
+  error: "bg-rose-500",
+  running: "bg-sky-400 animate-pulse",
+  skipped: "border border-amber-500/70 bg-transparent",
+  pending: "border border-forge-muted/50 bg-transparent",
+};
+
+const STEP_STATUS_TEXT: Record<StepStatus, string> = {
+  done: "completed",
+  warning: "completed with errors",
+  error: "failed",
+  running: "running",
+  skipped: "skipped",
+  pending: "not run",
+};
+
+function StepCircles({ steps }: { steps: JobStepRecord[] }) {
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2">
+      {steps.map((s) => (
+        <span
+          key={s.name}
+          className="flex items-center gap-1.5"
+          title={`${stepLabel(s.name)}: ${STEP_STATUS_TEXT[s.status] || s.status}${
+            s.detail ? ` — ${s.detail}` : ""
+          }`}
+        >
+          <span
+            className={`h-2.5 w-2.5 rounded-full shrink-0 ${
+              STEP_CIRCLE[s.status] || STEP_CIRCLE.pending
+            }`}
+          />
+          <span
+            className={`text-[10px] ${
+              s.status === "error"
+                ? "text-rose-400"
+                : s.status === "warning" || s.status === "skipped"
+                ? "text-amber-400"
+                : s.status === "running"
+                ? "text-sky-300"
+                : "text-forge-muted"
+            }`}
+          >
+            {stepLabel(s.name)}
+          </span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// Steps whose outcome deserves an explanation line under the circles —
+// anything that didn't simply succeed.
+function StepIssues({ steps }: { steps: JobStepRecord[] }) {
+  const issues = steps.filter(
+    (s) => (s.status === "error" || s.status === "warning" || s.status === "skipped") && s.detail
+  );
+  if (issues.length === 0) return null;
+  return (
+    <div className="mt-1.5 space-y-0.5">
+      {issues.map((s) => (
+        <div
+          key={s.name}
+          className={`text-[11px] font-mono ${
+            s.status === "error" ? "text-rose-400" : "text-amber-400/90"
+          }`}
+        >
+          {stepLabel(s.name)} {s.status === "skipped" ? "skipped" : s.status === "warning" ? "partial" : "failed"}: {s.detail}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function JobLogs({ jobId, isActive }: { jobId: string; isActive: boolean }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ["job-logs", jobId],
+    queryFn: () => getJobLogs(jobId),
+    refetchInterval: isActive ? 3000 : false,
+  });
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const pinnedToBottom = useRef(true);
+  const lines = data?.data?.lines || [];
+
+  // Follow the tail while the user hasn't scrolled up.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (el && pinnedToBottom.current) el.scrollTop = el.scrollHeight;
+  }, [lines.length]);
+
+  const levelColor = (level: string) =>
+    level === "ERROR" || level === "CRITICAL"
+      ? "text-rose-400"
+      : level === "WARNING"
+      ? "text-amber-400"
+      : "text-forge-muted";
+
+  return (
+    <div className="mt-2 border border-forge-edge rounded bg-forge-bg">
+      {isLoading ? (
+        <div className="text-xs text-forge-muted p-2">loading logs…</div>
+      ) : lines.length === 0 ? (
+        <div className="text-xs text-forge-muted p-2">
+          No logs recorded for this job
+          {" "}(jobs run before log capture was added have no stored logs).
+        </div>
+      ) : (
+        <div
+          ref={scrollRef}
+          onScroll={(e) => {
+            const el = e.currentTarget;
+            pinnedToBottom.current =
+              el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+          }}
+          className="max-h-72 overflow-y-auto p-2 font-mono text-[11px] leading-4"
+        >
+          {lines.map((ln, i) => (
+            <div key={i} className="whitespace-pre-wrap break-all">
+              <span className="text-forge-muted/70">
+                {new Date(ln.ts).toLocaleTimeString()}{" "}
+              </span>
+              <span className={levelColor(ln.level)}>{ln.level} </span>
+              <span className="text-forge-muted/70">{ln.logger}: </span>
+              <span className={ln.level === "ERROR" ? "text-rose-300" : ""}>
+                {ln.message}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function JobRowCard({ job }: { job: JobRow }) {
+  const [showLogs, setShowLogs] = useState(false);
   const colorMap: Record<string, string> = {
     queued: "bg-forge-muted/60",
     processing: "bg-forge-secondary",
@@ -579,18 +754,29 @@ function JobRowCard({ job }: { job: JobRow }) {
   // Derive job type from source_path pattern
   const jobType = job.source_path?.startsWith("(reembed")
     ? "re-embed"
+    : job.source_path?.startsWith("(text-reembed")
+    ? "text-reembed"
     : job.source_path?.startsWith("(extract")
     ? "extract-entities"
     : job.source_path?.startsWith("(build-communities")
     ? "build-communities"
+    : job.source_path?.startsWith("(rebuild-chunks")
+    ? "rebuild-chunks"
+    : job.source_path?.startsWith("(fill-missing")
+    ? "fill-missing"
     : "ingest";
 
   const typeColors: Record<string, string> = {
     "ingest": "text-forge-secondary",
     "re-embed": "text-forge-primary",
+    "text-reembed": "text-forge-primary",
     "extract-entities": "text-forge-accent",
     "build-communities": "text-emerald-400",
+    "rebuild-chunks": "text-forge-accent",
+    "fill-missing": "text-emerald-400",
   };
+
+  const isActive = job.status === "processing" || job.status === "queued";
 
   return (
     <div className="bg-forge-panel border border-forge-edge rounded p-3">
@@ -607,6 +793,16 @@ function JobRowCard({ job }: { job: JobRow }) {
           {job.pages_processed}
           {job.pages_total ? ` / ${job.pages_total}` : ""}
         </span>
+        <button
+          type="button"
+          onClick={() => setShowLogs((v) => !v)}
+          className={`text-xs border border-forge-edge rounded px-2 py-0.5 hover:bg-forge-edge ${
+            showLogs ? "bg-forge-edge" : ""
+          }`}
+          title="show captured log lines for this job"
+        >
+          logs {showLogs ? "▾" : "▸"}
+        </button>
       </div>
       <div className="h-1.5 bg-forge-bg rounded overflow-hidden">
         <div
@@ -614,11 +810,18 @@ function JobRowCard({ job }: { job: JobRow }) {
           style={{ width: `${pct}%` }}
         />
       </div>
+      {job.steps && job.steps.length > 0 && (
+        <>
+          <StepCircles steps={job.steps} />
+          <StepIssues steps={job.steps} />
+        </>
+      )}
       {job.error_message && (
         <div className="text-xs text-rose-400 mt-2 font-mono">
           ERR: {job.error_message}
         </div>
       )}
+      {showLogs && <JobLogs jobId={job.job_id} isActive={isActive} />}
     </div>
   );
 }

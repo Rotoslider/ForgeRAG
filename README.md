@@ -8,9 +8,11 @@ Designed for personal/research use. Runs entirely on local hardware — no cloud
 
 ![Search — Answer mode with VLM-generated response and page citations](docs/ForgeRAG-search.png)
 
-![Ingest — PDF upload with collection, category, and tag assignment](docs/ForgeRAG-ingest.png)
+![Ingest — PDF upload plus per-job step circles and the built-in log viewer](docs/ForgeRAG-ingest.png)
 
-![Manage — Documents, entities, GPU status, and GraphRAG communities](docs/ForgeRAG-manage.png)
+![Manage — Graph stats, GPU status, communities, Backup & Restore, and the Pipeline Completeness audit](docs/ForgeRAG-manage.png)
+
+![Pipeline Completeness — per-document audit with one-click incremental repairs](docs/ForgeRAG-completeness.png)
 
 ## What it does
 
@@ -39,6 +41,9 @@ All phases complete.
       + RRF hybrid (BM25 + dense) + BGE reranker + Formula/Table/topic-tag
       extraction + Standards `title` field + data-quality validators
 - [x] **Phase 10**: Backup & Restore system (Neo4j dump, image copy, Google Drive upload)
+- [x] **Phase 11**: Pipeline observability — per-job step ledger with status circles,
+      per-job log capture + viewer, completeness audit across the whole library,
+      and incremental gap-filling repairs (bulk and per-document)
 
 ## New Features
 
@@ -52,6 +57,10 @@ Recent additions since the Phase 9 baseline:
 - **Neo4j health loop** — 30-second heartbeat with exponential backoff auto-reconnect. The service stays alive and recovers automatically when Neo4j restarts for a dump or update.
 - **Choom skills integration** — `/skills/manifest` advertises ForgeRAG capabilities with live stats; `/skills/search` auto-routes queries (keyword vs answer vs hybrid) based on content; `/skills/batch` runs up to 20 queries in parallel.
 - **Backup & Restore system** — GUI-driven and CLI-driven full backups with Neo4j dump, graph JSON export, page images, reduced images, source PDFs, and optional Google Drive upload. Incremental: subsequent backups skip unchanged files.
+- **Per-job step ledger** — every job (ingest, re-embed, extract, rebuild-chunks, fill-missing, communities) records a per-step status ledger shown as colored circles on the job card: green done, amber partial/skipped (with the reason), red failed, hollow not run, pulsing running. Steps that used to be skipped silently (LLM down, service not wired) are now visibly marked.
+- **Per-job log viewer** — a "logs" button on each job card shows every backend log line captured while that job ran (including worker threads: Docling, rasterizer, model loading). Logs live-tail running jobs, persist in SQLite, and survive service restarts for post-mortems.
+- **Pipeline Completeness audit** — one click on the Manage page audits every document against the graph itself (no re-processing): page counts, text/visual embedding coverage with dimension verification, chunk coverage, and entity coverage. A ~100k-page library audits in seconds.
+- **Incremental gap repair** — fill-missing jobs process *only* pages lacking an artifact, never redoing finished work. Bulk buttons repair every affected doc at once; each problem row also has a per-document "fix" panel offering exactly the repairs that apply (fill embeddings, extract missing entities, build/rebuild chunks, or full re-embed for wrong-dimension vectors).
 
 ## Architecture
 
@@ -426,7 +435,20 @@ Review the suggestions as editable chips, drop what you don't want, choose **mer
 
 ### Monitoring Progress
 
-The Ingest tab shows real-time progress for each active job: current phase, pages processed, and estimated time remaining. Jobs run sequentially — queue multiple PDFs and they'll process one at a time.
+The Ingest tab shows real-time progress for each job: current phase, pages processed, and a per-step status ledger drawn as colored circles — green done, amber partial or skipped (hover for the reason), red failed, hollow not yet run, pulsing blue running. Any step that didn't fully succeed also prints its reason under the circles (e.g. "auto-tag skipped: manual categories/tags provided" or "12 of 900 pages failed — see logs").
+
+Every job card has a **logs** button that expands the backend log lines captured while that job ran — it live-tails active jobs and is kept for finished ones, so a failed overnight run can be diagnosed the next morning. Jobs run a few at a time; queue as many PDFs as you like.
+
+### Verifying the Library — Pipeline Completeness
+
+Manage → **Pipeline Completeness** → *Run audit* checks every document against the graph itself, with no re-processing: each pipeline step leaves a fingerprint (Page properties, Chunk nodes, entity relationships), so missing work is detectable directly. The audit verifies page counts, text-embedding coverage **and dimensions**, visual-embedding coverage and dimensions, chunk coverage, and entity coverage — a 100k-page library audits in under ten seconds.
+
+Repairs are incremental and never redo finished work:
+
+- **Bulk buttons** (e.g. "Extract missing entities (N docs)") queue a repair job per affected document.
+- **Per-row "fix" panel** on any problem document offers only the repairs that apply: fill missing embeddings, extract missing entities, build/rebuild chunks, or — for wrong-dimension vectors from an old model — a full re-embed (the only case that clears anything).
+
+Queued repairs appear on the Ingest page with their own step circles and logs. Re-run the audit afterwards to confirm everything is green.
 
 ## Usage
 
@@ -443,6 +465,7 @@ The Ingest tab shows real-time progress for each active job: current phase, page
 - **Suggest tags (LLM auto-tagger)**: click **suggest** on any doc to have the LLM read the document's first 10 chunks (falls back to page text if the doc has no chunks yet) and propose a collection, 2-4 categories, and 5-10 tags. The panel shows the suggestion as editable chips — drop what you don't like, add your own, choose **merge** (keep existing) or **replace** (drop existing first), then **apply**. No re-embedding, just metadata writes.
 - **Multi-select + bulk actions**: checkboxes on each row. Select multiple documents, then "rebuild (N)", "extract-only", or "only-missing" (skip docs that already have chunks). Jobs queue sequentially — pick a handful to run now or queue the whole library overnight.
 - **Backup & Restore**: configure backup destination, trigger full backups, monitor progress, and view available backups for restore.
+- **Pipeline Completeness**: audit every document's pipeline state (pages, embeddings + dimensions, chunks, entities) straight from the graph, then repair gaps incrementally — bulk buttons for library-wide fixes, a per-row "fix" panel for one document at a time.
 - **Graph Stats**: live entity counts across the knowledge graph
 - **GPU**: VRAM usage, loaded models, manual unload
 - **Communities**: rebuild GraphRAG summaries from the entity graph
@@ -625,7 +648,8 @@ When ForgeRAG starts with an empty database (0 documents, 0 pages), the GUI show
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/ingest` | Upload PDF (multipart: file, collection, categories, tags) |
-| GET | `/ingest/jobs/{id}` | Poll job progress |
+| GET | `/ingest/jobs/{id}` | Poll job progress (includes the per-step status ledger) |
+| GET | `/ingest/jobs/{id}/logs` | Captured log lines for a job (live-tails running jobs) |
 | GET | `/ingest/jobs` | List recent jobs |
 
 ### Knowledge Graph
@@ -653,6 +677,8 @@ When ForgeRAG starts with an empty database (0 documents, 0 pages), the GUI show
 ### Admin
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/admin/audit/completeness` | Audit every document's pipeline completeness from graph state (embedding dims verified) |
+| POST | `/admin/fill-missing` | Queue incremental gap-filling jobs. Body: `{doc_ids, text?, visual?, entities?}` — only missing pages are processed, nothing is cleared |
 | POST | `/admin/normalize-entities` | Merge duplicate entities that differ only by case/whitespace |
 | POST | `/admin/bulk-reembed` | Queue re-embed jobs for every document |
 | POST | `/admin/reembed-text` | Text-only re-embed (no visual, no entity extraction). Body: `{doc_id?}` |
