@@ -107,3 +107,18 @@ async def test_rasterized_pdf_is_valid_and_streams(tmp_path):
     finally:
         if out:
             Path(out).unlink(missing_ok=True)
+
+
+async def test_gapped_page_images_skip_rebuild(tmp_path):
+    """A missing render means rebuilt-PDF positions would misnumber every
+    later page — the fallback must refuse rather than misattribute OCR."""
+    d = tmp_path / "imgs"
+    _write_pages(d, 4)
+    (d / "page_0003.png").unlink()  # gap
+    chunker = _ChunkerStub()
+    p = _pipeline_with(d, chunker)
+
+    result = await p._build_chunks("job1", "doc1", "hash1", "/orig/doc.pdf")
+
+    assert result == {"chunks": 0}
+    assert len(chunker.calls) == 1  # no retry against a misnumbered rebuild

@@ -2122,6 +2122,19 @@ class IngestionPipeline:
         pages = sorted(img_dir.glob("page_*.png")) if img_dir.is_dir() else []
         if not pages:
             return None
+        # Positions in the rebuilt PDF become the chunker's page numbers, so
+        # the image set must be exactly pages 1..N with no gaps — a missing
+        # render would shift every later page and silently attribute OCR
+        # text to the wrong page_number. (Also guards the 4-digit padding:
+        # lexical sort breaks past page_9999.)
+        expected = [img_dir / f"page_{i:04d}.png" for i in range(1, len(pages) + 1)]
+        if pages != expected:
+            logger.warning(
+                "Rasterized-rebuild fallback skipped for %s: page images "
+                "are not a contiguous 1..%d sequence — a rebuilt PDF would "
+                "misnumber pages", file_hash, len(pages),
+            )
+            return None
 
         fd, out_path = tempfile.mkstemp(suffix=".pdf", prefix="rechunk_")
         os.close(fd)
