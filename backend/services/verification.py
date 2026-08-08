@@ -242,7 +242,11 @@ async def run_verification(neo4j, settings) -> dict:
     # every chunk check. Warn-level: a doc Docling genuinely cannot read
     # stays visual-only and will keep warning here — that is the honest
     # state, not a bug in the check.
-    rows = await q("""
+    # Distinct variable: the preceding query for chunks_have_text has
+    # already run into `rows` and its append below consumes it — reusing
+    # `rows` here made chunks_have_text report THIS check's violations
+    # (caught live 2026-08-08: chunks_have_text "failed" with a doc sample).
+    chunkless_docs = await q("""
         MATCH (d:Document)
         WHERE EXISTS { (d)-[:HAS_PAGE]->(:Page) }
           AND NOT EXISTS { (d)-[:HAS_PAGE]->(:Page)-[:HAS_CHUNK]->(:Chunk) }
@@ -252,10 +256,11 @@ async def run_verification(neo4j, settings) -> dict:
         "docs_have_chunks",
         "Every document with pages has at least one Docling chunk "
         "(zero chunks = OCR/chunking never produced output for the doc)",
-        len(rows), status="warn" if rows else "pass", samples=rows[:SAMPLE],
+        len(chunkless_docs), status="warn" if chunkless_docs else "pass",
+        samples=chunkless_docs[:SAMPLE],
         detail="re-run rebuild-chunks on these docs; if the chunker again "
         "produces nothing, the PDF is unreadable to Docling and the doc "
-        "remains visual-search-only" if rows else None,
+        "remains visual-search-only" if chunkless_docs else None,
     ))
 
     checks.append(_check(
