@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
+import tempfile
 import uuid
 from collections import Counter as _Counter
 from datetime import datetime, timezone
@@ -2103,6 +2105,46 @@ class IngestionPipeline:
 
     # --------------------------------------------------------- chunk building
 
+    def _rasterized_pdf_from_page_images(self, file_hash: str) -> str | None:
+        """Build a temp image-PDF from the doc's already-rendered page images.
+
+        Used as the chunking fallback for text-less PDFs (vector-outline
+        exports and anything else Docling parses to nothing). Pages are
+        appended one at a time (PIL append=True) so memory stays at one
+        decoded page regardless of book size; each page is downscaled to
+        OCR-sufficient resolution first. Returns None when no rendered
+        images exist (conversion failed or never ran) — caller falls back
+        to the plain no-chunks path.
+        """
+        from PIL import Image
+
+        img_dir = self.pdf_processor.doc_folder(file_hash)
+        pages = sorted(img_dir.glob("page_*.png")) if img_dir.is_dir() else []
+        if not pages:
+            return None
+
+        fd, out_path = tempfile.mkstemp(suffix=".pdf", prefix="rechunk_")
+        os.close(fd)
+        try:
+            first = True
+            for p in pages:
+                with Image.open(p) as im:
+                    im = im.convert("RGB")
+                    # 1800px on the long edge ≈ 200+ DPI for letter-size —
+                    # comfortably above what Docling's OCR needs, well below
+                    # the full-resolution ColPali renders.
+                    im.thumbnail((1800, 1800))
+                    im.save(
+                        out_path, "PDF",
+                        append=not first,
+                        resolution=200,
+                    )
+                first = False
+        except Exception:
+            Path(out_path).unlink(missing_ok=True)
+            raise
+        return out_path
+
     async def _build_chunks(
         self, job_id: str, doc_id: str, file_hash: str, pdf_path: str,
     ) -> dict[str, int]:
@@ -2126,6 +2168,35 @@ class IngestionPipeline:
         chunks: list[StructuralChunk] = await asyncio.to_thread(
             self.structural_chunker.chunk_pdf, pdf_path, file_hash,
         )
+        if not chunks:
+            # Text-less PDFs slip between both extraction strategies:
+            # vector-outline exports (Illustrator with fonts converted to
+            # curves — zero fonts in the file) LOOK born-digital so Docling
+            # trusts the (empty) text layer instead of OCRing, yet render
+            # perfectly. Rebuild a rasterized PDF from the page images we
+            # already rendered and retry — Docling then sees an honest
+            # scanned doc and OCRs it like any historical book. This is the
+            # remedy that fixed the live Camplux manual, automated.
+            rebuilt = await asyncio.to_thread(
+                self._rasterized_pdf_from_page_images, file_hash,
+            )
+            if rebuilt is not None:
+                logger.warning(
+                    "Chunker returned no chunks for %s — retrying OCR on a "
+                    "rasterized rebuild from the rendered page images",
+                    pdf_path,
+                )
+                await self.jobs.update_step(
+                    job_id, "building_chunks", "running",
+                    detail="no chunks from original PDF (text-less?) — "
+                    "retrying OCR on rasterized rebuild",
+                )
+                try:
+                    chunks = await asyncio.to_thread(
+                        self.structural_chunker.chunk_pdf, rebuilt, file_hash,
+                    )
+                finally:
+                    Path(rebuilt).unlink(missing_ok=True)
         if not chunks:
             logger.warning("Chunker returned no chunks for %s", pdf_path)
             return {"chunks": 0}
