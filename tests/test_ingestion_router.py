@@ -88,3 +88,45 @@ def test_logs_endpoint(client):
 
     r = c.get("/ingest/jobs/nonexistent/logs")
     assert r.status_code == 404
+
+
+def test_folder_upload_relative_path_is_flattened(client, tmp_path):
+    """Folder uploads (webkitdirectory) send 'subdir/file.pdf' as the
+    filename. Staging must flatten to the basename — embedding the path
+    pointed into a never-created subdirectory and failed with ENOENT."""
+    c, manager = client
+    import asyncio as _asyncio
+
+    _asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        manager.init()
+    )
+
+    class _Server:
+        data_dir = str(tmp_path)
+
+    class _Settings:
+        server = _Server()
+
+    class _PipelineStub:
+        async def run_job(self, job_id, collection):
+            pass
+
+        async def run_job_now(self, job_id, collection):
+            pass
+
+    c.app.state.settings = _Settings()
+    c.app.state.pipeline = _PipelineStub()
+
+    r = c.post(
+        "/ingest",
+        files={"file": ("ai/paper one.pdf", b"%PDF-1.4 fake", "application/pdf")},
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["success"] is True
+    assert body["data"]["filename"] == "paper one.pdf"
+    staged = list((tmp_path / "uploads").glob("*_paper one.pdf"))
+    assert len(staged) == 1
+    # No stray subdirectory was created from the relative path.
+    assert not list((tmp_path / "uploads").glob("*_ai"))

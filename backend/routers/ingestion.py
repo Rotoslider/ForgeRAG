@@ -44,7 +44,13 @@ async def start_ingestion(
     """
     if not file.filename:
         raise HTTPException(status_code=400, detail="Filename required")
-    if not file.filename.lower().endswith(".pdf"):
+    # Folder uploads (webkitdirectory) send the RELATIVE path as the
+    # filename ("ai/paper.pdf") — embedding that in the staged name points
+    # into a subdirectory that was never created and the write fails with
+    # ENOENT. Keep the basename only, for the staged file AND the display
+    # name (also neutralizes any path components an odd client sends).
+    clean_name = Path(file.filename).name
+    if not clean_name.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only .pdf files are supported")
 
     settings = request.app.state.settings
@@ -52,7 +58,7 @@ async def start_ingestion(
     pipeline = request.app.state.pipeline
 
     # Save upload to disk (uploads are large — don't keep in memory)
-    staged_name = f"{uuid.uuid4().hex}_{file.filename}"
+    staged_name = f"{uuid.uuid4().hex}_{clean_name}"
     staged_path = _uploads_dir(settings) / staged_name
     try:
         with staged_path.open("wb") as out:
@@ -71,7 +77,7 @@ async def start_ingestion(
     # can reconstruct the exact run_job call.
     job = await jobs.create(
         source_path=str(staged_path),
-        filename=file.filename,
+        filename=clean_name,
         categories=cats,
         tags=tgs,
         job_type="ingest",
@@ -89,11 +95,11 @@ async def start_ingestion(
 
     logger.info(
         "Enqueued ingestion job %s for %s (collection=%s, categories=%s, tags=%s)",
-        job.job_id, file.filename, col, cats, tgs,
+        job.job_id, clean_name, col, cats, tgs,
     )
     return ForgeResult(
         success=True,
-        data={"job_id": job.job_id, "status": job.status, "filename": file.filename},
+        data={"job_id": job.job_id, "status": job.status, "filename": clean_name},
     )
 
 

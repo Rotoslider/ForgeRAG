@@ -1030,14 +1030,37 @@ function VerificationCard() {
       return res;
     },
     onSuccess: (res, checkName) => {
-      const d = res.data as { queued?: number | boolean; pages?: number } | undefined;
-      setFixMsgs((prev) => ({
-        ...prev,
-        [checkName]:
-          `Queued — ${typeof d?.queued === "number" ? `${d.queued} jobs, ` : ""}` +
-          `${(d?.pages ?? 0).toLocaleString()} pages. Watch progress on the Ingest ` +
-          `page, then re-run verification once the queue drains.`,
-      }));
+      const d = (res.data ?? {}) as {
+        queued?: number | boolean;
+        pages?: number;
+        merged?: number;
+        temp_rels_recovered?: number;
+      };
+      // Three genuinely different outcomes deserve three different
+      // messages: a synchronous fix already FINISHED (normalize), a drain
+      // actually queued jobs, or there was nothing left to do. The old
+      // one-size message ("Queued — 0 pages, watch the Ingest page") sent
+      // users to an empty queue after a sync fix had already succeeded.
+      let msg: string;
+      if (typeof d.merged === "number") {
+        msg =
+          `Done — merged ${d.merged.toLocaleString()} duplicate(s)` +
+          `${d.temp_rels_recovered ? `, recovered ${d.temp_rels_recovered} temp rels` : ""}` +
+          ` (ran synchronously, already finished). Re-run verification to confirm.`;
+      } else if (
+        (typeof d.queued === "number" && d.queued > 0) ||
+        d.queued === true
+      ) {
+        msg =
+          `Queued ${typeof d.queued === "number" ? `${d.queued} job(s), ` : ""}` +
+          `${(d.pages ?? 0).toLocaleString()} pages. Watch progress on the Ingest ` +
+          `page, then re-run verification once the queue drains.`;
+      } else {
+        msg =
+          "Nothing left to do — the violation has likely already cleared " +
+          "(a background job or earlier fix handled it). Re-run verification to confirm.";
+      }
+      setFixMsgs((prev) => ({ ...prev, [checkName]: msg }));
       qc.invalidateQueries({ queryKey: ["jobs"] });
     },
     onError: (err, checkName) => {
