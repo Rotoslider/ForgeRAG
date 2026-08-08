@@ -23,7 +23,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from backend.services.llm_service import LLMService
+from backend.services.llm_service import LLMService, LLMTruncationError
 
 logger = logging.getLogger(__name__)
 
@@ -696,6 +696,51 @@ Page: {page_number}
 
 # ----------------------------------------------------------------- extractor
 
+# Pages with at least this much text that extract to NOTHING get one
+# anti-bail retry before the empty result is accepted. Mirrors the
+# suspicious-empty threshold in work_predicates (kept equal so a page the
+# verification flags as suspicious is exactly a page the retry guards).
+BAIL_RETRY_MIN_CHARS = 2000
+
+
+def _is_empty(x: PageExtraction) -> bool:
+    """True when the extraction carries no entities at all.
+
+    topic_tags alone don't count — they're page-level metadata the model
+    happily produces even while bailing on the actual table content.
+    """
+    return not (
+        x.materials or x.processes or x.standards
+        or x.equipment or x.formulas or x.tables or x.relationships
+    )
+
+
+def _split_point(text: str) -> int:
+    """Index near the middle of `text`, snapped to a line boundary so a
+    table row is never cut in half. Falls back to the raw midpoint."""
+    mid = len(text) // 2
+    nl = text.find("\n", mid)
+    if nl == -1 or nl >= len(text) - 1:
+        nl = text.rfind("\n", 0, mid)
+    return nl + 1 if nl > 0 else mid
+
+
+def _merge_extractions(a: PageExtraction, b: PageExtraction) -> PageExtraction:
+    """Concatenate two half-page extractions. Duplicate entities at the
+    seam are fine — GraphBuilder MERGEs by name/code on write."""
+    tags = list(dict.fromkeys([*a.topic_tags, *b.topic_tags]))
+    return PageExtraction(
+        materials=[*a.materials, *b.materials],
+        processes=[*a.processes, *b.processes],
+        standards=[*a.standards, *b.standards],
+        equipment=[*a.equipment, *b.equipment],
+        formulas=[*a.formulas, *b.formulas],
+        tables=[*a.tables, *b.tables],
+        topic_tags=tags[:8],
+        relationships=[*a.relationships, *b.relationships],
+    )
+
+
 class EntityExtractor:
     """Per-page extraction using the LLM service."""
 
@@ -719,21 +764,121 @@ class EntityExtractor:
             return PageExtraction()
 
         truncated = page_text[: self.max_page_chars]
+        try:
+            extraction = await self._extract_text(
+                document_title=document_title,
+                page_number=page_number,
+                text=truncated,
+            )
+        except LLMTruncationError:
+            # The page's extraction doesn't fit even at the escalation
+            # ceiling (dense designation-index pages). Split the text in
+            # half and extract each half separately — the graph write
+            # dedupes by entity name, so overlap at the seam is harmless.
+            # One level only: a half that still overflows fails the page.
+            logger.warning(
+                "Page %d extraction overflows the token ceiling — "
+                "splitting the page text in half", page_number,
+            )
+            mid = _split_point(truncated)
+            first = await self._extract_half(
+                document_title=document_title,
+                page_number=page_number,
+                text=truncated[:mid],
+            )
+            second = await self._extract_half(
+                document_title=document_title,
+                page_number=page_number,
+                text=truncated[mid:],
+            )
+            return _merge_extractions(first, second)
+
+        # Dense page but completely empty result: the model sometimes
+        # bails on walls of tabular data with a fast, schema-valid empty
+        # response instead of transcribing (observed live 2026-08-07 —
+        # page with 3.4k chars of alloy tables returned nothing while its
+        # neighbors yielded 200+). Retry once with an explicit nudge; an
+        # empty that survives the retry is trusted as genuinely empty.
+        if _is_empty(extraction) and len(truncated) >= BAIL_RETRY_MIN_CHARS:
+            logger.info(
+                "Page %d: empty extraction on %d chars of text — "
+                "retrying once with anti-bail nudge",
+                page_number, len(truncated),
+            )
+            extraction = await self._extract_text(
+                document_title=document_title,
+                page_number=page_number,
+                text=truncated,
+                extra_user_msg=(
+                    "Note: this page DOES contain technical content "
+                    "(possibly dense tables of designations, properties, or "
+                    "specifications). Extract every material, process, "
+                    "standard, and equipment item actually printed on the "
+                    "page. Do not return empty lists unless the page truly "
+                    "names none of these."
+                ),
+            )
+        return extraction
+
+    async def _extract_half(
+        self, *, document_title: str, page_number: int, text: str,
+    ) -> PageExtraction:
+        """Extract one half of a split page.
+
+        A half of a ~3k-char page that STILL overflows the 32k ceiling is
+        not producing legitimate volume — the model is looping under the
+        strict json_schema decoding grammar (observed live 2026-08-07:
+        1.6k chars in, 32k+ tokens out, JSON never closed). Retry once in
+        the free-decoding regime; the fence/prose JSON parser handles the
+        looser output. If that also overflows, the page genuinely fails.
+        """
+        try:
+            return await self._extract_text(
+                document_title=document_title,
+                page_number=page_number,
+                text=text,
+            )
+        except LLMTruncationError:
+            logger.warning(
+                "Page %d: half-page extraction still overflows the ceiling "
+                "— repetition loop suspected, retrying without strict "
+                "json_schema grammar", page_number,
+            )
+            return await self._extract_text(
+                document_title=document_title,
+                page_number=page_number,
+                text=text,
+                strict=False,
+            )
+
+    async def _extract_text(
+        self,
+        *,
+        document_title: str,
+        page_number: int,
+        text: str,
+        extra_user_msg: str | None = None,
+        strict: bool | None = None,
+    ) -> PageExtraction:
+        """One structured-extraction call over the given text."""
         user_msg = USER_PROMPT_TEMPLATE.format(
             document_title=document_title,
             page_number=page_number,
-            page_text=truncated,
+            page_text=text,
         )
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ]
+        if extra_user_msg:
+            messages.append({"role": "user", "content": extra_user_msg})
 
         # Standards-heavy pages (especially NFPA / ASME cross-reference
         # appendices) can emit long extractions listing dozens of
         # standards/clauses. Default max_tokens (4096) truncates the
         # JSON mid-field. 8192 clears the vast majority of cases at
-        # a modest cost per page.
+        # a modest cost per page; chat_json_structured escalates on
+        # truncation from there.
         return await self.llm.chat_json_structured(
-            messages, PageExtraction, max_tokens=8192,
+            messages, PageExtraction, max_tokens=8192, strict=strict,
         )

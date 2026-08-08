@@ -170,13 +170,45 @@ async def test_failed_page_is_counted_and_not_stamped():
     p = _pipeline(neo4j, jobs, extractor)
     p.graph_builder = _GraphStub()
 
-    done, failed = await p._extract_entities("job1", "doc1")
+    done, failed, last_err = await p._extract_entities("job1", "doc1")
 
     assert (done, failed) == (2, 1)
+    assert last_err is not None
     # Only the successful page may be stamped entities_extracted_at.
     stamped = [params["pid"] for q, params in neo4j.writes
                if "entities_extracted_at" in q]
     assert stamped == ["p2"]
+
+
+async def test_dense_empty_page_stamped_confirmed_empty():
+    # An empty extraction on a DENSE page already survived the extractor's
+    # anti-bail retry — the stamp must carry entities_confirmed_empty so
+    # the suspicious-empty check/drain never re-pays it.
+    rows = _doc_rows(1)
+    rows[0]["pages"][0]["text"] = "dense table content " * 200  # > 2000 chars
+    neo4j = _Neo4jStub(rows)
+    p = _pipeline(neo4j, _JobsStub(), _StubExtractor(fail_pages=set()))
+    p.graph_builder = _GraphStub()
+
+    done, failed, _ = await p._extract_entities("job1", "doc1")
+
+    assert (done, failed) == (1, 0)
+    stamps = [q for q, _ in neo4j.writes if "entities_extracted_at" in q]
+    assert len(stamps) == 1
+    assert "entities_confirmed_empty = true" in stamps[0]
+
+
+async def test_sparse_empty_page_stamped_without_confirmed_marker():
+    neo4j = _Neo4jStub(_doc_rows(1))  # stub pages have short text
+    p = _pipeline(neo4j, _JobsStub(), _StubExtractor(fail_pages=set()))
+    p.graph_builder = _GraphStub()
+
+    done, failed, _ = await p._extract_entities("job1", "doc1")
+
+    assert (done, failed) == (1, 0)
+    stamps = [q for q, _ in neo4j.writes if "entities_extracted_at" in q]
+    assert len(stamps) == 1
+    assert "entities_confirmed_empty" not in stamps[0]
 
 
 async def test_all_pages_failed_reports_every_failure():
@@ -184,9 +216,10 @@ async def test_all_pages_failed_reports_every_failure():
     jobs = _JobsStub()
     p = _pipeline(neo4j, jobs, _StubExtractor(fail_pages={1, 2, 3}))
 
-    done, failed = await p._extract_entities("job1", "doc1")
+    done, failed, last_err = await p._extract_entities("job1", "doc1")
 
     assert (done, failed) == (3, 3)
+    assert last_err is not None
     assert neo4j.writes == []  # nothing stamped
 
 

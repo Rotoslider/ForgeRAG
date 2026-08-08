@@ -33,6 +33,24 @@ ENTITY_EXTRACTION_DONE = (
     f"OR EXISTS {{ (p)-[:{ENTITY_PAGE_RELS}]->() }}"
 )
 
+# A page with at least this much text and ZERO entity relationships is
+# suspicious: dense engineering pages nearly always name some material,
+# process, standard, or equipment. Before 2026-08-07 the extractor accepted
+# the model's fast schema-valid empty bail on table-heavy pages, so such
+# pages were stamped done with nothing extracted. Post-fix, an empty result
+# on a dense page survives an anti-bail retry and is stamped
+# entities_confirmed_empty — those are trusted and excluded here.
+# Keep equal to entity_extractor.BAIL_RETRY_MIN_CHARS.
+SUSPICIOUS_EMPTY_MIN_CHARS = 2000
+
+# Stamped pages whose empty extraction predates the anti-bail retry.
+ENTITY_SUSPICIOUS_EMPTY = (
+    f"p.text_char_count >= {SUSPICIOUS_EMPTY_MIN_CHARS} "
+    "AND p.entities_extracted_at IS NOT NULL "
+    "AND p.entities_confirmed_empty IS NULL "
+    f"AND NOT EXISTS {{ (p)-[:{ENTITY_PAGE_RELS}]->() }}"
+)
+
 # Pages text embedding should process: has text, embedding absent entirely.
 # (Wrong-dimension embeddings are a separate, destructive re-embed path and
 # a separate verification check.)

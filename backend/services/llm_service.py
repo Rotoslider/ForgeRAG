@@ -31,6 +31,13 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
+# Ceiling for the automatic max_tokens escalation when a structured-JSON
+# response comes back truncated (finish_reason == "length"). Doubling from
+# the entity-extraction budget of 8192 reaches this in two steps. Kept well
+# under typical local-server context (Qwen at 32k+) so the escalated request
+# still fits alongside the prompt.
+TRUNCATION_MAX_TOKENS = 32768
+
 
 class LLMError(Exception):
     """Base class for LLM service errors."""
@@ -42,6 +49,15 @@ class LLMTransientError(LLMError):
 
 class LLMFatalError(LLMError):
     """Schema mismatch, invalid response, auth — don't retry."""
+
+
+class LLMTruncationError(LLMFatalError):
+    """Response still truncated at the max_tokens escalation ceiling.
+
+    The requested output genuinely doesn't fit — retrying the same call
+    can't succeed, but the CALLER may be able to shrink the request
+    (e.g. split a dense page in half and extract each half separately).
+    """
 
 
 class CircuitBreaker:
@@ -197,6 +213,29 @@ class LLMService:
         response_format: dict[str, Any] | None = None,
     ) -> str:
         """Low-level chat completion. Returns the content string of the first choice."""
+        content, _ = await self.chat_with_finish_reason(
+            messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format=response_format,
+        )
+        return content
+
+    async def chat_with_finish_reason(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        response_format: dict[str, Any] | None = None,
+    ) -> tuple[str, str | None]:
+        """Chat completion returning (content, finish_reason).
+
+        finish_reason distinguishes a response the model finished ("stop")
+        from one the server cut off at max_tokens ("length") — a truncated
+        JSON payload is unparseable for a reason no re-prompt can fix, only
+        a higher token budget can.
+        """
         if self._client is None:
             raise LLMFatalError("LLMService not started")
 
@@ -248,7 +287,8 @@ class LLMService:
 
         try:
             body = r.json()
-            message = body["choices"][0]["message"]
+            choice = body["choices"][0]
+            message = choice["message"]
             content = message.get("content") or ""
             # Reasoning models (GLM-4.7-Flash, DeepSeek-R1, etc.) sometimes
             # route their entire output — including structured JSON — into
@@ -259,7 +299,7 @@ class LLMService:
                 if reasoning.strip():
                     content = reasoning
             self.circuit_breaker.record_success()
-            return content
+            return content, choice.get("finish_reason")
         except (KeyError, ValueError, TypeError) as exc:
             raise LLMFatalError(f"Malformed response: {r.text[:400]}") from exc
 
@@ -271,12 +311,19 @@ class LLMService:
         max_tokens: int | None = None,
         temperature: float | None = None,
         retries: int = 2,
+        strict: bool | None = None,
     ) -> T:
         """Chat completion that returns a validated Pydantic model.
 
         Asks the model for JSON that matches schema_cls. Validates on our side
         and retries on transient errors or invalid JSON (up to `retries` extra
         attempts beyond the first). Fails fast on auth/schema errors.
+
+        strict: override the config's use_json_schema for this call. Grammar-
+        constrained decoding can drive some models into repetition loops on
+        dense tabular input (observed live: 1.6k chars of input generating
+        32k+ tokens without closing the JSON) — callers can pass strict=False
+        to retry such a case in the free-decoding regime.
         """
         schema = schema_cls.model_json_schema()
         # Some models support strict JSON schema grammar (llama.cpp and
@@ -296,8 +343,14 @@ class LLMService:
 
         attempts_left = retries + 1
         last_err: Exception | None = None
-        use_strict = self.settings.use_json_schema
+        use_strict = (
+            self.settings.use_json_schema if strict is None else strict
+        )
         primary_failed = False
+        # Grows on truncation (finish_reason == "length"): a dense page — a
+        # periodic table, a standards cross-reference appendix — can
+        # legitimately need far more output than the caller's budget.
+        effective_max_tokens = max_tokens or self.settings.max_tokens
 
         while attempts_left > 0:
             attempts_left -= 1
@@ -307,9 +360,9 @@ class LLMService:
                     if (use_strict and not primary_failed)
                     else None
                 )
-                content = await self.chat(
+                content, finish_reason = await self.chat_with_finish_reason(
                     messages,
-                    max_tokens=max_tokens,
+                    max_tokens=effective_max_tokens,
                     temperature=temperature,
                     response_format=rf,
                 )
@@ -341,8 +394,38 @@ class LLMService:
                         data = None
 
             if data is None:
+                if finish_reason == "length":
+                    # The JSON is unparseable because the server cut it off
+                    # at max_tokens, not because the model wrote prose. A
+                    # re-prompt can't fix that — only a bigger budget can.
+                    last_err = ValueError(
+                        f"response truncated at max_tokens={effective_max_tokens}"
+                    )
+                    if effective_max_tokens >= TRUNCATION_MAX_TOKENS:
+                        logger.warning(
+                            "LLM response still truncated at the %d-token "
+                            "ceiling — giving up (each retry costs a full "
+                            "generation)", effective_max_tokens,
+                        )
+                        raise LLMTruncationError(
+                            f"response truncated at the max_tokens ceiling "
+                            f"({effective_max_tokens}) — output doesn't fit; "
+                            "caller may split the input"
+                        )
+                    effective_max_tokens = min(
+                        effective_max_tokens * 2, TRUNCATION_MAX_TOKENS
+                    )
+                    logger.warning(
+                        "LLM response hit the token cap (finish_reason=length)"
+                        " — retrying with max_tokens=%d (attempts left=%d)",
+                        effective_max_tokens, attempts_left,
+                    )
+                    continue
                 last_err = ValueError("non-JSON response")
-                logger.warning("LLM returned non-JSON (attempts left=%d): %.200s", attempts_left, content)
+                logger.warning(
+                    "LLM returned non-JSON (finish_reason=%s, attempts left=%d): %.200s",
+                    finish_reason, attempts_left, content,
+                )
                 messages = messages + [
                     {
                         "role": "user",

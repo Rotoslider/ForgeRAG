@@ -12,6 +12,7 @@ import {
   extractMissingEntitiesAll,
   fillMissingBulk,
   recoverStrandedTextAll,
+  reextractSuspiciousEmpties,
   getBackupProgress,
   getBackupSettings,
   listBackups,
@@ -975,6 +976,11 @@ const VERIFY_FIXES: Record<string, {
     note: "Merges entities that differ only by case/whitespace onto the most-mentioned spelling — every relationship is redirected, nothing is lost. Runs synchronously.",
     run: () => normalizeEntities(),
   },
+  entity_extractions_not_bailed: {
+    label: (v) => `Re-extract suspicious empties now (${v.toLocaleString()} pages)`,
+    note: "Dense pages that extracted to nothing before the anti-bail retry existed. Re-runs them through the LLM; pages that are genuinely empty get a confirmed-empty marker and stop being counted, so this converges. Background LLM work — slow for a big backlog.",
+    run: () => reextractSuspiciousEmpties(),
+  },
 };
 
 // Loose response shape shared by the verify-fix drains — queued is a count
@@ -994,7 +1000,17 @@ function VerificationCard() {
   const qc = useQueryClient();
   const verify = useQuery({
     queryKey: ["deep-verify"],
-    queryFn: deepVerify,
+    // request() resolves {success:false, reason} instead of throwing, so a
+    // failed run would render NEITHER the verdict badge NOR the error line
+    // (report stays undefined, isError stays false) — the card just goes
+    // blank. Throw here so the error branch fires.
+    queryFn: async () => {
+      const res = await deepVerify();
+      if (!res.success) {
+        throw new Error(res.reason || "verification failed with no reason given");
+      }
+      return res;
+    },
     enabled: false, // full scans incl. on-disk file checks — on demand only
     staleTime: Infinity,
     retry: false,
@@ -1531,7 +1547,16 @@ function CompletenessCard() {
   const [tracked, setTracked] = useState<Record<string, { jobId: string | null; label: string }>>({});
   const audit = useQuery({
     queryKey: ["completeness"],
-    queryFn: auditCompleteness,
+    // Same silent-blank trap as the verification card: request() resolves
+    // {success:false} instead of throwing, which would render neither the
+    // report nor the error line. Throw so audit.isError fires.
+    queryFn: async () => {
+      const res = await auditCompleteness();
+      if (!res.success) {
+        throw new Error(res.reason || "audit failed with no reason given");
+      }
+      return res;
+    },
     enabled: false, // full page scan — run only on demand
     staleTime: Infinity,
     retry: false,

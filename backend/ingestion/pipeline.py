@@ -38,6 +38,7 @@ from backend.services.colpali_service import ColPaliService, serialize_colpali
 from backend.services.entity_merge import merge_entity
 from backend.services.work_predicates import (
     ENTITY_NEEDS_EXTRACTION,
+    SUSPICIOUS_EMPTY_MIN_CHARS,
     TEXT_EMBED_MISSING,
     VISUAL_EMBED_MISSING,
 )
@@ -341,14 +342,15 @@ class IngestionPipeline:
                     job_id, current_step="extracting_entities", progress_pct=88.0
                 )
                 await self.jobs.update_step(job_id, "extracting_entities", "running")
-                done, failed = await self._extract_entities(job_id, doc_id)
+                done, failed, last_err = await self._extract_entities(
+                    job_id, doc_id
+                )
                 if done and failed == done:
-                    # Every page failed — the LLM endpoint is down, not a
-                    # per-page problem. Fail the job instead of completing
+                    # Every page failed — fail the job instead of completing
                     # with a warning nobody reads.
                     raise RuntimeError(
-                        f"entity extraction failed for all {done} pages — "
-                        "LLM endpoint unreachable? Pages remain unstamped "
+                        f"entity extraction failed for all {done} pages "
+                        f"(last error: {last_err}) — pages remain unstamped "
                         "and will be retried on the next run"
                     )
                 if failed:
@@ -727,11 +729,11 @@ class IngestionPipeline:
                 job_id, current_step="extracting_entities", progress_pct=10.0
             )
             await self.jobs.update_step(job_id, "extracting_entities", "running")
-            done, failed = await self._extract_entities(job_id, doc_id)
+            done, failed, last_err = await self._extract_entities(job_id, doc_id)
             if done and failed == done:
                 raise RuntimeError(
-                    f"entity extraction failed for all {done} pages — "
-                    "LLM endpoint unreachable? Pages remain unstamped "
+                    f"entity extraction failed for all {done} pages "
+                    f"(last error: {last_err}) — pages remain unstamped "
                     "and will be retried on the next run"
                 )
             if failed:
@@ -1444,11 +1446,13 @@ class IngestionPipeline:
                     await self.jobs.update_step(
                         job_id, "extracting_entities", "running"
                     )
-                    done, failed = await self._extract_entities(job_id, doc_id)
+                    done, failed, last_err = await self._extract_entities(
+                        job_id, doc_id
+                    )
                     if done and failed == done:
                         raise RuntimeError(
-                            f"entity extraction failed for all {done} pages — "
-                            "LLM endpoint unreachable? Pages remain unstamped "
+                            f"entity extraction failed for all {done} pages "
+                            f"(last error: {last_err}) — pages remain unstamped "
                             "and will be retried on the next run"
                         )
                     if failed:
@@ -1958,7 +1962,9 @@ class IngestionPipeline:
 
     # ------------------------------------------------------------------ step 6
 
-    async def _extract_entities(self, job_id: str, doc_id: str) -> tuple[int, int]:
+    async def _extract_entities(
+        self, job_id: str, doc_id: str
+    ) -> tuple[int, int, str | None]:
         """Run LLM entity extraction on each page and write results into the graph.
 
         I/O-bound on the LLM endpoint. Sequential per page (local LLM
@@ -1966,8 +1972,9 @@ class IngestionPipeline:
         MENTIONS_* outgoing relationship so re-runs after a partial failure
         don't double-count support_count on existing edges.
 
-        Returns (pages_processed, pages_failed) so callers can surface
-        partial failures instead of reporting a clean run.
+        Returns (pages_processed, pages_failed, last_error) so callers can
+        surface partial failures — with the actual reason, not a guess —
+        instead of reporting a clean run.
         """
         assert self.entity_extractor is not None
 
@@ -1989,13 +1996,13 @@ class IngestionPipeline:
         )
         if not rows:
             logger.warning("No document %s found for entity extraction", doc_id)
-            return 0, 0
+            return 0, 0, None
         title = rows[0]["title"] or "(untitled)"
         pages = [p for p in rows[0]["pages"] if p["page_id"] is not None]
 
         if not pages:
             logger.info("Document %s has no pages with text — skipping extraction", doc_id)
-            return 0, 0
+            return 0, 0, None
 
         total = len(pages)
         logger.info(
@@ -2010,6 +2017,7 @@ class IngestionPipeline:
 
         done = 0
         failed = 0
+        last_error: str | None = None
         aggregate = {"materials": 0, "processes": 0, "standards": 0,
                      "clauses": 0, "equipment": 0,
                      "page_rels": 0, "entity_rels": 0}
@@ -2036,13 +2044,24 @@ class IngestionPipeline:
                 # indistinguishable from "never ran", the completeness audit
                 # reports it as a gap forever, and repair jobs re-pay the
                 # LLM for the same empty pages on every run.
+                # A dense page that still produced nothing already survived
+                # the extractor's anti-bail retry — mark the empty as
+                # CONFIRMED so the suspicious-empty verification check
+                # doesn't flag it (and drains don't re-pay it) forever.
+                confirmed_empty = (
+                    counts.get("page_rels", 0) == 0
+                    and len(page["text"] or "") >= SUSPICIOUS_EMPTY_MIN_CHARS
+                )
                 await self.neo4j.run_write(
                     "MATCH (p:Page {page_id: $pid}) "
-                    "SET p.entities_extracted_at = datetime()",
+                    "SET p.entities_extracted_at = datetime()"
+                    + (", p.entities_confirmed_empty = true"
+                       if confirmed_empty else ""),
                     {"pid": page["page_id"]},
                 )
             except Exception as exc:  # noqa: BLE001
                 failed += 1
+                last_error = str(exc)
                 logger.warning("Entity extraction failed for page %d: %s",
                                page["page_number"], exc)
 
@@ -2055,7 +2074,7 @@ class IngestionPipeline:
 
         logger.info("Entity extraction complete for doc %s: %s (%d/%d pages failed)",
                     doc_id, aggregate, failed, total)
-        return done, failed
+        return done, failed, last_error
 
     # --------------------------------------------------------- chunk building
 

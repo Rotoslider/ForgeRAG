@@ -525,6 +525,11 @@ export const recoverStrandedTextAll = () =>
     method: "POST",
     timeoutMs: 10 * 60 * 1000,
   });
+export const reextractSuspiciousEmpties = () =>
+  request<{ queued: number; pages: number; unstamped: number }>(
+    "/admin/reextract-suspicious-empties",
+    { method: "POST", timeoutMs: 10 * 60 * 1000 }
+  );
 export const backfillBlankFlags = () =>
   request<{ queued: boolean; docs: number; pages: number }>(
     "/admin/backfill-blank-flags",

@@ -139,6 +139,72 @@ async def extract_missing_entities(request: Request) -> ForgeResult:
     })
 
 
+@router.post("/reextract-suspicious-empties")
+async def reextract_suspicious_empties(request: Request) -> ForgeResult:
+    """Re-check dense pages stamped extracted-with-nothing.
+
+    Server-side twin of the entity_extractions_not_bailed verification
+    check: pre-2026-08-07 extractions accepted the model's fast empty bail
+    on table-heavy pages and stamped them done. This unstamps every such
+    page (dense text, zero entity relationships, no confirmed-empty
+    marker) and queues one fill-missing(entities) job per affected doc.
+    The re-run goes through the anti-bail retry, so pages that come back
+    empty AGAIN are stamped entities_confirmed_empty and drop off the
+    check for good — the drain converges instead of re-paying forever.
+    """
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    from backend.services.work_predicates import ENTITY_SUSPICIOUS_EMPTY
+
+    docs = await neo4j.run_query(
+        f"""
+        MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
+        WHERE {ENTITY_SUSPICIOUS_EMPTY}
+        WITH d, count(p) AS todo
+        RETURN d.doc_id AS doc_id, d.filename AS filename, todo
+        ORDER BY todo DESC
+        """,
+        timeout=600.0,
+    )
+    if not docs:
+        return ForgeResult(success=True, data={"queued": 0, "pages": 0,
+                                               "reason": "nothing suspicious"})
+    # Unstamp first so the queued jobs' ENTITY_NEEDS_EXTRACTION query
+    # selects these pages. Restart-safe: a killed job leaves the pages
+    # unstamped, where the entity_extraction_complete check catches them.
+    unstamped = await neo4j.run_write(
+        f"""
+        MATCH (p:Page) WHERE {ENTITY_SUSPICIOUS_EMPTY}
+        SET p.entities_extracted_at = null
+        RETURN count(p) AS n
+        """,
+    )
+    queued = []
+    for r in docs:
+        job = await jobs.create(
+            source_path=f"(fill-missing of {r['doc_id']})",
+            filename=r["filename"], categories=[], tags=[],
+            job_type="fill-missing", doc_id=r["doc_id"],
+            params={"text": False, "visual": False, "entities": True},
+        )
+        jobs.spawn(job.job_id, pipeline.run_fill_missing(
+            job.job_id, r["doc_id"],
+            do_text=False, do_visual=False, do_entities=True,
+        ))
+        queued.append({"doc_id": r["doc_id"], "job_id": job.job_id})
+    total_pages = sum(r["todo"] for r in docs)
+    logger.info(
+        "Queued suspicious-empty re-extraction: %d docs, %d pages unstamped",
+        len(queued), total_pages,
+    )
+    return ForgeResult(success=True, data={
+        "queued": len(queued), "pages": total_pages,
+        "unstamped": unstamped[0]["n"] if unstamped else 0, "jobs": queued,
+    })
+
+
 @router.post("/resummarize-fallbacks")
 async def resummarize_fallbacks(request: Request) -> ForgeResult:
     """Queue regeneration of chunk summaries that fell back to text previews

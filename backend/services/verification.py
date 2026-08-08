@@ -290,6 +290,36 @@ async def run_verification(neo4j, settings) -> dict:
         n, detail="run 'Extract missing entities' on affected docs" if n else None,
     ))
 
+    # Dense pages stamped done with ZERO entities and no confirmed-empty
+    # marker: before 2026-08-07 the model's fast schema-valid bail on
+    # table-heavy pages was accepted and stamped, indistinguishable from a
+    # genuine "nothing on this page". Post-fix empties survive an anti-bail
+    # retry and carry entities_confirmed_empty. Warn (not fail): a legacy
+    # empty CAN be genuine — but >=2000 chars of engineering text naming no
+    # material/process/standard/equipment is rare enough to re-check.
+    from backend.services.work_predicates import ENTITY_SUSPICIOUS_EMPTY
+    rows = await q(f"""
+        MATCH (d:Document)-[:HAS_PAGE]->(p:Page)
+        WHERE {ENTITY_SUSPICIOUS_EMPTY}
+        RETURN d.title AS doc, p.page_number AS page,
+               p.text_char_count AS chars
+        ORDER BY p.text_char_count DESC LIMIT 1000
+    """)
+    n_rows = await q(f"""
+        MATCH (p:Page) WHERE {ENTITY_SUSPICIOUS_EMPTY}
+        RETURN count(p) AS n
+    """)
+    n = n_rows[0]["n"] if n_rows else 0
+    checks.append(_check(
+        "entity_extractions_not_bailed",
+        "No dense page is stamped extracted-with-nothing without a "
+        "confirmed-empty marker (pre-2026-08-07 extractions accepted the "
+        "model bailing on dense tables)",
+        n, status="warn" if n else "pass", samples=rows[:SAMPLE],
+        detail="run 'Re-extract suspicious empties' to re-check them "
+        "(genuine empties get confirmed and drop off this list)" if n else None,
+    ))
+
     bad_entities = 0
     ent_samples: list = []
     for label, pk in [("Material", "name"), ("Process", "name"),
