@@ -235,6 +235,29 @@ async def run_verification(neo4j, settings) -> dict:
         WHERE c.text IS NULL OR trim(c.text) = ''
         RETURN c.chunk_id AS id LIMIT 1000
     """)
+    # Existence first: every doc with pages must have chunks AT ALL. The
+    # per-chunk checks below verify chunks that exist — a doc Docling never
+    # chunked (or produced nothing for) passes them vacuously. Found live
+    # 2026-08-08: a 52-page scanned manual with zero chunks sailed through
+    # every chunk check. Warn-level: a doc Docling genuinely cannot read
+    # stays visual-only and will keep warning here — that is the honest
+    # state, not a bug in the check.
+    rows = await q("""
+        MATCH (d:Document)
+        WHERE EXISTS { (d)-[:HAS_PAGE]->(:Page) }
+          AND NOT EXISTS { (d)-[:HAS_PAGE]->(:Page)-[:HAS_CHUNK]->(:Chunk) }
+        RETURN d.doc_id AS id, d.title AS title LIMIT 100
+    """)
+    checks.append(_check(
+        "docs_have_chunks",
+        "Every document with pages has at least one Docling chunk "
+        "(zero chunks = OCR/chunking never produced output for the doc)",
+        len(rows), status="warn" if rows else "pass", samples=rows[:SAMPLE],
+        detail="re-run rebuild-chunks on these docs; if the chunker again "
+        "produces nothing, the PDF is unreadable to Docling and the doc "
+        "remains visual-search-only" if rows else None,
+    ))
+
     checks.append(_check(
         "chunks_have_text", "Every chunk has non-empty text",
         len(rows), samples=rows[:SAMPLE],
