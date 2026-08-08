@@ -2044,12 +2044,22 @@ class IngestionPipeline:
                 # indistinguishable from "never ran", the completeness audit
                 # reports it as a gap forever, and repair jobs re-pay the
                 # LLM for the same empty pages on every run.
-                # A dense page that still produced nothing already survived
-                # the extractor's anti-bail retry — mark the empty as
-                # CONFIRMED so the suspicious-empty verification check
+                # A dense page that still produced no ENTITIES already
+                # survived the extractor's anti-bail retry — mark the empty
+                # as CONFIRMED so the suspicious-empty verification check
                 # doesn't flag it (and drains don't re-pay it) forever.
+                # Gate on the per-type entity counts, NOT counts["page_rels"]
+                # — that key tallies the model's explicit relationship list,
+                # which is zero on entity-rich pages and nonzero when every
+                # relationship endpoint was validator-rejected (both burned
+                # us live on 2026-08-08: 3,063 unflagged + wrong flags).
+                wrote_entities = any(
+                    counts.get(k, 0) > 0
+                    for k in ("materials", "processes", "standards",
+                              "clauses", "equipment")
+                )
                 confirmed_empty = (
-                    counts.get("page_rels", 0) == 0
+                    not wrote_entities
                     and len(page["text"] or "") >= SUSPICIOUS_EMPTY_MIN_CHARS
                 )
                 await self.neo4j.run_write(

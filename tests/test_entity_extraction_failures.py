@@ -198,6 +198,33 @@ async def test_dense_empty_page_stamped_confirmed_empty():
     assert "entities_confirmed_empty = true" in stamps[0]
 
 
+async def test_entity_bearing_page_never_marked_confirmed_empty():
+    # counts["page_rels"] tallies the model's explicit relationship list,
+    # which is legitimately zero on entity-rich pages — the confirmed-empty
+    # gate must key on the per-type entity counts instead (live bug
+    # 2026-08-08: entity-bearing drain pages were wrongly flagged).
+    rows = _doc_rows(1)
+    rows[0]["pages"][0]["text"] = "dense table content " * 200
+
+    class _EntityGraphStub(_GraphStub):
+        async def write_page(self, *, page_id, extraction):
+            await super().write_page(page_id=page_id, extraction=extraction)
+            return {"materials": 5, "processes": 0, "standards": 0,
+                    "clauses": 0, "equipment": 0,
+                    "page_rels": 0, "entity_rels": 0}
+
+    neo4j = _Neo4jStub(rows)
+    p = _pipeline(neo4j, _JobsStub(), _StubExtractor(fail_pages=set()))
+    p.graph_builder = _EntityGraphStub()
+
+    done, failed, _ = await p._extract_entities("job1", "doc1")
+
+    assert (done, failed) == (1, 0)
+    stamps = [q for q, _ in neo4j.writes if "entities_extracted_at" in q]
+    assert len(stamps) == 1
+    assert "entities_confirmed_empty" not in stamps[0]
+
+
 async def test_sparse_empty_page_stamped_without_confirmed_marker():
     neo4j = _Neo4jStub(_doc_rows(1))  # stub pages have short text
     p = _pipeline(neo4j, _JobsStub(), _StubExtractor(fail_pages=set()))
