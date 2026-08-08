@@ -186,6 +186,7 @@ async def test_dense_empty_page_stamped_confirmed_empty():
     # the suspicious-empty check/drain never re-pays it.
     rows = _doc_rows(1)
     rows[0]["pages"][0]["text"] = "dense table content " * 200  # > 2000 chars
+    rows[0]["pages"][0]["char_count"] = 4000  # density source = stored property
     neo4j = _Neo4jStub(rows)
     p = _pipeline(neo4j, _JobsStub(), _StubExtractor(fail_pages=set()))
     p.graph_builder = _GraphStub()
@@ -222,11 +223,14 @@ async def test_entity_bearing_page_never_marked_confirmed_empty():
     assert (done, failed) == (1, 0)
     stamps = [q for q, _ in neo4j.writes if "entities_extracted_at" in q]
     assert len(stamps) == 1
-    assert "entities_confirmed_empty" not in stamps[0]
+    # Never marked confirmed-empty — and any STALE flag from a previous
+    # empty run must be actively cleared, not left in place.
+    assert "entities_confirmed_empty = true" not in stamps[0]
+    assert "entities_confirmed_empty = null" in stamps[0]
 
 
 async def test_sparse_empty_page_stamped_without_confirmed_marker():
-    neo4j = _Neo4jStub(_doc_rows(1))  # stub pages have short text
+    neo4j = _Neo4jStub(_doc_rows(1))  # stub pages have no char_count (sparse)
     p = _pipeline(neo4j, _JobsStub(), _StubExtractor(fail_pages=set()))
     p.graph_builder = _GraphStub()
 
@@ -235,7 +239,7 @@ async def test_sparse_empty_page_stamped_without_confirmed_marker():
     assert (done, failed) == (1, 0)
     stamps = [q for q, _ in neo4j.writes if "entities_extracted_at" in q]
     assert len(stamps) == 1
-    assert "entities_confirmed_empty" not in stamps[0]
+    assert "entities_confirmed_empty = true" not in stamps[0]
 
 
 async def test_all_pages_failed_reports_every_failure():

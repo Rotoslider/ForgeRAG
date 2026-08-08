@@ -697,10 +697,19 @@ Page: {page_number}
 # ----------------------------------------------------------------- extractor
 
 # Pages with at least this much text that extract to NOTHING get one
-# anti-bail retry before the empty result is accepted. Mirrors the
-# suspicious-empty threshold in work_predicates (kept equal so a page the
-# verification flags as suspicious is exactly a page the retry guards).
-BAIL_RETRY_MIN_CHARS = 2000
+# anti-bail retry before the empty result is accepted. Imported from
+# work_predicates so the retry guard and the suspicious-empty verification
+# predicate can never drift apart (they must agree by construction, not by
+# "keep equal" comments).
+from backend.services.work_predicates import (  # noqa: E402
+    SUSPICIOUS_EMPTY_MIN_CHARS as BAIL_RETRY_MIN_CHARS,
+)
+
+# Half-page extractions start here instead of 8192: a half only exists
+# because the FULL page overflowed 32768, so a half needing more than
+# 16384 is the expected case — starting lower just burns a doomed rung
+# of the escalation ladder per half.
+HALF_START_MAX_TOKENS = 16384
 
 
 def _is_empty(x: PageExtraction) -> bool:
@@ -771,27 +780,11 @@ class EntityExtractor:
                 text=truncated,
             )
         except LLMTruncationError:
-            # The page's extraction doesn't fit even at the escalation
-            # ceiling (dense designation-index pages). Split the text in
-            # half and extract each half separately — the graph write
-            # dedupes by entity name, so overlap at the seam is harmless.
-            # One level only: a half that still overflows fails the page.
-            logger.warning(
-                "Page %d extraction overflows the token ceiling — "
-                "splitting the page text in half", page_number,
-            )
-            mid = _split_point(truncated)
-            first = await self._extract_half(
+            return await self._extract_split(
                 document_title=document_title,
                 page_number=page_number,
-                text=truncated[:mid],
+                text=truncated,
             )
-            second = await self._extract_half(
-                document_title=document_title,
-                page_number=page_number,
-                text=truncated[mid:],
-            )
-            return _merge_extractions(first, second)
 
         # Dense page but completely empty result: the model sometimes
         # bails on walls of tabular data with a fast, schema-valid empty
@@ -805,20 +798,58 @@ class EntityExtractor:
                 "retrying once with anti-bail nudge",
                 page_number, len(truncated),
             )
-            extraction = await self._extract_text(
-                document_title=document_title,
-                page_number=page_number,
-                text=truncated,
-                extra_user_msg=(
-                    "Note: this page DOES contain technical content "
-                    "(possibly dense tables of designations, properties, or "
-                    "specifications). Extract every material, process, "
-                    "standard, and equipment item actually printed on the "
-                    "page. Do not return empty lists unless the page truly "
-                    "names none of these."
-                ),
-            )
+            try:
+                extraction = await self._extract_text(
+                    document_title=document_title,
+                    page_number=page_number,
+                    text=truncated,
+                    extra_user_msg=(
+                        "Note: this page DOES contain technical content "
+                        "(possibly dense tables of designations, properties, "
+                        "or specifications). Extract every material, process, "
+                        "standard, and equipment item actually printed on the "
+                        "page. Do not return empty lists unless the page truly "
+                        "names none of these."
+                    ),
+                )
+            except LLMTruncationError:
+                # The nudge pushed the model from bailing to genuinely
+                # transcribing — and the transcription overflowed. That's a
+                # dense page like any other overflow: split it, don't let
+                # the truncation escape and fail the page forever.
+                extraction = await self._extract_split(
+                    document_title=document_title,
+                    page_number=page_number,
+                    text=truncated,
+                )
         return extraction
+
+    async def _extract_split(
+        self, *, document_title: str, page_number: int, text: str,
+    ) -> PageExtraction:
+        """Extract a page whose output overflows the escalation ceiling.
+
+        Splits the text in half and extracts each half separately — the
+        graph write dedupes by entity name, so overlap at the seam is
+        harmless. One level only: a half that still overflows (after the
+        loop-breaker retry in _extract_half) fails the page.
+        """
+        logger.warning(
+            "Page %d extraction overflows the token ceiling — "
+            "splitting the page text in half", page_number,
+        )
+        mid = _split_point(text)
+        first = await self._extract_half(
+            document_title=document_title,
+            page_number=page_number,
+            text=text[:mid],
+        )
+        second = await self._extract_half(
+            document_title=document_title,
+            page_number=page_number,
+            text=text[mid:],
+        )
+        return _merge_extractions(first, second)
 
     async def _extract_half(
         self, *, document_title: str, page_number: int, text: str,
@@ -837,6 +868,7 @@ class EntityExtractor:
                 document_title=document_title,
                 page_number=page_number,
                 text=text,
+                max_tokens=HALF_START_MAX_TOKENS,
             )
         except LLMTruncationError:
             logger.warning(
@@ -849,6 +881,7 @@ class EntityExtractor:
                 page_number=page_number,
                 text=text,
                 strict=False,
+                max_tokens=HALF_START_MAX_TOKENS,
             )
 
     async def _extract_text(
@@ -859,6 +892,7 @@ class EntityExtractor:
         text: str,
         extra_user_msg: str | None = None,
         strict: bool | None = None,
+        max_tokens: int = 8192,
     ) -> PageExtraction:
         """One structured-extraction call over the given text."""
         user_msg = USER_PROMPT_TEMPLATE.format(
@@ -878,7 +912,8 @@ class EntityExtractor:
         # standards/clauses. Default max_tokens (4096) truncates the
         # JSON mid-field. 8192 clears the vast majority of cases at
         # a modest cost per page; chat_json_structured escalates on
-        # truncation from there.
+        # truncation from there. Half-page calls start higher (see
+        # HALF_START_MAX_TOKENS).
         return await self.llm.chat_json_structured(
-            messages, PageExtraction, max_tokens=8192, strict=strict,
+            messages, PageExtraction, max_tokens=max_tokens, strict=strict,
         )

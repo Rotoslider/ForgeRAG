@@ -89,6 +89,28 @@ async def test_sparse_empty_is_accepted_without_retry():
     assert len(llm.calls) == 1
 
 
+async def test_bail_then_overflowing_nudge_retry_splits_instead_of_failing():
+    # The nudge can push the model from bailing (fast empty) into genuine
+    # transcription that overflows the ceiling — that truncation must route
+    # into the split path, not escape extract_page and fail the page.
+    llm = _ScriptedLLM([
+        PageExtraction(),                  # fast schema-valid bail
+        LLMTruncationError("ceiling"),     # nudged retry overflows
+        _extraction("Alloy 625"),          # first half
+        _extraction("ASTM A36"),           # second half
+    ])
+    ex = EntityExtractor(llm)
+
+    result = await ex.extract_page(
+        document_title="T", page_number=1, page_text=DENSE,
+    )
+
+    assert {m.name for m in result.materials} == {"Alloy 625", "ASTM A36"}
+    assert len(llm.calls) == 4
+    # Call 2 was the nudged retry; calls 3-4 are the halves.
+    assert "DOES contain technical content" in llm.calls[1][-1]["content"]
+
+
 async def test_ceiling_truncation_splits_page_and_merges():
     llm = _ScriptedLLM([
         LLMTruncationError("response truncated at the max_tokens ceiling"),

@@ -1019,7 +1019,16 @@ function VerificationCard() {
   const [showPassed, setShowPassed] = useState(false);
   const [fixMsgs, setFixMsgs] = useState<Record<string, string>>({});
   const fix = useMutation({
-    mutationFn: (checkName: string) => VERIFY_FIXES[checkName].run(),
+    // request() resolves {success:false, reason} instead of throwing — the
+    // same trap fixed in the two queryFns. Without this throw, onSuccess
+    // renders a green "Queued — 0 pages" over a backend failure.
+    mutationFn: async (checkName: string) => {
+      const res = await VERIFY_FIXES[checkName].run();
+      if (!res.success) {
+        throw new Error(res.reason || "fix failed with no reason given");
+      }
+      return res;
+    },
     onSuccess: (res, checkName) => {
       const d = res.data as { queued?: number | boolean; pages?: number } | undefined;
       setFixMsgs((prev) => ({
@@ -1052,7 +1061,7 @@ function VerificationCard() {
         >
           {verify.isFetching ? "Verifying… (full scans, ~1-2 min)" : "Run verification"}
         </button>
-        {report && (
+        {report && !verify.isError && (
           <span
             className={`text-sm font-bold px-3 py-0.5 rounded border ${
               report.verdict === "PASS"
@@ -1073,7 +1082,7 @@ function VerificationCard() {
             )}
           </span>
         )}
-        {report && (
+        {report && !verify.isError && (
           <span className="text-xs text-forge-muted">
             at {new Date(report.generated_at).toLocaleTimeString()}
           </span>
@@ -1091,7 +1100,10 @@ function VerificationCard() {
           Verification failed to run: {(verify.error as Error).message}
         </div>
       )}
-      {report && !verify.isFetching && (
+      {/* React Query keeps the last successful data on error — without the
+          isError gate a failed re-run renders the error line AND the stale
+          pre-failure report (old PASS/FAIL badge included). */}
+      {report && !verify.isFetching && !verify.isError && (
         <>
           <label className="flex items-center gap-1.5 cursor-pointer text-xs text-forge-muted mb-2">
             <input
@@ -1731,7 +1743,7 @@ function CompletenessCard() {
         >
           {audit.isFetching ? "Auditing… (full page scan)" : report ? "Re-run audit" : "Run audit"}
         </button>
-        {report && (
+        {report && !audit.isError && (
           <span className="text-xs text-forge-muted">
             audited {report.summary.documents} docs / {report.summary.total_pages.toLocaleString()} pages
             {" at "}{new Date(report.generated_at).toLocaleTimeString()}
@@ -1772,7 +1784,7 @@ function CompletenessCard() {
           Audit failed: {(audit.error as Error).message}
         </div>
       )}
-      {report && !audit.isFetching && (
+      {report && !audit.isFetching && !audit.isError && (
         <>
           <div className="flex items-center gap-2 flex-wrap mb-3 text-xs">
             <span className="border border-emerald-500/50 text-emerald-400 rounded px-2 py-0.5" title="Documents where every pipeline step is fully done">

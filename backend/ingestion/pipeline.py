@@ -1990,7 +1990,9 @@ class IngestionPipeline:
             OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
             WHERE {ENTITY_NEEDS_EXTRACTION}
             RETURN d.title AS title,
-                   collect({{page_id: p.page_id, page_number: p.page_number, text: p.extracted_text}}) AS pages
+                   collect({{page_id: p.page_id, page_number: p.page_number,
+                             text: p.extracted_text,
+                             char_count: p.text_char_count}}) AS pages
             """,
             {"doc_id": doc_id},
         )
@@ -2044,15 +2046,23 @@ class IngestionPipeline:
                 # indistinguishable from "never ran", the completeness audit
                 # reports it as a gap forever, and repair jobs re-pay the
                 # LLM for the same empty pages on every run.
-                # A dense page that still produced no ENTITIES already
-                # survived the extractor's anti-bail retry — mark the empty
-                # as CONFIRMED so the suspicious-empty verification check
-                # doesn't flag it (and drains don't re-pay it) forever.
+                # entities_confirmed_empty means: "the POST-FIX extractor
+                # ran this dense page and wrote no entity mentions" — the
+                # suspicious-empty check must not re-flag it and drains must
+                # not re-pay it. (When the model returned only formulas or
+                # tables, the anti-bail retry deliberately did not run — the
+                # model engaged with the page; the marker still applies
+                # because no ENTITY mentions exist for the predicate to see.)
                 # Gate on the per-type entity counts, NOT counts["page_rels"]
                 # — that key tallies the model's explicit relationship list,
                 # which is zero on entity-rich pages and nonzero when every
                 # relationship endpoint was validator-rejected (both burned
-                # us live on 2026-08-08: 3,063 unflagged + wrong flags).
+                # us live on 2026-08-08: 3,063 unflagged pages).
+                # Density comes from p.text_char_count — the SAME property
+                # the predicate compares — not Python len(text): Cypher
+                # size() counts UTF-16 code units, len() counts code points,
+                # and a page straddling the threshold between the two
+                # measures would drain-loop forever.
                 wrote_entities = any(
                     counts.get(k, 0) > 0
                     for k in ("materials", "processes", "standards",
@@ -2060,13 +2070,18 @@ class IngestionPipeline:
                 )
                 confirmed_empty = (
                     not wrote_entities
-                    and len(page["text"] or "") >= SUSPICIOUS_EMPTY_MIN_CHARS
+                    and (page.get("char_count") or 0)
+                    >= SUSPICIOUS_EMPTY_MIN_CHARS
                 )
+                # A successful extraction must CLEAR any stale marker: a
+                # page re-extracted after a flag (model upgrade, deeper
+                # re-run) would otherwise stay exempt from the suspicious
+                # check forever if its rels are ever removed again.
                 await self.neo4j.run_write(
                     "MATCH (p:Page {page_id: $pid}) "
-                    "SET p.entities_extracted_at = datetime()"
-                    + (", p.entities_confirmed_empty = true"
-                       if confirmed_empty else ""),
+                    "SET p.entities_extracted_at = datetime(), "
+                    "p.entities_confirmed_empty = "
+                    + ("true" if confirmed_empty else "null"),
                     {"pid": page["page_id"]},
                 )
             except Exception as exc:  # noqa: BLE001

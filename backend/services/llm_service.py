@@ -379,6 +379,43 @@ class LLMService:
                     continue
                 raise
 
+            # Truncation FIRST, before any parsing: a response the server
+            # cut off at max_tokens is never a complete answer, even when a
+            # prefix of it happens to parse (non-strict mode can emit a
+            # complete first object and then ramble into the cap — accepting
+            # that prefix silently drops the truncation on the floor).
+            if finish_reason == "length":
+                last_err = ValueError(
+                    f"response truncated at max_tokens={effective_max_tokens}"
+                )
+                if effective_max_tokens >= TRUNCATION_MAX_TOKENS:
+                    logger.warning(
+                        "LLM response still truncated at the %d-token "
+                        "ceiling — giving up (each retry costs a full "
+                        "generation)", effective_max_tokens,
+                    )
+                    raise LLMTruncationError(
+                        f"response truncated at the max_tokens ceiling "
+                        f"({effective_max_tokens}) — output doesn't fit; "
+                        "caller may split the input"
+                    )
+                effective_max_tokens = min(
+                    effective_max_tokens * 2, TRUNCATION_MAX_TOKENS
+                )
+                # Escalation must not consume the shared retry budget:
+                # otherwise a mixed sequence (transient blip + truncations)
+                # exhausts attempts mid-ladder and exits with a generic
+                # LLMFatalError, so callers waiting on LLMTruncationError
+                # (the extractor's split fallback) never see it. The ladder
+                # is bounded by the doubling, not by attempts.
+                attempts_left += 1
+                logger.warning(
+                    "LLM response hit the token cap (finish_reason=length)"
+                    " — retrying with max_tokens=%d",
+                    effective_max_tokens,
+                )
+                continue
+
             # Parse + validate — tolerate models that wrap JSON in prose or
             # markdown code fences. We look for the first {...} span if the
             # raw content doesn't parse directly.
@@ -394,33 +431,6 @@ class LLMService:
                         data = None
 
             if data is None:
-                if finish_reason == "length":
-                    # The JSON is unparseable because the server cut it off
-                    # at max_tokens, not because the model wrote prose. A
-                    # re-prompt can't fix that — only a bigger budget can.
-                    last_err = ValueError(
-                        f"response truncated at max_tokens={effective_max_tokens}"
-                    )
-                    if effective_max_tokens >= TRUNCATION_MAX_TOKENS:
-                        logger.warning(
-                            "LLM response still truncated at the %d-token "
-                            "ceiling — giving up (each retry costs a full "
-                            "generation)", effective_max_tokens,
-                        )
-                        raise LLMTruncationError(
-                            f"response truncated at the max_tokens ceiling "
-                            f"({effective_max_tokens}) — output doesn't fit; "
-                            "caller may split the input"
-                        )
-                    effective_max_tokens = min(
-                        effective_max_tokens * 2, TRUNCATION_MAX_TOKENS
-                    )
-                    logger.warning(
-                        "LLM response hit the token cap (finish_reason=length)"
-                        " — retrying with max_tokens=%d (attempts left=%d)",
-                        effective_max_tokens, attempts_left,
-                    )
-                    continue
                 last_err = ValueError("non-JSON response")
                 logger.warning(
                     "LLM returned non-JSON (finish_reason=%s, attempts left=%d): %.200s",

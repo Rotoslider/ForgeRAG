@@ -14,6 +14,8 @@ from backend.config import LLMSettings
 from backend.services.llm_service import (
     LLMFatalError,
     LLMService,
+    LLMTransientError,
+    LLMTruncationError,
     TRUNCATION_MAX_TOKENS,
 )
 
@@ -40,7 +42,10 @@ def _service(monkeypatch, responses):
     async def fake_chat(messages, *, max_tokens=None, temperature=None,
                         response_format=None):
         calls.append((messages, max_tokens))
-        return responses[min(len(calls) - 1, len(responses) - 1)]
+        item = responses[min(len(calls) - 1, len(responses) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        return item
 
     monkeypatch.setattr(svc, "chat_with_finish_reason", fake_chat)
     return svc, calls
@@ -74,6 +79,43 @@ async def test_truncation_at_ceiling_gives_up(monkeypatch):
 
     # Already at the ceiling: exactly one call, no doomed retries.
     assert len(calls) == 1
+
+
+async def test_mixed_failures_still_reach_the_truncation_ceiling(monkeypatch):
+    # Escalation retries must not consume the shared attempt budget: with a
+    # transient blip burning one attempt, the ladder must still climb to
+    # the ceiling and raise LLMTruncationError (the extractor's split
+    # fallback depends on that exact type) instead of exhausting attempts
+    # into a generic LLMFatalError.
+    svc, calls = _service(monkeypatch, [
+        LLMTransientError("server hiccup"),
+        (TRUNCATED, "length"),   # 8192  -> escalate
+        (TRUNCATED, "length"),   # 16384 -> escalate
+        (TRUNCATED, "length"),   # 32768 -> ceiling
+    ])
+
+    with pytest.raises(LLMTruncationError):
+        await svc.chat_json_structured(
+            [{"role": "user", "content": "extract"}], _Result, max_tokens=8192,
+        )
+
+    assert [mt for _, mt in calls] == [8192, 8192, 16384, 32768]
+
+
+async def test_parseable_prefix_with_length_finish_still_escalates(monkeypatch):
+    # A truncated response whose PREFIX parses (complete object followed by
+    # cut-off rambling) must not be accepted as the complete answer.
+    svc, calls = _service(monkeypatch, [
+        ('{"items": []} and then the model rambles on and on', "length"),
+        (COMPLETE, "stop"),
+    ])
+
+    result = await svc.chat_json_structured(
+        [{"role": "user", "content": "extract"}], _Result, max_tokens=8192,
+    )
+
+    assert result.items == ["a", "b", "c"]
+    assert [mt for _, mt in calls] == [8192, 16384]
 
 
 async def test_prose_response_still_gets_nudge(monkeypatch):
