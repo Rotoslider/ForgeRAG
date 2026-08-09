@@ -108,7 +108,7 @@ class ChunkSummarizer:
         ]
 
         try:
-            raw = await self.llm.chat(
+            raw, finish_reason = await self.llm.chat_with_finish_reason(
                 messages,
                 max_tokens=150,
                 temperature=0.1,
@@ -118,6 +118,16 @@ class ChunkSummarizer:
                 "Chunk summarization failed for chunk %s: %s — "
                 "falling back to text preview",
                 chunk.chunk_id, exc,
+            )
+            return text[:240], "preview"
+        if finish_reason == "length":
+            # A summary cut off at the token cap is not a summary. Storing
+            # it as source='llm' would hide it from the resummarize repair
+            # forever — mark it preview so the repair can find and redo it.
+            logger.warning(
+                "Chunk summary truncated at max_tokens for chunk %s — "
+                "stored as preview for the resummarize repair",
+                chunk.chunk_id,
             )
             return text[:240], "preview"
 

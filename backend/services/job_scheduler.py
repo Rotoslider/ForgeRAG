@@ -375,16 +375,20 @@ class JobScheduler:
     @classmethod
     def _list_inbox(cls, inbox: Path) -> list[Path]:
         """PDFs anywhere under the inbox (subfolders included), excluding
-        the ingested/ and duplicates/ output trees."""
+        the ingested/ and duplicates/ output trees.
+
+        Prunes the skip dirs DURING traversal — the old rglob descended the
+        entire ingested/ archive (which grows by one file per processed PDF
+        forever) before filtering, a stat storm re-paid on every walk.
+        """
         out = []
-        for p in sorted(inbox.rglob("*")):
-            if not (p.is_file() and p.suffix.lower() == ".pdf"):
-                continue
-            rel = p.relative_to(inbox)
-            if rel.parts[0] in cls._SKIP_DIRS:
-                continue
-            out.append(p)
-        return out
+        for root, dirs, files in os.walk(inbox):
+            if Path(root) == inbox:
+                dirs[:] = [d for d in dirs if d not in cls._SKIP_DIRS]
+            for f in files:
+                if f.lower().endswith(".pdf"):
+                    out.append(Path(root) / f)
+        return sorted(out)
 
     def open_watch_folder(self) -> None:
         """Open the inbox in the desktop file manager. ForgeRAG is a

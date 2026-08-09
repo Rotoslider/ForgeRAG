@@ -130,6 +130,14 @@ class PDFProcessor:
         import fitz
 
         with fitz.open(str(pdf_path)) as doc:
+            if doc.needs_pass:
+                # Fail loudly and specifically — an encrypted PDF used to
+                # sail into rasterization and die on an opaque poppler
+                # error after partial writes.
+                raise ValueError(
+                    f"PDF is password-protected: {pdf_path.name} — remove "
+                    "the password (e.g. qpdf --decrypt) and re-upload"
+                )
             total = doc.page_count
 
         # Collect the set of page numbers still to render

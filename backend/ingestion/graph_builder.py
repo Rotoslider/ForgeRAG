@@ -107,7 +107,23 @@ class GraphBuilder:
     async def write_page(
         self, *, page_id: str, extraction: PageExtraction
     ) -> dict[str, int]:
-        """Persist all entities + relationships from one page. Returns counts."""
+        """Persist all entities + relationships from one page. Returns counts.
+
+        Runs under GRAPH_MERGE_LOCK so a concurrent entity merge can never
+        DETACH DELETE a node between this page's writes (live incident
+        2026-08-08: a dedup pass destroyed just-written REFERENCES_STANDARD
+        rels, leaving a stamped page with no rels and no marker).
+        """
+        from backend.services.entity_merge import GRAPH_MERGE_LOCK
+
+        async with GRAPH_MERGE_LOCK:
+            return await self._write_page_impl(
+                page_id=page_id, extraction=extraction
+            )
+
+    async def _write_page_impl(
+        self, *, page_id: str, extraction: PageExtraction
+    ) -> dict[str, int]:
         counts = {
             "materials": 0,
             "processes": 0,
@@ -394,11 +410,32 @@ class GraphBuilder:
             counts["topic_tags"] = len(tags)
 
         # ---- Relationships -----------------------------------------------
+        # The per-type writes are separate transactions; a mid-loop failure
+        # would leave the page with SOME entity rels — a state every repair
+        # predicate treats as "done" (NOT EXISTS rels fails) while the page
+        # stays unstamped: permanently half-extracted and unrepairable. On
+        # any failure, roll this page's entity mentions back to zero so the
+        # page cleanly re-enters the needs-extraction pool.
         page_rels, entity_rels = self._split_rels(extraction.relationships)
-        if page_rels:
-            counts["page_rels"] = await self._write_page_rels(page_id, page_rels)
-        if entity_rels:
-            counts["entity_rels"] = await self._write_entity_rels(entity_rels)
+        try:
+            if page_rels:
+                counts["page_rels"] = await self._write_page_rels(page_id, page_rels)
+            if entity_rels:
+                counts["entity_rels"] = await self._write_entity_rels(entity_rels)
+        except Exception:
+            try:
+                await self.neo4j.run_write(
+                    "MATCH (p:Page {page_id: $pid})"
+                    "-[r:MENTIONS_MATERIAL|DESCRIBES_PROCESS|"
+                    "REFERENCES_STANDARD|MENTIONS_EQUIPMENT]->() DELETE r",
+                    {"pid": page_id},
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "Rollback of partial page rels failed for %s — page may "
+                    "be left half-extracted", page_id,
+                )
+            raise
 
         return counts
 

@@ -14,9 +14,23 @@ scripts/canonicalize_entity_apply.py).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Serializes entity merges against concurrent page-relationship writes.
+# merge_entity's redirect passes and its final DETACH DELETE are separate
+# transactions; a relationship MERGEd onto the loser node by a concurrent
+# write_page between them is destroyed unmigrated (live incident
+# 2026-08-08 16:29: a fill-missing job's REFERENCES_STANDARD rels were
+# deleted seconds after being written by another job's dedup pass, leaving
+# stamped pages with no rels and no marker). Every graph writer lives in
+# this one process/event loop, so an asyncio lock is a complete exclusion:
+# merge_entity holds it for the whole merge; GraphBuilder.write_page holds
+# it while writing page rels. Merges are rare and fast (ms) relative to
+# extraction, so the added latency is negligible.
+GRAPH_MERGE_LOCK = asyncio.Lock()
 
 # Page->entity relationship per entity label, used to recover the junk
 # ``<Label>__TEMP_REL`` edges the old normalize-entities left behind.
@@ -40,7 +54,20 @@ async def merge_entity(neo4j, label: str, pk: str, winner: str, loser: str) -> N
     the loser is redirected to the winner (per discovered type, literal in
     the Cypher — type strings come from the graph's own type(r), never user
     input), support_count accumulates on collisions, the loser's name lands
-    in winner.common_names, and the loser node is deleted."""
+    in winner.common_names, and the loser node is deleted.
+
+    Holds GRAPH_MERGE_LOCK for the whole merge so a concurrent
+    write_page can never land a relationship on the loser between the
+    redirect passes and the final DETACH DELETE (which would destroy it
+    unmigrated) — and so a concurrent MERGE-by-name can't resurrect the
+    loser node mid-delete."""
+    async with GRAPH_MERGE_LOCK:
+        await _merge_entity_locked(neo4j, label, pk, winner, loser)
+
+
+async def _merge_entity_locked(
+    neo4j, label: str, pk: str, winner: str, loser: str
+) -> None:
     params = {"winner": winner, "loser": loser}
     incoming = await neo4j.run_query(
         f"MATCH ()-[r]->(l:{label} {{{pk}: $loser}}) "

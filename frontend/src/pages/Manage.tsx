@@ -1707,7 +1707,15 @@ function CompletenessCard() {
   };
   const outstanding = Object.keys(tracked).filter((docId) => {
     const j = trackedJobStatus(docId);
-    return !j || j.status === "queued" || j.status === "processing";
+    // "paused" is active too (backend ACTIVE_STATUSES) — dropping it made
+    // a held repair flip the green "all finished" banner while its own row
+    // showed "⏸ held" right below.
+    return (
+      !j ||
+      j.status === "queued" ||
+      j.status === "processing" ||
+      j.status === "paused"
+    );
   });
   const allRepairsFinished =
     Object.keys(tracked).length > 0 && outstanding.length === 0;

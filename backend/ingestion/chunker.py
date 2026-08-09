@@ -206,12 +206,19 @@ def _extract_bbox(item) -> tuple[float, float, float, float] | None:
     if bbox is None:
         return None
     # docling BoundingBox has l, t, r, b (or similar). Handle both patterns.
+    # Explicit None checks, NOT `or` — a legitimate 0.0 coordinate (any
+    # element touching the page's left/top edge) is falsy and would fall
+    # through to subscripting a non-subscriptable BoundingBox, silently
+    # dropping the bbox for exactly the edge-anchored chunks.
+    def _coord(attr: str, idx: int):
+        v = getattr(bbox, attr, None)
+        return v if v is not None else bbox[idx]
+
     try:
-        l = getattr(bbox, "l", None) or bbox[0]
-        t = getattr(bbox, "t", None) or bbox[1]
-        r = getattr(bbox, "r", None) or bbox[2]
-        b = getattr(bbox, "b", None) or bbox[3]
-        return (float(l), float(t), float(r), float(b))
+        return (
+            float(_coord("l", 0)), float(_coord("t", 1)),
+            float(_coord("r", 2)), float(_coord("b", 3)),
+        )
     except Exception:
         return None
 

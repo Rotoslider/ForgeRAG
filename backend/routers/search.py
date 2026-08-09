@@ -60,6 +60,21 @@ def _filter_clauses(filters: SearchFilters | None) -> tuple[str, dict]:
     return " AND ".join(parts), params
 
 
+# Lucene query-syntax metacharacters. A bare token containing any of these
+# either throws a ParseException/TokenMgrError that fails the whole search
+# (live-reproduced: "3/16 weld", "weld(ing test") or silently changes the
+# query's meaning (":" starts a field query). Escape every occurrence when
+# interpolating user text or entity names into a Lucene query string.
+_LUCENE_SPECIALS = set('+-&|!(){}[]^"~*?:\\/')
+
+
+def _lucene_escape(token: str) -> str:
+    """Backslash-escape Lucene metacharacters in a single term."""
+    return "".join(
+        f"\\{ch}" if ch in _LUCENE_SPECIALS else ch for ch in token
+    )
+
+
 def _apply_lucene_fuzzy(tokens: list[str]) -> list[str]:
     """Append Lucene ~1 (edit distance 1) to tokens >= 5 characters.
 
@@ -116,7 +131,7 @@ async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeR
     # gets zero results just because the full string isn't in any doc).
     escaped = body.query.replace('"', '\\"')
     tokens = [t for t in body.query.split() if t]
-    escaped_tokens = [t.replace('"', '\\"') for t in tokens if len(t) >= 2]
+    escaped_tokens = [_lucene_escape(t) for t in tokens if len(t) >= 2]
 
     # When fuzzy mode is enabled, apply Lucene edit-distance syntax to
     # individual terms for OCR typo tolerance ("weldlng" -> "welding").
@@ -416,7 +431,14 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
     sent_pages: set[tuple[str, int]] = set()  # (doc_hash, page_number) dedup
 
     async def _add_page_image(doc_hash: str, pn: int, title: str, label: str) -> bool:
-        """Add a page image to the LLM context. Returns True if added."""
+        """Add a page image to the LLM context. Returns True if added.
+
+        Every image sent with an IMG_ID is citable by the model, so every
+        image sent MUST also appear in sources[] — the frontend resolves
+        [#N] citations against sources only, and an adjacent-page citation
+        with no source entry either dead-ends ("citation doesn't match any
+        source") or gets offset-"corrected" to the wrong page.
+        """
         key = (doc_hash, pn)
         if key in sent_pages or pn < 1:
             return False
@@ -424,8 +446,18 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         if not img_path.exists():
             return False
         sent_pages.add(key)
-        img_bytes = img_path.read_bytes()
+        # ~250-580KB per image, up to 3x limit images per request — read
+        # off the event loop so concurrent requests don't stutter.
+        img_bytes = await asyncio.to_thread(img_path.read_bytes)
         b64 = base64.b64encode(img_bytes).decode("ascii")
+        if label != "Source":
+            sources.append({
+                "document_title": title,
+                "page_number": pn,
+                "image_url": f"/images/{doc_hash}/{pn}",
+                "score": 0,
+                "adjacent": True,
+            })
         # Each image is introduced by a distinctive ID token ("#NNN") that
         # cannot be confused with the printed page number in the PDF
         # header/footer. The LLM is instructed in the system prompt to
@@ -601,7 +633,15 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
     try:
         answer = await llm.chat(messages, max_tokens=2048, temperature=0.1)
     except Exception as exc:
-        answer = f"LLM error: {exc}"
+        # Fail honestly — packing the error string into `answer` under
+        # success:true rendered "LLM error: ..." to users as if it were the
+        # generated answer, inverting the pipeline's loud-failure rule.
+        logger.exception("Answer-mode LLM call failed")
+        return ForgeResult(
+            success=False,
+            reason=f"LLM answer generation failed: {exc}",
+            data={"sources": sources, "query": body.query},
+        )
 
     return ForgeResult(
         success=True,
@@ -765,7 +805,7 @@ async def visual_search(body: VisualSearchRequest, request: Request) -> ForgeRes
     if not candidates:
         terms = [t for t in body.query.split() if t]
         ft_query = (
-            " OR ".join(t.replace('"', '\\"') for t in terms if len(t) >= 2)
+            " OR ".join(_lucene_escape(t) for t in terms if len(t) >= 2)
             if len(terms) > 3
             else f'"{body.query.replace(chr(34), chr(92) + chr(34))}"'
         )
@@ -905,7 +945,7 @@ async def search_chunks(body: ChunkSearchRequest, request: Request) -> ForgeResu
     if len(terms) <= 3:
         ft_query = f'"{body.query.replace(chr(34), chr(92) + chr(34))}"'
     else:
-        ft_query = " OR ".join(t.replace('"', '\\"') for t in terms if len(t) >= 2)
+        ft_query = " OR ".join(_lucene_escape(t) for t in terms if len(t) >= 2)
 
     dense_cypher = f"""
         CALL db.index.vector.queryNodes('chunk_embedding', $pool, $vec)
@@ -1269,8 +1309,16 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
         # OR'd so any entity whose name contains the term is a candidate.
         # The fulltext index (entity_name_fulltext) covers Material.name,
         # Process.name, Equipment.name, and Standard.code — no full
-        # property scan needed.
-        lucene_query = " OR ".join(query_terms)
+        # property scan needed. Terms MUST be escaped: raw "3/16" or
+        # "weld(ing" throws a Lucene parse error that fails the whole
+        # request (live-reproduced), and entity names appended by the
+        # fuzzy matcher carry the same specials.
+        escaped_terms = [_lucene_escape(t) for t in query_terms if t.strip()]
+        if not escaped_terms:
+            # All-stopword query with no entity-matcher expansion: an
+            # empty Lucene string is a parse error, not an empty result.
+            return ForgeResult(success=True, data=[])
+        lucene_query = " OR ".join(escaped_terms)
 
         cypher = f"""
             CALL db.index.fulltext.queryNodes('entity_name_fulltext', $lucene)
@@ -1373,7 +1421,7 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
             escaped = body.query.replace('"', '\\"')
             ft_query = f'"{escaped}"'
         else:
-            escaped_terms = [t.replace('"', '\\"') for t in terms if len(t) >= 2]
+            escaped_terms = [_lucene_escape(t) for t in terms if len(t) >= 2]
             ft_query = " OR ".join(escaped_terms)
 
         # (1) Chunk dense

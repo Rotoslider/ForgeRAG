@@ -528,7 +528,10 @@ async def run_verification(neo4j, settings) -> dict:
     ))
 
     # ------------------------------------------------------------- indexes
-    idx_rows = await q("SHOW INDEXES YIELD name, state, type RETURN name, state, type")
+    idx_rows = await q(
+        "SHOW INDEXES YIELD name, state, type, options "
+        "RETURN name, state, type, options"
+    )
     by_name = {r["name"]: r for r in idx_rows}
     expected = [
         "page_doc_number", "document_title", "chunk_page_number", "chunk_type",
@@ -545,6 +548,38 @@ async def run_verification(neo4j, settings) -> dict:
         "indexes_online",
         "Every schema index (btree, fulltext, vector) exists and is ONLINE",
         len(idx_problems), total=len(expected), samples=idx_problems,
+    ))
+
+    # Vector index DIMENSIONS — CREATE VECTOR INDEX IF NOT EXISTS is a no-op
+    # on an existing index, so after an embedding-dim change the stale-dim
+    # index stays ONLINE and Neo4j silently excludes every mismatched vector
+    # from it: all vector search returns nothing while everything reads
+    # healthy. Per-node dim checks can't see this (they compare node
+    # properties to current settings); only the index config knows.
+    expected_dims = {
+        "page_text_embedding": settings.models.text_embedding_dim,
+        "chunk_embedding": settings.models.text_embedding_dim,
+        "community_summary_embedding": settings.models.text_embedding_dim,
+    }
+    dim_problems = []
+    for name, want in expected_dims.items():
+        row = by_name.get(name)
+        if row is None:
+            continue  # already reported by indexes_online
+        cfg = (row.get("options") or {}).get("indexConfig") or {}
+        have = cfg.get("vector.dimensions")
+        if have is not None and int(have) != int(want):
+            dim_problems.append(
+                {"index": name, "configured": int(have), "expected": int(want)}
+            )
+    checks.append(_check(
+        "vector_index_dimensions",
+        "Every vector index is configured at the current embedding "
+        "dimension (a stale-dim index stays ONLINE but silently indexes "
+        "nothing after a model change)",
+        len(dim_problems), total=len(expected_dims), samples=dim_problems,
+        detail="DROP the mismatched index and re-run schema setup, then "
+        "re-embed" if dim_problems else None,
     ))
 
     # ------------------------------------------------------------- summary

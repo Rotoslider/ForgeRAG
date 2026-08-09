@@ -138,6 +138,13 @@ async def scan_now(request: Request) -> ForgeResult:
             status_code=409, detail="watch folder is not enabled"
         )
     result = await sched.scan_watch_folder(force=True)
+    if result.get("error"):
+        # A missing/unmounted inbox used to come back success:true with an
+        # "error" key the frontend never read — the GUI showed a green
+        # "Scan done: 0 queued" over a hard failure.
+        return ForgeResult(success=False, reason=str(result["error"]), data={
+            **result, "status": sched.status(),
+        })
     return ForgeResult(success=True, data={
         **result, "status": sched.status(),
     })

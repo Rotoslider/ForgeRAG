@@ -247,17 +247,16 @@ def derive_doc_audit(
         aspects["entities"] = _aspect(
             "missing", 0, pages_with_text, "no page has been extracted"
         )
-    elif done_pages / pages_with_text < _COVERAGE_PARTIAL_THRESHOLD:
+    else:
+        # ANY shortfall is partial. Since entities_extracted_at is stamped
+        # even for zero-yield pages, done_pages < pages_with_text can only
+        # mean pages that FAILED or never ran — the old >=50% "done" branch
+        # reported docs with up to half their pages unextracted as complete
+        # and hid them from the problems table entirely.
         aspects["entities"] = _aspect(
             "partial", done_pages, pages_with_text,
             f"only {done_pages} of {pages_with_text} text pages extracted"
             f"{empty_note} ({tt_pages} have topic tags)",
-        )
-    else:
-        aspects["entities"] = _aspect(
-            "done", done_pages, pages_with_text,
-            f"{e_pages} pages with entities{empty_note}; "
-            f"{tt_pages} have topic tags",
         )
 
     statuses = {a["status"] for a in aspects.values()}

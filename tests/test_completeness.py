@@ -21,8 +21,11 @@ def _row(**overrides) -> dict:
         "visual_embedded": 95,
         "visual_embedded_ok": 95,
         "pages_with_chunks": 90,
+        # extraction_done must cover EVERY text page for "complete" — pages
+        # extracted-but-empty (entities < done) are fine, unextracted pages
+        # are not. The audit no longer calls >=50% coverage "done".
         "pages_with_entities": 80,
-        "pages_extraction_done": 80,
+        "pages_extraction_done": 95,
         "pages_text_recoverable": 0,
         "pages_with_topic_tags": 80,
         "chunks_built": False,

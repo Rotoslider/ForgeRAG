@@ -814,16 +814,25 @@ class IngestionPipeline:
                     "cannot recreate missing pages."
                 )
 
-            # Locate source PDF in data/uploads/ by hash prefix
+            # Locate the source PDF and VERIFY it by content hash. Uploads
+            # are staged as "{uuid4().hex}_{basename}", so the old
+            # hash-prefix glob could never match, and its filename-suffix
+            # fallback could silently pick a same-named DIFFERENT document —
+            # rebuilding this doc's chunks from the wrong PDF's text.
             upload_dir = Path(self.settings.server.data_dir) / "uploads"
-            candidates = list(upload_dir.glob(f"{file_hash[:32]}_*"))
-            if not candidates and filename:
-                candidates = list(upload_dir.glob(f"*{filename}"))
-            if not candidates:
+            candidates = sorted(upload_dir.glob(f"*_{filename}")) if filename else []
+            pdf_path = None
+            for cand in candidates:
+                if await _sha256_file(cand) == file_hash:
+                    pdf_path = cand
+                    break
+            if pdf_path is None:
                 raise ValueError(
-                    f"Source PDF not found in {upload_dir} for doc {doc_id}"
+                    f"No staged upload matching this document's file hash "
+                    f"found in {upload_dir} for doc {doc_id} "
+                    f"({len(candidates)} same-named candidate(s) rejected by "
+                    "hash check) — re-upload the PDF, then rebuild"
                 )
-            pdf_path = candidates[0]
 
             if extract_only:
                 for name in ("chunking", "summarizing", "embedding_chunks", "writing_chunks"):
@@ -845,12 +854,36 @@ class IngestionPipeline:
                     self.structural_chunker.chunk_pdf, pdf_path, file_hash,
                 )
                 if not chunks:
+                    # Same self-heal as the ingest lane: text-less PDFs
+                    # (vector-outline exports) yield nothing until Docling
+                    # is handed a rasterized rebuild it can OCR. This is
+                    # the exact lane docs_have_chunks tells users to run —
+                    # without the fallback here, the recommended repair
+                    # dead-ended on precisely the PDFs it exists to fix.
+                    rebuilt = await asyncio.to_thread(
+                        self._rasterized_pdf_from_page_images, file_hash,
+                    )
+                    if rebuilt is not None:
+                        await self.jobs.update_step(
+                            job_id, "chunking", "running",
+                            detail="no chunks from original PDF (text-less?)"
+                            " — retrying OCR on rasterized rebuild",
+                        )
+                        try:
+                            chunks = await asyncio.to_thread(
+                                self.structural_chunker.chunk_pdf,
+                                rebuilt, file_hash,
+                            )
+                        finally:
+                            Path(rebuilt).unlink(missing_ok=True)
+                if not chunks:
                     logger.warning(
                         "Chunker produced no chunks for doc %s", doc_id,
                     )
                     await self.jobs.update_step(
                         job_id, "chunking", "warning",
-                        detail="chunker produced no chunks",
+                        detail="chunker produced no chunks "
+                        "(rasterized retry included)",
                     )
                     for name in ("summarizing", "embedding_chunks", "writing_chunks"):
                         await self.jobs.update_step(
@@ -960,19 +993,42 @@ class IngestionPipeline:
                         # summarizing; keep pages_processed in step so the
                         # job card shows 26/26 instead of a misleading 0/26.
                         await self.jobs.update(job_id, pages_processed=end)
-                    # Mark the doc as chunk-built so the completeness audit
-                    # treats whatever coverage Docling achieved as final —
-                    # some pages legitimately yield no chunks, and without
-                    # the marker those docs read as forever-incomplete.
-                    await self.neo4j.run_write(
-                        "MATCH (d:Document {doc_id: $id}) "
-                        "SET d.chunks_built_at = datetime()",
+                    # Verify what actually landed — the UNWIND's MATCH
+                    # silently drops rows whose page_number has no :Page
+                    # node, and the old code reported the CHUNKER's count
+                    # as "written" and stamped regardless.
+                    written_rows = await self.neo4j.run_query(
+                        "MATCH (c:Chunk {doc_id: $id}) RETURN count(c) AS n",
                         {"id": doc_id},
                     )
-                    await self.jobs.update_step(
-                        job_id, "writing_chunks", "done",
-                        detail=f"{len(chunks)} chunks written",
-                    )
+                    actually_written = written_rows[0]["n"] if written_rows else 0
+                    dropped = max(0, len(chunks) - actually_written)
+                    if dropped > 0:
+                        logger.warning(
+                            "%d of %d chunk rows dropped for doc %s (no "
+                            "matching page node) — chunks_built_at NOT "
+                            "stamped", dropped, len(chunks), doc_id,
+                        )
+                        await self.jobs.update_step(
+                            job_id, "writing_chunks", "warning",
+                            detail=f"{dropped} of {len(chunks)} chunk rows "
+                            "dropped — no matching page node",
+                        )
+                    else:
+                        # Mark the doc as chunk-built so the completeness
+                        # audit treats whatever coverage Docling achieved as
+                        # final — some pages legitimately yield no chunks,
+                        # and without the marker those docs read as
+                        # forever-incomplete.
+                        await self.neo4j.run_write(
+                            "MATCH (d:Document {doc_id: $id}) "
+                            "SET d.chunks_built_at = datetime()",
+                            {"id": doc_id},
+                        )
+                        await self.jobs.update_step(
+                            job_id, "writing_chunks", "done",
+                            detail=f"{actually_written} chunks written",
+                        )
                     step = None
 
             if skip_extract:
@@ -1006,7 +1062,8 @@ class IngestionPipeline:
                           AND (p.topic_tags IS NULL OR size(p.topic_tags) = 0)
                           AND coalesce(p.is_blank, false) = false
                         RETURN p.page_id AS page_id, p.page_number AS page_number,
-                               p.extracted_text AS text
+                               p.extracted_text AS text,
+                               p.text_char_count AS char_count
                         ORDER BY p.page_number
                         """,
                         {"d": doc_id},
@@ -1024,13 +1081,11 @@ class IngestionPipeline:
                                 page_number=p["page_number"],
                                 page_text=p["text"],
                             )
-                            await self.graph_builder.write_page(
+                            page_counts = await self.graph_builder.write_page(
                                 page_id=p["page_id"], extraction=extraction,
                             )
-                            await self.neo4j.run_write(
-                                "MATCH (p:Page {page_id: $pid}) "
-                                "SET p.entities_extracted_at = datetime()",
-                                {"pid": p["page_id"]},
+                            await self._stamp_page_extracted(
+                                p["page_id"], page_counts, p.get("char_count"),
                             )
                         except Exception as exc:  # noqa: BLE001
                             logger.warning(
@@ -1046,9 +1101,10 @@ class IngestionPipeline:
                             )
                     if total and failed == total:
                         raise RuntimeError(
-                            f"entity extraction failed for all {total} pages — "
-                            "LLM endpoint unreachable? Pages remain unstamped "
-                            "and will be retried on the next run"
+                            f"entity extraction failed for all {total} pages "
+                            "— see per-page log warnings for the actual "
+                            "errors; pages remain unstamped and will be "
+                            "retried on the next run"
                         )
                     if failed:
                         logger.warning(
@@ -1159,22 +1215,44 @@ class IngestionPipeline:
 
             await self.jobs.update(job_id, status="processing", doc_id=doc_id, file_hash=file_hash)
 
+            # Refuse to run at all when NEITHER embedding service is up —
+            # and clear only the lanes whose service can actually re-fill
+            # them. The old order (clear everything, then notice a service
+            # is None and mark the step "skipped") destroyed the library's
+            # embeddings under all-green completed jobs when a bulk
+            # re-embed ran while ColPali/LM Studio was down.
+            if self.text_embedding is None and self.colpali is None:
+                raise RuntimeError(
+                    "no embedding service is available — refusing to clear "
+                    "existing embeddings (nothing could re-create them)"
+                )
+            clear_sets = []
+            if self.colpali is not None:
+                clear_sets += ["p.colpali_vectors = NULL",
+                               "p.colpali_vector_count = NULL",
+                               "p.colpali_vector_dim = NULL"]
+            if self.text_embedding is not None:
+                clear_sets += ["p.text_embedding = NULL"]
+
             # Clear existing embeddings so the new model re-processes them.
             # Without this, switching models (e.g. ColPali to Nemotron, or
             # nomic 768-d to bge-m3 1024-d) would skip all pages because
             # _embed_text filters on "text_embedding IS NULL" and
             # _embed_visual checks colpali_vector_count > 0.
             await self.neo4j.run_write(
-                """
-                MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page)
-                SET p.colpali_vectors = NULL,
-                    p.colpali_vector_count = NULL,
-                    p.colpali_vector_dim = NULL,
-                    p.text_embedding = NULL
-                """,
+                "MATCH (d:Document {doc_id: $doc_id})-[:HAS_PAGE]->(p:Page) "
+                "SET " + ", ".join(clear_sets),
                 {"doc_id": doc_id},
             )
-            logger.info("Cleared existing embeddings (visual + text) for doc %s", doc_id)
+            logger.info(
+                "Cleared existing embeddings for doc %s (lanes: %s)",
+                doc_id,
+                ", ".join(
+                    l for l, ok in
+                    [("visual", self.colpali is not None),
+                     ("text", self.text_embedding is not None)] if ok
+                ),
+            )
 
             # Ensure is_blank is populated before re-embedding so we don't
             # waste GPU cycles on pages that are visually empty.
@@ -1248,6 +1326,12 @@ class IngestionPipeline:
 
             await self.jobs.update(job_id, status="processing", doc_id=doc_id, file_hash=file_hash)
 
+            # Check BEFORE the destructive clear — clearing first and then
+            # failing would leave the doc with no text embeddings and no
+            # service able to re-create them.
+            if self.text_embedding is None:
+                raise ValueError("Text embedding service not configured")
+
             # Clear ONLY text embeddings — leave visual embeddings intact
             await self.neo4j.run_write(
                 """
@@ -1257,9 +1341,6 @@ class IngestionPipeline:
                 {"doc_id": doc_id},
             )
             logger.info("Cleared text embeddings (visual untouched) for doc %s", doc_id)
-
-            if self.text_embedding is None:
-                raise ValueError("Text embedding service not configured")
 
             await self.jobs.update(
                 job_id, current_step="embedding_text", progress_pct=10.0
@@ -1964,6 +2045,39 @@ class IngestionPipeline:
 
     # ------------------------------------------------------------------ step 6
 
+    async def _stamp_page_extracted(
+        self, page_id: str, counts: dict[str, int], char_count: int | None,
+    ) -> None:
+        """Stamp a page entities_extracted_at with the confirmed-empty
+        protocol — THE single stamp writer for every extraction lane.
+
+        entities_confirmed_empty means: the post-fix extractor ran this
+        dense page and wrote no entity mentions; the suspicious-empty check
+        must not re-flag it and drains must not re-pay it. Gate on the
+        per-type entity counts (counts["page_rels"] tallies the model's
+        explicit relationship list — wrong signal), density on the stored
+        text_char_count (the SAME property the predicate compares), and
+        always write the marker so a successful extraction CLEARS a stale
+        one. Every rule here is a scar from a live incident; do not fork
+        this logic into per-lane copies again.
+        """
+        wrote_entities = any(
+            counts.get(k, 0) > 0
+            for k in ("materials", "processes", "standards",
+                      "clauses", "equipment")
+        )
+        confirmed_empty = (
+            not wrote_entities
+            and (char_count or 0) >= SUSPICIOUS_EMPTY_MIN_CHARS
+        )
+        await self.neo4j.run_write(
+            "MATCH (p:Page {page_id: $pid}) "
+            "SET p.entities_extracted_at = datetime(), "
+            "p.entities_confirmed_empty = "
+            + ("true" if confirmed_empty else "null"),
+            {"pid": page_id},
+        )
+
     async def _extract_entities(
         self, job_id: str, doc_id: str
     ) -> tuple[int, int, str | None]:
@@ -2048,43 +2162,8 @@ class IngestionPipeline:
                 # indistinguishable from "never ran", the completeness audit
                 # reports it as a gap forever, and repair jobs re-pay the
                 # LLM for the same empty pages on every run.
-                # entities_confirmed_empty means: "the POST-FIX extractor
-                # ran this dense page and wrote no entity mentions" — the
-                # suspicious-empty check must not re-flag it and drains must
-                # not re-pay it. (When the model returned only formulas or
-                # tables, the anti-bail retry deliberately did not run — the
-                # model engaged with the page; the marker still applies
-                # because no ENTITY mentions exist for the predicate to see.)
-                # Gate on the per-type entity counts, NOT counts["page_rels"]
-                # — that key tallies the model's explicit relationship list,
-                # which is zero on entity-rich pages and nonzero when every
-                # relationship endpoint was validator-rejected (both burned
-                # us live on 2026-08-08: 3,063 unflagged pages).
-                # Density comes from p.text_char_count — the SAME property
-                # the predicate compares — not Python len(text): Cypher
-                # size() counts UTF-16 code units, len() counts code points,
-                # and a page straddling the threshold between the two
-                # measures would drain-loop forever.
-                wrote_entities = any(
-                    counts.get(k, 0) > 0
-                    for k in ("materials", "processes", "standards",
-                              "clauses", "equipment")
-                )
-                confirmed_empty = (
-                    not wrote_entities
-                    and (page.get("char_count") or 0)
-                    >= SUSPICIOUS_EMPTY_MIN_CHARS
-                )
-                # A successful extraction must CLEAR any stale marker: a
-                # page re-extracted after a flag (model upgrade, deeper
-                # re-run) would otherwise stay exempt from the suspicious
-                # check forever if its rels are ever removed again.
-                await self.neo4j.run_write(
-                    "MATCH (p:Page {page_id: $pid}) "
-                    "SET p.entities_extracted_at = datetime(), "
-                    "p.entities_confirmed_empty = "
-                    + ("true" if confirmed_empty else "null"),
-                    {"pid": page["page_id"]},
+                await self._stamp_page_extracted(
+                    page["page_id"], counts, page.get("char_count"),
                 )
             except Exception as exc:  # noqa: BLE001
                 failed += 1
@@ -2312,12 +2391,35 @@ class IngestionPipeline:
                               c.embedding = row.embedding,
                               c.bbox = row.bbox
                 MERGE (p)-[:HAS_CHUNK]->(c)
+                RETURN count(c) AS written
                 """,
                 {"doc_id": doc_id, "rows": rows},
             )
-            total_written += len(rows)
+            # Count what the MATCH actually let through, not what we sent:
+            # a row whose page_number has no :Page node is silently filtered
+            # by Cypher — counting len(rows) reported dropped chunks as
+            # written and stamped the shrunken coverage as final.
+            written_rows = await self.neo4j.run_query(
+                "MATCH (c:Chunk {doc_id: $doc_id}) "
+                "WHERE c.chunk_id IN $ids RETURN count(c) AS n",
+                {"doc_id": doc_id, "ids": [r["chunk_id"] for r in rows]},
+            )
+            total_written += written_rows[0]["n"] if written_rows else 0
 
-        if total_written:
+        dropped = len(chunks) - total_written
+        if dropped > 0:
+            logger.warning(
+                "%d of %d chunk rows were DROPPED for doc %s — their "
+                "page_number matched no :Page node (page-count skew?). "
+                "chunks_built_at NOT stamped so the audit keeps the doc "
+                "visible.", dropped, len(chunks), doc_id,
+            )
+            await self.jobs.update_step(
+                job_id, "building_chunks", "warning",
+                detail=f"{dropped} of {len(chunks)} chunk rows dropped — "
+                "no matching page node",
+            )
+        elif total_written:
             await self.neo4j.run_write(
                 "MATCH (d:Document {doc_id: $id}) "
                 "SET d.chunks_built_at = datetime()",

@@ -31,9 +31,11 @@ def _chunk(text: str, chunk_id: str = "c1") -> StructuralChunk:
 
 
 class _LLMStub:
-    def __init__(self, response: str | None = None, exc: Exception | None = None):
+    def __init__(self, response: str | None = None, exc: Exception | None = None,
+                 finish_reason: str = "stop"):
         self.response = response
         self.exc = exc
+        self.finish_reason = finish_reason
         self.calls = 0
 
     async def chat(self, *args, **kwargs):
@@ -41,6 +43,9 @@ class _LLMStub:
         if self.exc is not None:
             raise self.exc
         return self.response
+
+    async def chat_with_finish_reason(self, *args, **kwargs):
+        return await self.chat(*args, **kwargs), self.finish_reason
 
 
 # ------------------------------------------------------------- summarize()
@@ -200,3 +205,14 @@ async def test_resummarize_noop_when_nothing_marked():
 
     assert jobs.completed == ["job1"]
     assert neo4j.repaired == []
+
+
+async def test_truncated_summary_is_marked_preview():
+    # A summary cut off at max_tokens (finish_reason="length") is not a
+    # summary — storing it as source='llm' would hide it from the
+    # resummarize repair forever.
+    llm = _LLMStub(response="This summary was cut off mid", finish_reason="length")
+    text = "x" * 500
+    s, source = await ChunkSummarizer(llm).summarize(_chunk(text))
+    assert source == "preview"
+    assert s == text[:240]

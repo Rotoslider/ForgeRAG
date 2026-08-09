@@ -220,7 +220,8 @@ class NemotronService:
         for batch_start in range(0, total, batch_size):
             batch_paths = paths[batch_start:batch_start + batch_size]
             images = []
-            valid_indices = []
+            batch_slots: list[np.ndarray | None] = [None] * len(batch_paths)
+            valid_positions: list[int] = []
 
             for i, path in enumerate(batch_paths):
                 if self._model is None:
@@ -228,10 +229,14 @@ class NemotronService:
                 try:
                     img = Image.open(path).convert("RGB")
                     images.append(img)
-                    valid_indices.append(batch_start + i)
+                    valid_positions.append(i)
                 except Exception as exc:
                     logger.error("Failed to open %s: %s", path, exc)
-                    results.append(np.zeros((0, self.target_dim), dtype=np.float32))
+                    # Slot stays None -> zero placeholder IN POSITION below.
+                    # (Appending the placeholder to `results` here, before the
+                    # batch's real embeddings, shifted every earlier page onto
+                    # the wrong embedding — pages stored a NEIGHBOR's vectors
+                    # with self-consistent blobs no check could catch.)
 
             if images:
                 with torch.no_grad():
@@ -247,11 +252,17 @@ class NemotronService:
                                 "Token pooling failed (continuing without): %s", exc,
                             )
 
-                    for emb_tensor in embeddings:
+                    for pos, emb_tensor in zip(valid_positions, embeddings):
                         # emb_tensor: (K, native_dim) — project to target_dim
                         arr = emb_tensor.to(torch.float32).cpu().numpy()
                         arr = self._project(arr)
-                        results.append(arr)
+                        batch_slots[pos] = arr
+
+            for slot in batch_slots:
+                results.append(
+                    slot if slot is not None
+                    else np.zeros((0, self.target_dim), dtype=np.float32)
+                )
 
             # Report progress
             done = min(batch_start + batch_size, total)

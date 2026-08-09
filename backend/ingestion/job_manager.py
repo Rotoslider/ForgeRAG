@@ -745,6 +745,27 @@ class JobManager:
         await self._prune_job_logs(job_id)
 
     async def complete(self, job_id: str) -> None:
+        # A Stop acknowledged after the job's last cooperative checkpoint
+        # used to be silently overwritten here: the run loop had already
+        # exited, complete() wrote "completed", and task cleanup discarded
+        # the cancel flag — the stop vanished without a trace. The work DID
+        # finish (there was nothing left to interrupt), so record completed
+        # but keep the stop visible instead of pretending it never happened.
+        if job_id in self._cancel_requested:
+            self._cancel_requested.discard(job_id)
+            logger.info(
+                "Job %s: stop was requested after the final checkpoint — "
+                "work had already finished; recording completed", job_id,
+            )
+            await self.update(
+                job_id,
+                status="completed",
+                current_step="done",
+                progress_pct=100.0,
+                current_item="stop requested after work finished",
+            )
+            await self._prune_job_logs(job_id)
+            return
         await self.update(
             job_id,
             status="completed",

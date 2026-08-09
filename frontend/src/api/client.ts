@@ -443,7 +443,10 @@ export interface AnswerResult {
   } | null;
 }
 
-export const searchAnswer = (query: string, limit = 5, search_mode = "semantic") =>
+// "auto" = the backend's full retrieval path (hybrid RRF + visual + rerank,
+// with keyword fallback when embeddings are down). The old hardcoded
+// "semantic" default silently bypassed all of that and 503'd on outages.
+export const searchAnswer = (query: string, limit = 5, search_mode = "auto") =>
   request<AnswerResult>("/search/answer", {
     method: "POST",
     body: JSON.stringify({ query, limit, search_mode }),
