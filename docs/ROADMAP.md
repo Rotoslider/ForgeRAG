@@ -43,6 +43,16 @@ weld-fitting query.
 - **Cost:** hours of Cypher + one review session. Zero LLM. **Full era
   re-extraction remains the nuclear option and is NOT justified** (the depth
   sample showed parity on real designations).
+- **Design refinement (2026-08, after extracting 306 candidates):** degree
+  alone conflates two populations needing different remedies. "steel"
+  (5,556 pages) is a useless retrieval discriminator but so is deleting it
+  wrong; "water"/"air" are not engineering entities at all. Therefore two
+  verdicts: **DELETE** (not a real entity) and **STOP-TIER** (real but
+  ubiquitous — kept, marked `e.noise_tier = 'stop'`, excluded from query
+  expansion and graph_first seeding; reversible, no per-query degree
+  computation). Review executed by Genesis (researcher Choom) with human/
+  assistant veto before any write. Status: candidate list extracted;
+  briefing prepared.
 
 ### N2. Extraction-time noise valve — future ingests
 - Validator rejects standalone generic-noun entities (blocklist from N1 +
@@ -73,7 +83,32 @@ one-human instrument.
 
 ## NEXT (the real 1M-page gate: ingestion throughput)
 
-### T1. vLLM serving for the extractor — the single cheapest big win
+### T1. Batched LLM serving for the extractor — the single cheapest big win
+*(Amended after the shared-GPU discussion: one card serves Whisper,
+Chatterbox, Stable Diffusion, the Chooms, and ForgeRAG.)*
+
+**Step 0 — llama-server first.** LM Studio is llama.cpp underneath but
+serves requests one at a time. Running `llama-server` directly with
+`--parallel 8` and a larger context gives continuous batching on the SAME
+GGUF file already on disk — zero new downloads, LM-Studio-like memory
+behavior, one-evening benchmark. If this yields 2-3x, vLLM may never be
+needed.
+
+**Step 1 — vLLM as campaign mode, not a resident.** Facts that matter on a
+shared GPU: one vLLM instance serves ONE model to any number of clients
+(ForgeRAG and the Qwen Chooms would share the same endpoint — you never run
+two copies of Qwen); it is OpenAI-compatible, so both clients change only a
+URL; but it PRE-ALLOCATES VRAM (gpu_memory_utilization, default 0.9) and
+does not idle-unload, so a resident vLLM competes with SD/Whisper/TTS all
+day; and it prefers AWQ/GPTQ/FP8 quants (GGUF support is second-class), so
+expect one new quant download. Sleep/wake endpoints exist for VRAM
+handoffs but are manual orchestration. Conclusion: run vLLM as a
+**campaign profile** — during heavy ingestion, stop LM Studio, start vLLM
+with the extractor model, point ForgeRAG AND the Qwen-based Chooms at it,
+raise max_concurrent_requests to 8-12 and ingest parallelism to match;
+swap back when the campaign ends. A systemd profile pair makes the swap
+one command. Non-Qwen Chooms (Gemma) either idle during campaigns or stay
+on a slimmed LM Studio if VRAM allows.
 At 8–10 s/page of entity extraction, 900k new pages ≈ **100+ days of GPU
 nights**. Storage is not the 1M gate; this is.
 
@@ -85,7 +120,13 @@ nights**. Storage is not the 1M gate; this is.
 - Verify structured-output (JSON schema) support for the chosen model under
   vLLM before switching; keep LM Studio as the fallback profile.
 
-### T2. Plane policy per collection
+### T2. Plane policy per collection — DECLINED by owner (2026-08)
+Owner's call: the deferred-entity hit is not worth the later repayment;
+every ingested document gets the full treatment at ingest time. Kept here
+because the math may change (a 5x faster extractor makes this moot; a 10x
+corpus growth spike revives it). Superseded in priority by T1.
+
+*(Original proposal below for the record.)*
 Not every document deserves every plane. Proposal:
 
 | Tier | Planes | Example collections |
@@ -141,12 +182,10 @@ RRF + reranker.
 rsync-style file sync, and Qdrant snapshots once L1 lands. Trigger: before
 the library doubles again.
 
-### L4. Eval harness as a repo fixture
-The 27-question audited battery + answer key currently lives in scratch.
-Move to `scripts/eval/`, runnable after any material change (model swap,
-Docling bump, L1 migration). The Choom-executed variant doubles as an
-integration test of the skills path. Cheap insurance against silent
-regressions during every migration above.
+### L4. Eval harness as a repo fixture — DONE (2026-08)
+Frozen at `scripts/eval/`: the 45-test battery, the agent-pasteable
+question set, and the page-grounded answer key. Run after any material
+change; diff JSONL outputs between runs.
 
 ---
 
@@ -186,8 +225,10 @@ recall gain. Revisit only alongside a step-change in local extractor quality
   re-prices T1/T2/R3 at once; re-evaluate the tier policy each major local
   model generation.
 - **Neo4j vector quantization maturity** — could extend the L1 trigger
-  outward; verify against the running Neo4j version before committing to
-  the sidecar.
+  outward. Checked 2026-08: running 5.26.28 Community (LTS line — current
+  and supported; vector quantization landed in the 2025.x series, NOT in
+  5.26). Re-check when considering L1: upgrading Neo4j vs adding Qdrant is
+  the actual fork.
 - **Handwritten material** (the 1980s notes from v1): Docling will not OCR
   handwriting well, but the pixel plane + VLM answer mode reads handwritten
   pages natively. If that corpus returns, it enters as an Archive-tier
