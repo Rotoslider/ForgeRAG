@@ -409,6 +409,40 @@ class GraphBuilder:
             )
             counts["topic_tags"] = len(tags)
 
+        # ---- Page mention edges, direct from the entity lists -----------
+        # Every entity this page extracted gets its MENTIONS edge HERE,
+        # keyed by the exact normalized name we just MERGEd — guaranteed
+        # string match. The model's relationships list used to be the ONLY
+        # source of these edges, and its object strings routinely differ
+        # from the entity-list spellings ("MIL-DTL-46593B" vs "...B(U)"):
+        # the node landed, the rel row was silently dropped by its MATCH,
+        # and the page ended up stamped with entities "written" but zero
+        # relationships — deterministically re-flagged as suspicious and
+        # re-paid by every drain, forever (live: Ballistics p155).
+        mention_specs = [
+            ("MENTIONS_MATERIAL", "Material", "name",
+             [r["name"] for r in mat_rows]),
+            ("DESCRIBES_PROCESS", "Process", "name",
+             [r["name"] for r in proc_rows]),
+            ("REFERENCES_STANDARD", "Standard", "code",
+             [r["code"] for r in std_rows]),
+            ("MENTIONS_EQUIPMENT", "Equipment", "name",
+             [r["name"] for r in eq_rows]),
+        ]
+        for rel_name, label, pk, names in mention_specs:
+            if not names:
+                continue
+            await self.neo4j.run_write(
+                f"""
+                UNWIND $names AS n
+                MATCH (p:Page {{page_id: $page_id}})
+                MATCH (e:{label} {{{pk}: n}})
+                MERGE (p)-[r:{rel_name}]->(e)
+                ON CREATE SET r.support_count = 1
+                """,
+                {"page_id": page_id, "names": names},
+            )
+
         # ---- Relationships -----------------------------------------------
         # The per-type writes are separate transactions; a mid-loop failure
         # would leave the page with SOME entity rels — a state every repair
@@ -481,9 +515,24 @@ class GraphBuilder:
                 ON CREATE SET r.context = row.context, r.support_count = 1
                 ON MATCH SET  r.context = coalesce(r.context, row.context),
                               r.support_count = coalesce(r.support_count, 0) + 1
+                RETURN count(r) AS n
             """
-            await self.neo4j.run_write(cypher, {"page_id": page_id, "rows": rows})
-            written += len(rows)
+            res = await self.neo4j.run_write(
+                cypher, {"page_id": page_id, "rows": rows}
+            )
+            # Count what the MATCH let through — a row whose target_name
+            # matches no entity node is silently dropped, and counting
+            # len(rows) reported phantom relationships.
+            actual = res[0]["n"] if res else 0
+            if actual < len(rows):
+                logger.info(
+                    "%d of %d %s rel(s) dropped for page %s — relationship "
+                    "object names matched no %s node (the direct mention "
+                    "edges from the entity lists still cover the page)",
+                    len(rows) - actual, len(rows), rel_name, page_id,
+                    target_label,
+                )
+            written += actual
         return written
 
     async def _write_entity_rels(self, rels: list[Relationship]) -> int:

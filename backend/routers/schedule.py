@@ -61,6 +61,11 @@ async def put_watch(request: Request, payload: dict) -> ForgeResult:
     sched = request.app.state.scheduler
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail="body must be an object")
+    # Same confinement as /browse — the scanner MOVES files out of the
+    # watch path, so pointing it at an arbitrary directory must not be
+    # possible on an unauthenticated API.
+    if payload.get("path"):
+        _confine(Path(str(payload["path"])).expanduser(), sched)
     try:
         await sched.update_watch(payload)
     except ValueError as exc:
@@ -70,13 +75,43 @@ async def put_watch(request: Request, payload: dict) -> ForgeResult:
     })
 
 
+# Directory-picker confinement: the API has no auth and (by deliberate
+# choice) binds beyond localhost so local agents can use it, so the browse
+# endpoint must not enumerate the whole filesystem. Books live in the home
+# directory (Downloads subfolders) and on external drives — allow exactly
+# those roots plus the data dir.
+def _browse_roots(sched) -> list[Path]:
+    return [
+        Path.home().resolve(),
+        Path("/media"),
+        Path("/mnt"),
+        sched.default_watch_path().parent.resolve(),
+    ]
+
+
+def _confine(base: Path, sched) -> Path:
+    resolved = base.resolve()
+    for root in _browse_roots(sched):
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            continue
+    raise HTTPException(
+        status_code=403,
+        detail="browsing is limited to the home directory, external "
+        "drives (/media, /mnt), and the data directory",
+    )
+
+
 @router.get("/browse")
 async def browse_directories(
     request: Request,
     path: str | None = Query(None, description="Directory to list; omit for a sensible start"),
 ) -> ForgeResult:
     """List subdirectories of a server-side folder — the GUI's folder
-    picker for choosing the watch inbox. Directories only, no files."""
+    picker for choosing the watch inbox. Directories only, no files.
+    Confined to the home directory, external drives, and the data dir."""
     sched = request.app.state.scheduler
     if path:
         base = Path(path).expanduser()
@@ -85,7 +120,7 @@ async def browse_directories(
     else:
         base = sched.default_watch_path().parent
     try:
-        base = base.resolve()
+        base = _confine(base, sched)
     except OSError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not base.is_dir():
