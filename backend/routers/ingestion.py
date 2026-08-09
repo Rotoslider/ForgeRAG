@@ -225,7 +225,7 @@ async def cancel_job(job_id: str, request: Request) -> ForgeResult:
 RESTARTABLE_JOB_TYPES = {
     "ingest", "fill-missing", "extract-entities", "rebuild-chunks",
     "re-embed", "text-reembed", "resummarize", "autotag",
-    "build-communities",
+    "build-communities", "build-summaries",
 }
 
 
@@ -266,6 +266,8 @@ def _build_restart_coro(pipeline, new_job_id: str, job):
         return pipeline.run_autotag_missing(new_job_id)
     if jt == "build-communities":
         return pipeline.run_communities_only(new_job_id)
+    if jt == "build-summaries" and doc_id:
+        return pipeline.run_build_summaries(new_job_id, doc_id)
     return None
 
 
@@ -300,7 +302,7 @@ async def restart_job(job_id: str, request: Request) -> ForgeResult:
             "(uploads were cleaned) — re-upload the PDF instead",
         )
     if job.job_type in ("fill-missing", "extract-entities", "rebuild-chunks",
-                        "re-embed", "text-reembed") and not job.doc_id:
+                        "re-embed", "text-reembed", "build-summaries") and not job.doc_id:
         raise HTTPException(
             status_code=409,
             detail="Job has no doc_id recorded — it failed before touching "

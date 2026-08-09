@@ -397,6 +397,228 @@ class IngestionPipeline:
                 await self.jobs.update_step(job_id, step, "error", detail=str(exc))
             await self.jobs.fail(job_id, str(exc))
 
+    async def run_build_summaries(self, job_id: str, doc_id: str) -> None:
+        """Build the RAPTOR-by-TOC section-summary tree for one document.
+
+        Bottom-up LLM summaries over the Docling section structure (leaf
+        sections -> chapters -> whole document), embedded and stored as
+        :SectionSummary nodes with PARENT_OF edges and page ranges.
+        Idempotent per doc: existing summaries are replaced wholesale.
+        Stamps d.summaries_built_at only when every summary landed
+        (count-verified) so the audit never treats a partial tree as done.
+        """
+        from backend.ingestion.toc_summarizer import (
+            TocSummarizer,
+            build_section_tree,
+            iter_nodes_bottom_up,
+            summary_id,
+        )
+
+        current_job_id.set(job_id)
+        step = None
+        try:
+            await self.jobs.checkpoint(job_id)
+            await self.jobs.set_steps(job_id, [
+                "loading_chunks", "summarizing_sections",
+                "embedding_summaries", "writing_summaries",
+            ])
+            if self.llm is None or self.text_embedding is None:
+                raise ValueError(
+                    "LLM and text-embedding services are required to build "
+                    "summaries"
+                )
+            rows = await self.neo4j.run_query(
+                "MATCH (d:Document {doc_id: $d}) "
+                "RETURN d.title AS title, d.file_hash AS h",
+                {"d": doc_id},
+            )
+            if not rows:
+                raise ValueError(f"Document {doc_id} not found")
+            title = rows[0]["title"] or doc_id
+
+            step = "loading_chunks"
+            await self.jobs.update(
+                job_id, status="processing", doc_id=doc_id,
+                file_hash=rows[0]["h"], current_step="loading_chunks",
+                progress_pct=2.0,
+            )
+            await self.jobs.update_step(job_id, "loading_chunks", "running")
+            chunks = await self.neo4j.run_query(
+                """
+                MATCH (d:Document {doc_id: $d})-[:HAS_PAGE]->(:Page)
+                      -[:HAS_CHUNK]->(c:Chunk)
+                RETURN c.section_path AS section_path,
+                       c.page_number AS page_number,
+                       c.summary AS summary, c.chunk_type AS chunk_type,
+                       left(c.text, 600) AS text
+                ORDER BY c.page_number, c.chunk_index
+                """,
+                {"d": doc_id}, timeout=300.0,
+            )
+            if not chunks:
+                raise ValueError(
+                    f"Document {doc_id} has no chunks — build chunks first "
+                    "(summaries are rolled up from chunk summaries)"
+                )
+            root = build_section_tree(title, chunks)
+            await self.jobs.update_step(
+                job_id, "loading_chunks", "done",
+                detail=f"{len(chunks)} chunks into section tree",
+            )
+
+            step = "summarizing_sections"
+            nodes = list(iter_nodes_bottom_up(root))
+            await self.jobs.update(
+                job_id, current_step="summarizing_sections",
+                progress_pct=8.0, pages_total=len(nodes), pages_processed=0,
+            )
+            await self.jobs.update_step(
+                job_id, "summarizing_sections", "running",
+                detail=f"{len(nodes)} sections via LLM",
+            )
+            summarizer = TocSummarizer(self.llm)
+            done = 0
+
+            # summarize_tree walks bottom-up itself; we wrap its checkpoint
+            # to also report progress.
+            async def _progress_checkpoint():
+                nonlocal done
+                await self.jobs.checkpoint(job_id)
+                done += 1
+                if done % 5 == 0 or done >= len(nodes):
+                    await self.jobs.update(
+                        job_id, pages_processed=min(done, len(nodes)),
+                        progress_pct=min(80.0, 8.0 + 72.0 * done / max(len(nodes), 1)),
+                    )
+
+            n_summarized = await summarizer.summarize_tree(
+                title, root, checkpoint=_progress_checkpoint,
+            )
+            filled = [n for n in nodes if n.summary]
+            if not filled:
+                raise RuntimeError(
+                    "summarization produced no section summaries — see "
+                    "per-call log warnings; document remains unstamped"
+                )
+            await self.jobs.update_step(
+                job_id, "summarizing_sections", "done",
+                detail=f"{n_summarized} section summaries",
+            )
+
+            step = "embedding_summaries"
+            await self.jobs.update(
+                job_id, current_step="embedding_summaries", progress_pct=82.0,
+            )
+            await self.jobs.update_step(job_id, "embedding_summaries", "running")
+            assert self.gpu is not None
+            async with self.gpu.load_scope("text_embedding"):
+                vectors = await asyncio.to_thread(
+                    self.text_embedding.embed_documents,
+                    [n.summary for n in filled],
+                    batch_size=self.settings.ingestion.text_embedding_batch_size,
+                )
+            await self.jobs.update_step(
+                job_id, "embedding_summaries", "done",
+                detail=f"{len(vectors)} vectors",
+            )
+
+            step = "writing_summaries"
+            await self.jobs.update(
+                job_id, current_step="writing_summaries", progress_pct=90.0,
+            )
+            await self.jobs.update_step(job_id, "writing_summaries", "running")
+            # Self-ensure schema (seed_schema is a manual script; a fresh
+            # install must not need it before this job works).
+            await self.neo4j.run_write(
+                "CREATE CONSTRAINT summary_id_unique IF NOT EXISTS "
+                "FOR (s:SectionSummary) REQUIRE s.summary_id IS UNIQUE"
+            )
+            await self.neo4j.run_write(
+                f"""CREATE VECTOR INDEX section_summary_embedding IF NOT EXISTS
+                FOR (s:SectionSummary) ON (s.embedding)
+                OPTIONS {{ indexConfig: {{
+                    `vector.dimensions`: {self.settings.models.text_embedding_dim},
+                    `vector.similarity_function`: 'cosine'
+                }} }}"""
+            )
+            # Replace wholesale — the tree is derived data.
+            await self.neo4j.run_write(
+                "MATCH (d:Document {doc_id: $d})-[:HAS_SUMMARY]->(s:SectionSummary) "
+                "DETACH DELETE s",
+                {"d": doc_id},
+            )
+            srows = []
+            for node, vec in zip(filled, vectors):
+                srows.append({
+                    "summary_id": summary_id(doc_id, node.path),
+                    "parent_id": (
+                        summary_id(doc_id, node.path[:-1]) if node.path else None
+                    ),
+                    "path": list(node.path),
+                    "title": node.title,
+                    "level": node.level,
+                    "summary": node.summary,
+                    "page_start": node.page_start,
+                    "page_end": node.page_end,
+                    "embedding": vec.tolist(),
+                })
+            await self.neo4j.run_write(
+                """
+                UNWIND $rows AS row
+                MATCH (d:Document {doc_id: $d})
+                MERGE (s:SectionSummary {summary_id: row.summary_id})
+                SET s.doc_id = $d, s.path = row.path, s.title = row.title,
+                    s.level = row.level, s.summary = row.summary,
+                    s.page_start = row.page_start, s.page_end = row.page_end,
+                    s.embedding = row.embedding
+                MERGE (d)-[:HAS_SUMMARY]->(s)
+                """,
+                {"d": doc_id, "rows": srows},
+            )
+            await self.neo4j.run_write(
+                """
+                UNWIND $rows AS row
+                WITH row WHERE row.parent_id IS NOT NULL
+                MATCH (p:SectionSummary {summary_id: row.parent_id})
+                MATCH (s:SectionSummary {summary_id: row.summary_id})
+                MERGE (p)-[:PARENT_OF]->(s)
+                """,
+                {"rows": srows},
+            )
+            # Count-verify before stamping (house rule: never stamp
+            # shrunken coverage as final).
+            wrote = await self.neo4j.run_query(
+                "MATCH (d:Document {doc_id: $d})-[:HAS_SUMMARY]->(s) "
+                "RETURN count(s) AS n",
+                {"d": doc_id},
+            )
+            actually = wrote[0]["n"] if wrote else 0
+            if actually != len(srows):
+                await self.jobs.update_step(
+                    job_id, "writing_summaries", "warning",
+                    detail=f"{len(srows) - actually} of {len(srows)} summary "
+                    "rows dropped — summaries_built_at NOT stamped",
+                )
+            else:
+                await self.neo4j.run_write(
+                    "MATCH (d:Document {doc_id: $d}) "
+                    "SET d.summaries_built_at = datetime()",
+                    {"d": doc_id},
+                )
+                await self.jobs.update_step(
+                    job_id, "writing_summaries", "done",
+                    detail=f"{actually} summaries written",
+                )
+            await self.jobs.complete(job_id)
+            logger.info(
+                "Summary tree built for doc %s: %d sections", doc_id, actually,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Build-summaries job %s failed", job_id)
+            if step is not None:
+                await self.jobs.update_step(job_id, step, "error", detail=str(exc))
+            await self.jobs.fail(job_id, str(exc))
+
     async def run_communities_only(self, job_id: str) -> None:
         """Rebuild all :Community nodes globally from the current graph.
 

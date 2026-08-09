@@ -4,6 +4,7 @@ import { useMutation } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
 import {
   searchSemantic,
+  searchSummaries,
   searchVisual,
   searchHybrid,
   searchKeyword,
@@ -14,7 +15,7 @@ import {
 import type { SearchHit, CommunityHit, HybridStrategy } from "../api/types";
 import type { AnswerResult } from "../api/client";
 
-type Mode = "semantic" | "keyword" | "visual" | "hybrid" | "answer";
+type Mode = "semantic" | "summary" | "keyword" | "visual" | "hybrid" | "answer";
 
 // localStorage keys for last-search persistence. URL params cover the
 // common case (same-tab navigation), but clicking the sidebar "Search"
@@ -126,6 +127,8 @@ function SearchInner() {
       let result;
       if (mode === "semantic") {
         result = await searchSemantic(query, limit);
+      } else if (mode === "summary") {
+        result = await searchSummaries(query, limit);
       } else if (mode === "keyword") {
         result = await searchKeyword(query, limit);
       } else if (mode === "visual") {
@@ -228,6 +231,7 @@ function SearchInner() {
             <option value="visual">Visual (ColPali page retrieval)</option>
             <optgroup label="Advanced">
               <option value="semantic">Semantic (text vectors)</option>
+              <option value="summary">Summary (TOC zoom-out)</option>
               <option value="hybrid">Hybrid (graph-aware)</option>
             </optgroup>
           </select>

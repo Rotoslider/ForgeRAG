@@ -719,6 +719,70 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
     )
 
 
+@router.post("/summaries")
+async def summary_search(body: SemanticSearchRequest, request: Request) -> ForgeResult:
+    """RAPTOR-by-TOC summary search — retrieval at section/chapter/document
+    abstraction levels instead of page level.
+
+    Queries the section_summary_embedding index over the hierarchical
+    summary trees built by the build-summaries job. Use this for zoom-out
+    questions ("what does this book cover", "which volume treats fatigue
+    most deeply", "summarize the welding handbook's take on preheat")
+    where page-level retrieval returns needles instead of the haystack's
+    shape. Hits are page-hit shaped: page_number is the section's first
+    page, the snippet is the section summary, and the image links open the
+    section's first page.
+    """
+    text_emb = getattr(request.app.state, "text_embedding", None)
+    neo4j = request.app.state.neo4j
+    if text_emb is None:
+        raise HTTPException(503, "Text embedding service not available")
+
+    gpu = request.app.state.gpu
+    async with gpu.load_scope("text_embedding"):
+        query_vec = await asyncio.to_thread(text_emb.embed_query, body.query)
+
+    rows = await neo4j.run_query(
+        """
+        CALL db.index.vector.queryNodes('section_summary_embedding', $topk, $vec)
+        YIELD node AS s, score
+        MATCH (d:Document)-[:HAS_SUMMARY]->(s)
+        RETURN s.summary_id AS summary_id, s.path AS path, s.title AS title,
+               s.level AS level, s.summary AS summary,
+               s.page_start AS page_start, s.page_end AS page_end,
+               d.doc_id AS doc_id, d.title AS document_title,
+               d.filename AS filename, d.file_hash AS file_hash,
+               score
+        ORDER BY score DESC
+        LIMIT $limit
+        """,
+        {"topk": max(body.limit * 3, 15), "vec": query_vec.tolist(),
+         "limit": body.limit},
+    )
+    hits = []
+    for r in rows:
+        pn = r["page_start"] or 1
+        hits.append({
+            "page_id": r["summary_id"],  # stable id; not a real page node
+            "doc_id": r["doc_id"],
+            "document_title": r["document_title"],
+            "filename": r["filename"],
+            "page_number": pn,
+            "score": float(r["score"]),
+            "text_snippet": (
+                f"[{' / '.join(r['path']) or 'Whole document'} — "
+                f"pages {r['page_start']}–{r['page_end']}] {r['summary']}"
+            )[:1200],
+            "image_url": f"/images/{r['file_hash']}/{pn}",
+            "reduced_image_url": f"/images/{r['file_hash']}/{pn}/reduced",
+            "section_path": r["path"],
+            "level": r["level"],
+            "page_start": r["page_start"],
+            "page_end": r["page_end"],
+        })
+    return ForgeResult(success=True, data=hits)
+
+
 @router.post("/semantic")
 async def semantic_search(body: SemanticSearchRequest, request: Request) -> ForgeResult:
     """Semantic text search via the chunk vector index.

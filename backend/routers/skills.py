@@ -158,6 +158,13 @@ async def manifest(request: Request) -> ForgeResult:
             "params": ["query", "strategy", "limit", "filters", "boost_weight", "rerank"],
         },
         {
+            "name": "search_summaries",
+            "description": "Search hierarchical TOC summaries (section/chapter/whole-document level) — for zoom-out questions about what books or chapters cover",
+            "endpoint": "/search/summaries",
+            "method": "POST",
+            "params": ["query", "limit"],
+        },
+        {
             "name": "graph_query",
             "description": "Run a predefined graph query template (material_standards, process_materials, etc.)",
             "endpoint": "/graph/query",

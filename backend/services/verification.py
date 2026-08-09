@@ -527,6 +527,24 @@ async def run_verification(neo4j, settings) -> dict:
         if rows else None,
     ))
 
+    # RAPTOR-by-TOC summary coverage: every chunked doc should carry its
+    # section-summary tree. Warn-level — new docs queue behind the LLM.
+    from backend.services.work_predicates import SUMMARIES_MISSING
+    rows = await q(f"""
+        MATCH (d:Document)
+        WHERE {SUMMARIES_MISSING}
+        RETURN d.doc_id AS id, d.title AS title LIMIT 1000
+    """)
+    checks.append(_check(
+        "docs_have_summaries",
+        "Every document with chunks has its TOC summary tree "
+        "(section/chapter/document-level summaries for zoom-out retrieval)",
+        len(rows), samples=rows[:SAMPLE],
+        status="warn" if rows else "pass",
+        detail="run POST /admin/build-missing-summaries to queue the "
+        "builder" if rows else None,
+    ))
+
     # ------------------------------------------------------------- indexes
     idx_rows = await q(
         "SHOW INDEXES YIELD name, state, type, options "
@@ -537,6 +555,7 @@ async def run_verification(neo4j, settings) -> dict:
         "page_doc_number", "document_title", "chunk_page_number", "chunk_type",
         "page_text_fulltext", "chunk_text_fulltext", "entity_name_fulltext",
         "page_text_embedding", "chunk_embedding", "community_summary_embedding",
+        "section_summary_embedding",
     ]
     idx_problems = [
         {"index": name,
@@ -560,6 +579,7 @@ async def run_verification(neo4j, settings) -> dict:
         "page_text_embedding": settings.models.text_embedding_dim,
         "chunk_embedding": settings.models.text_embedding_dim,
         "community_summary_embedding": settings.models.text_embedding_dim,
+        "section_summary_embedding": settings.models.text_embedding_dim,
     }
     dim_problems = []
     for name, want in expected_dims.items():

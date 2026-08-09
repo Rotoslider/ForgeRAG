@@ -139,6 +139,45 @@ async def extract_missing_entities(request: Request) -> ForgeResult:
     })
 
 
+@router.post("/build-missing-summaries")
+async def build_missing_summaries(request: Request) -> ForgeResult:
+    """Queue the RAPTOR-by-TOC summary builder for every chunked document
+    without a summary tree. Server-side twin of the docs_have_summaries
+    verification check. Long-running LLM work — jobs drain in the
+    background, resumable, one per doc."""
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    from backend.services.work_predicates import SUMMARIES_MISSING
+
+    docs = await neo4j.run_query(
+        f"""
+        MATCH (d:Document)
+        WHERE {SUMMARIES_MISSING}
+        RETURN d.doc_id AS doc_id, d.filename AS filename
+        ORDER BY d.title
+        """,
+        timeout=600.0,
+    )
+    if not docs:
+        return ForgeResult(success=True, data={"queued": 0,
+                                               "reason": "nothing missing"})
+    queued = []
+    for r in docs:
+        job = await jobs.create(
+            source_path=f"(build-summaries of {r['doc_id']})",
+            filename=r["filename"], categories=[], tags=[],
+            job_type="build-summaries", doc_id=r["doc_id"], params={},
+        )
+        jobs.spawn(job.job_id, pipeline.run_build_summaries(
+            job.job_id, r["doc_id"],
+        ))
+        queued.append({"doc_id": r["doc_id"], "job_id": job.job_id})
+    logger.info("Queued summary builder: %d docs", len(queued))
+    return ForgeResult(success=True, data={"queued": len(queued), "jobs": queued})
+
+
 @router.post("/reextract-suspicious-empties")
 async def reextract_suspicious_empties(request: Request) -> ForgeResult:
     """Re-check dense pages stamped extracted-with-nothing.

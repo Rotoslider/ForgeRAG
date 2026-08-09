@@ -51,6 +51,14 @@ ENTITY_SUSPICIOUS_EMPTY = (
     f"AND NOT EXISTS {{ (p)-[:{ENTITY_PAGE_RELS}]->() }}"
 )
 
+# Documents the TOC-summary builder should process: has chunks (the tree is
+# built from chunk summaries) and no summaries stamp. Binds `d`, not `p` —
+# summary coverage is a document-level property.
+SUMMARIES_MISSING = (
+    "EXISTS { (d)-[:HAS_PAGE]->(:Page)-[:HAS_CHUNK]->(:Chunk) } "
+    "AND d.summaries_built_at IS NULL"
+)
+
 # Pages text embedding should process: has text, embedding absent entirely.
 # (Wrong-dimension embeddings are a separate, destructive re-embed path and
 # a separate verification check.)

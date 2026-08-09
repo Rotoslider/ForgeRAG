@@ -52,6 +52,9 @@ CONSTRAINTS: list[str] = [
     "CREATE CONSTRAINT equipment_name_unique IF NOT EXISTS "
     "FOR (e:Equipment) REQUIRE e.name IS UNIQUE",
 
+    "CREATE CONSTRAINT summary_id_unique IF NOT EXISTS "
+    "FOR (s:SectionSummary) REQUIRE s.summary_id IS UNIQUE",
+
     "CREATE CONSTRAINT community_id_unique IF NOT EXISTS "
     "FOR (c:Community) REQUIRE c.community_id IS UNIQUE",
 
@@ -142,6 +145,15 @@ def vector_indexes(dim: int) -> list[str]:
 
         f"""CREATE VECTOR INDEX community_summary_embedding IF NOT EXISTS
            FOR (c:Community) ON (c.summary_embedding)
+           OPTIONS {{ indexConfig: {{
+               `vector.dimensions`: {dim},
+               `vector.similarity_function`: 'cosine'
+           }} }}""",
+
+        # RAPTOR-by-TOC hierarchical section summaries (leaf sections up to
+        # whole-document roots) — retrieval at any abstraction level.
+        f"""CREATE VECTOR INDEX section_summary_embedding IF NOT EXISTS
+           FOR (s:SectionSummary) ON (s.embedding)
            OPTIONS {{ indexConfig: {{
                `vector.dimensions`: {dim},
                `vector.similarity_function`: 'cosine'

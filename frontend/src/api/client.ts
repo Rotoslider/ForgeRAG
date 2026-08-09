@@ -421,6 +421,15 @@ export const searchSemantic = (query: string, limit = 10) =>
     body: JSON.stringify({ query, limit }),
   });
 
+// RAPTOR-by-TOC summary search — section/chapter/document-level zoom-out.
+// Hits are page-hit shaped (snippet = section summary, page = section's
+// first page) so the standard result cards render them unchanged.
+export const searchSummaries = (query: string, limit = 10) =>
+  request<SearchHit[]>("/search/summaries", {
+    method: "POST",
+    body: JSON.stringify({ query, limit }),
+  });
+
 export const searchKeyword = (query: string, limit = 20) =>
   request<SearchHit[]>("/search/keyword", {
     method: "POST",
