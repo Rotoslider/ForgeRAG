@@ -4,6 +4,7 @@ watch-folder scanning, and the /schedule endpoints."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -296,8 +297,10 @@ async def test_put_watch_and_scan_now(api, tmp_path):
     assert r.status_code == 200
     assert r.json()["data"]["queued"] == 1
 
+    # Outside the allowed roots (home, /media, /mnt, data dir) -> 403 from
+    # the confinement guard, before any exists/is_dir validation.
     r = await client.put("/schedule/watch", json={"enabled": True, "path": "/nope"})
-    assert r.status_code == 400
+    assert r.status_code == 403
 
 
 # ----------------------------------------------------- subfolders / browse
@@ -323,12 +326,14 @@ async def test_watch_scan_recurses_and_preserves_structure(scheduler):
 
 
 @pytest.mark.asyncio
-async def test_browse_endpoint_lists_directories(api, tmp_path):
+async def test_browse_endpoint_lists_directories(api, tmp_path, monkeypatch):
     client, _ = api
     (tmp_path / "alpha").mkdir()
     (tmp_path / "beta").mkdir()
     (tmp_path / ".hidden").mkdir()
     (tmp_path / "file.txt").write_text("x")
+    # Confinement allows the home directory — point home at the tmp tree.
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
 
     r = await client.get("/schedule/browse", params={"path": str(tmp_path)})
     assert r.status_code == 200
@@ -338,6 +343,14 @@ async def test_browse_endpoint_lists_directories(api, tmp_path):
 
     r = await client.get("/schedule/browse", params={"path": str(tmp_path / "nope")})
     assert r.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_browse_endpoint_refuses_paths_outside_roots(api):
+    client, _ = api
+    # /etc is outside home, /media, /mnt, and the data dir.
+    r = await client.get("/schedule/browse", params={"path": "/etc"})
+    assert r.status_code == 403
 
 
 @pytest.mark.asyncio
