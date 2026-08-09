@@ -162,7 +162,10 @@ async def manifest(request: Request) -> ForgeResult:
             "description": "Run a predefined graph query template (material_standards, process_materials, etc.)",
             "endpoint": "/graph/query",
             "method": "POST",
-            "params": ["template", "params", "limit"],
+            # Field names MUST match models/graph.py GraphQueryRequest —
+            # the old advertised names (template/params) 422'd every
+            # manifest-following client.
+            "params": ["query_type", "parameters", "limit"],
         },
         {
             "name": "list_documents",
