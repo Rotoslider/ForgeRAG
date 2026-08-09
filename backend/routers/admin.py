@@ -140,25 +140,37 @@ async def extract_missing_entities(request: Request) -> ForgeResult:
 
 
 @router.post("/build-missing-summaries")
-async def build_missing_summaries(request: Request) -> ForgeResult:
+async def build_missing_summaries(
+    request: Request, payload: dict | None = None
+) -> ForgeResult:
     """Queue the RAPTOR-by-TOC summary builder for every chunked document
     without a summary tree. Server-side twin of the docs_have_summaries
     verification check. Long-running LLM work — jobs drain in the
-    background, resumable, one per doc."""
+    background, resumable, one per doc.
+
+    Body (optional): {"doc_ids": [...]} to scope the queue to specific
+    documents (still filtered by the missing-summaries predicate)."""
     neo4j = request.app.state.neo4j
     jobs = request.app.state.job_manager
     pipeline = request.app.state.pipeline
 
     from backend.services.work_predicates import SUMMARIES_MISSING
 
+    doc_filter = ""
+    params: dict = {}
+    wanted = (payload or {}).get("doc_ids") if isinstance(payload, dict) else None
+    if wanted:
+        doc_filter = "AND d.doc_id IN $ids "
+        params["ids"] = [str(x) for x in wanted]
+
     docs = await neo4j.run_query(
         f"""
         MATCH (d:Document)
-        WHERE {SUMMARIES_MISSING}
+        WHERE {SUMMARIES_MISSING} {doc_filter}
         RETURN d.doc_id AS doc_id, d.filename AS filename
         ORDER BY d.title
         """,
-        timeout=600.0,
+        params, timeout=600.0,
     )
     if not docs:
         return ForgeResult(success=True, data={"queued": 0,
