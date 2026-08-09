@@ -1205,7 +1205,12 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
         if entity_matcher is not None:
             try:
                 matches = await entity_matcher.find_matches_async(body.query)
-                for m in matches:
+                # The indexed matcher covers the FULL entity population, so
+                # it can legitimately return 50-150 matches on a wordy query
+                # — appending them all would balloon the Lucene query and
+                # drown the user's own terms. Take the strongest few; they
+                # are sorted by score.
+                for m in matches[:10]:
                     term = m.name.lower()
                     if term not in query_terms:
                         query_terms.append(term)
@@ -1335,7 +1340,12 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
         if entity_matcher is not None:
             try:
                 matches = await entity_matcher.find_matches_async(body.query)
-                for m in matches:
+                # The indexed matcher covers the FULL entity population, so
+                # it can legitimately return 50-150 matches on a wordy query
+                # — appending them all would balloon the Lucene query and
+                # drown the user's own terms. Take the strongest few; they
+                # are sorted by score.
+                for m in matches[:10]:
                     term = m.name.lower()
                     if term not in query_terms:
                         query_terms.append(term)

@@ -18,6 +18,7 @@ import asyncio
 import logging
 import re
 import time
+from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -68,6 +69,14 @@ class EntityMatcher:
         self._entities: list[_EntityEntry] = []
         self._last_refresh: float = 0.0
         self._refresh_interval: float = 300.0  # 5 minutes
+        # Indexes built by _build_index() after every refresh:
+        # exact normalized-name lookup, and a character-trigram inverted
+        # index for fuzzy candidate generation. Without them, matching was
+        # an O(entities x windows) SequenceMatcher scan whose 5s budget
+        # covered ~0.007% of a 276k-entity population (observed live) —
+        # fuzzy expansion had silently become a lottery.
+        self._by_norm: dict[str, list[int]] = {}
+        self._trigram: dict[str, list[int]] = {}
 
     @property
     def entity_count(self) -> int:
@@ -121,8 +130,28 @@ class EntityMatcher:
                     ))
 
         self._entities = entities
+        self._build_index()
         self._last_refresh = time.monotonic()
         logger.info("EntityMatcher refreshed: %d entity names loaded", len(entities))
+
+    @staticmethod
+    def _trigrams(s: str) -> set[str]:
+        if len(s) < 3:
+            return {s} if s else set()
+        return {s[i:i + 3] for i in range(len(s) - 2)}
+
+    def _build_index(self) -> None:
+        """Build the exact-normalized and trigram indexes over _entities."""
+        by_norm: dict[str, list[int]] = {}
+        trigram: dict[str, list[int]] = {}
+        for idx, e in enumerate(self._entities):
+            if not e.normalized:
+                continue
+            by_norm.setdefault(e.normalized, []).append(idx)
+            for g in self._trigrams(e.normalized):
+                trigram.setdefault(g, []).append(idx)
+        self._by_norm = by_norm
+        self._trigram = trigram
 
     async def _ensure_loaded(self) -> None:
         """Refresh if never loaded or stale."""
@@ -142,7 +171,16 @@ class EntityMatcher:
     })
 
     _MAX_WINDOWS = 25
-    _TIME_BUDGET = 5.0  # seconds
+    _TIME_BUDGET = 5.0  # safety net only — index-driven matching is ~ms
+    # Per-window cap on fuzzy candidates scored with SequenceMatcher. A
+    # 0.75-similar pair shares most of its trigrams, so ordering candidates
+    # by shared-trigram count and scoring the top slice is near-exhaustive
+    # for this threshold while bounding the work.
+    _MAX_CANDIDATES = 300
+    # Trigrams whose posting lists exceed this are too common to be
+    # discriminative ("ste" in a steels library) — skipped for candidate
+    # generation unless the window has no rarer trigram.
+    _HOT_TRIGRAM_CAP = 5000
 
     def find_matches(
         self,
@@ -151,19 +189,24 @@ class EntityMatcher:
     ) -> list[MatchResult]:
         """Find entity names that fuzzy-match tokens/windows in the query.
 
-        Strategy:
-        - Tokenize the query, filter noise words
-        - For each bigram and trigram window (and individual tokens >= 3 chars),
-          compare against known entity names using:
-          1. Normalized exact match (catches "inconel625" vs "Inconel® 625")
-          2. Containment check for abbreviations
-          3. SequenceMatcher ratio for candidates within reasonable length range
+        Strategy (index-driven — full coverage of the entity population):
+        - Tokenize the query, filter noise words, build token/bigram/trigram
+          windows.
+        - For each window: O(1) exact normalized lookup, then candidate
+          generation via the character-trigram inverted index (entities
+          sharing trigrams with the window, ranked by overlap), then the
+          same containment/SequenceMatcher scoring as before — but only
+          over the candidates instead of every entity in the graph.
 
-        Caps at _MAX_WINDOWS and bails after _TIME_BUDGET seconds.
-        Returns matches sorted by score descending.
+        Scoring semantics are unchanged from the linear version: exact
+        normalized match = 1.0, containment = min/max length ratio,
+        otherwise SequenceMatcher ratio; results >= threshold.
         """
         if not self._entities:
             return []
+        if not self._trigram and self._entities:
+            # Entities injected without refresh() (tests) — build lazily.
+            self._build_index()
 
         query_lower = query.lower()
         tokens = [
@@ -182,61 +225,73 @@ class EntityMatcher:
             windows.append(f"{tokens[i]} {tokens[i+1]} {tokens[i+2]}")
         if len(tokens) <= 5:
             windows.append(query_lower)
-
-        # Cap to avoid O(windows × entities) explosion on long queries
         if len(windows) > self._MAX_WINDOWS:
-            # Prefer shorter, more specific windows (individual tokens and
-            # short n-grams) — they're more likely to match entity names.
             windows.sort(key=len)
             windows = windows[: self._MAX_WINDOWS]
 
-        normalized_windows = [_normalize(w) for w in windows]
         deadline = time.monotonic() + self._TIME_BUDGET
 
-        for entry in self._entities:
-            best_score = 0.0
-            elen = len(entry.normalized)
-            if elen == 0:
+        def _record(idx: int, score: float) -> None:
+            entry = self._entities[idx]
+            existing = results.get(entry.name)
+            if existing is None or score > existing.score:
+                results[entry.name] = MatchResult(
+                    name=entry.name,
+                    entity_type=entry.entity_type,
+                    score=score,
+                )
+
+        for window in windows:
+            nw = _normalize(window)
+            wlen = len(nw)
+            if wlen == 0:
                 continue
 
-            for i, window in enumerate(windows):
-                nw = normalized_windows[i]
-                wlen = len(nw)
-                if wlen == 0:
+            # 1. Exact normalized match — O(1), score 1.0.
+            for idx in self._by_norm.get(nw, ()):
+                _record(idx, 1.0)
+
+            # 2. Candidate generation via trigram overlap.
+            grams = self._trigrams(nw)
+            postings = sorted(
+                (self._trigram.get(g, ()) for g in grams), key=len,
+            )
+            counts: Counter[int] = Counter()
+            used_any = False
+            for plist in postings:
+                if not plist:
                     continue
+                if len(plist) > self._HOT_TRIGRAM_CAP and used_any:
+                    continue  # too common to discriminate; rarer ones suffice
+                used_any = True
+                counts.update(plist)
+            if not counts:
+                continue
+
+            # 3. Score the top candidates by shared-trigram count with the
+            #    ORIGINAL semantics (containment, then SequenceMatcher).
+            for idx, _shared in counts.most_common(self._MAX_CANDIDATES):
+                entry = self._entities[idx]
+                en = entry.normalized
+                elen = len(en)
+                if en == nw:
+                    continue  # already recorded via exact lookup
                 ratio = max(elen, wlen) / max(min(elen, wlen), 1)
                 if ratio > 3.0:
                     continue
+                if en in nw or nw in en:
+                    score = min(elen, wlen) / max(elen, wlen)
+                else:
+                    score = SequenceMatcher(None, nw, en).ratio()
+                if score >= threshold:
+                    _record(idx, score)
 
-                if nw == entry.normalized:
-                    best_score = 1.0
-                    break
-
-                if entry.normalized in nw or nw in entry.normalized:
-                    containment_score = min(elen, wlen) / max(elen, wlen)
-                    if containment_score > best_score:
-                        best_score = containment_score
-                    continue
-
-                sim = SequenceMatcher(None, nw, entry.normalized).ratio()
-                if sim > best_score:
-                    best_score = sim
-
-            if best_score >= threshold:
-                existing = results.get(entry.name)
-                if existing is None or best_score > existing.score:
-                    results[entry.name] = MatchResult(
-                        name=entry.name,
-                        entity_type=entry.entity_type,
-                        score=best_score,
-                    )
-
-            # Bail early if time budget exceeded — partial results are
-            # still useful and better than a 200s hang.
             if time.monotonic() > deadline:
                 logger.warning(
-                    "EntityMatcher hit %.0fs time budget after %d/%d entities",
-                    self._TIME_BUDGET, len(results), len(self._entities),
+                    "EntityMatcher hit %.0fs safety budget mid-query "
+                    "(%d windows processed) — should not happen with the "
+                    "trigram index; investigate",
+                    self._TIME_BUDGET, windows.index(window) + 1,
                 )
                 break
 
