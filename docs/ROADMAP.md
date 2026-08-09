@@ -51,8 +51,14 @@ weld-fitting query.
   ubiquitous — kept, marked `e.noise_tier = 'stop'`, excluded from query
   expansion and graph_first seeding; reversible, no per-query degree
   computation). Review executed by Genesis (researcher Choom) with human/
-  assistant veto before any write. Status: candidate list extracted;
-  briefing prepared.
+  assistant veto before any write.
+- **Status: entity pass DONE 2026-08-09** — Genesis judged all 306, every
+  DELETE was vetoed to STOP or held-merge (nothing deleted), 92 entities
+  stop-tiered with count-verified writes, exclusion wired into the matcher
+  + graph_first + graph_boosted (live at next restart), blocklist banked
+  for N2, verification check #30 pins graph↔ledger parity. Full audit
+  trail: `docs/noise-review-2026-08.md`. Remaining: the relations tier-1
+  edge pass (support_count = 1, endpoints never co-occur) — unstarted.
 
 ### N2. Extraction-time noise valve — future ingests
 - Validator rejects standalone generic-noun entities (blocklist from N1 +

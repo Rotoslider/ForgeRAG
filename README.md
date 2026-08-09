@@ -493,7 +493,7 @@ Queued repairs appear in the Ingest page's Active Jobs panel with their own step
 
 ### Deep Verification — proving the database is intact
 
-Manage → **Deep Verification** → *Run verification* is the strictest check in the system: 24 read-only integrity checks with exact counts and **zero sampling** across the whole library. Where the completeness audit answers "which steps ran per document", verification answers "is every artifact the pipeline claims to have produced actually present and well-formed":
+Manage → **Deep Verification** → *Run verification* is the strictest check in the system: 30 read-only integrity checks with exact counts and **zero sampling** across the whole library. Where the completeness audit answers "which steps ran per document", verification answers "is every artifact the pipeline claims to have produced actually present and well-formed":
 
 - page counts match the PDFs; page numbering contiguous; no duplicate pages, no orphan pages or chunks
 - every page's full-resolution and reduced image exists **on disk**
@@ -746,7 +746,7 @@ Schedule & Automation, endpoints below) instead of external cron.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/admin/audit/completeness` | Audit every document's pipeline completeness from graph state (embedding dims verified) |
-| GET | `/admin/verify` | Deep verification: 29 exact-count integrity checks (images on disk, embedding dims, blob byte-integrity, duplicates/orphans, extraction coverage, entity hygiene, index health). PASS requires zero violations |
+| GET | `/admin/verify` | Deep verification: 30 exact-count integrity checks (images on disk, embedding dims, blob byte-integrity, duplicates/orphans, extraction coverage, entity hygiene, index health). PASS requires zero violations |
 | POST | `/admin/extract-missing-entities` | Queue entity extraction for every doc with unextracted text pages (server finds them). Long-running background LLM work, resumable |
 | POST | `/admin/build-missing-summaries` | Queue the RAPTOR-by-TOC summary builder for every chunked doc without a summary tree (optional `{"doc_ids": [...]}` scope; skips docs already queued). One resumable job per doc |
 | POST | `/search/summaries` | Search hierarchical section summaries at any abstraction level (page-hit shaped results; snippet = section summary + page range) |

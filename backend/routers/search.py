@@ -1326,6 +1326,7 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
             OPTIONAL MATCH (p)-[r]->(e)
             WHERE type(r) IN ['MENTIONS_MATERIAL','DESCRIBES_PROCESS',
                               'REFERENCES_STANDARD','MENTIONS_EQUIPMENT']
+              AND coalesce(e.noise_tier, '') <> 'stop'
             WITH p, d, base_score,
                  collect(DISTINCT toLower(coalesce(e.name, e.code))) AS ent_names,
                  collect(coalesce(e.common_names, [])) AS nested_aliases
@@ -1479,6 +1480,7 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
             YIELD node AS e, score AS ft_score
             WHERE any(l IN labels(e) WHERE l IN
                       ['Material','Process','Standard','Equipment'])
+              AND coalesce(e.noise_tier, '') <> 'stop'
             WITH e, ft_score
             ORDER BY ft_score DESC
             LIMIT 40

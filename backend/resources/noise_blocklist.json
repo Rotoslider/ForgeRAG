@@ -1,0 +1,374 @@
+{
+  "generated": "2026-08-09",
+  "source": "N1 noise review \u2014 Genesis first pass, Claude veto (docs/noise-review-2026-08.md)",
+  "stop_tier": [
+    {
+      "label": "Equipment",
+      "name": "Fastener"
+    },
+    {
+      "label": "Equipment",
+      "name": "PV modules"
+    },
+    {
+      "label": "Equipment",
+      "name": "PV panel"
+    },
+    {
+      "label": "Equipment",
+      "name": "batteries"
+    },
+    {
+      "label": "Equipment",
+      "name": "battery"
+    },
+    {
+      "label": "Equipment",
+      "name": "bearing"
+    },
+    {
+      "label": "Equipment",
+      "name": "bearings"
+    },
+    {
+      "label": "Equipment",
+      "name": "boiler"
+    },
+    {
+      "label": "Equipment",
+      "name": "compressor"
+    },
+    {
+      "label": "Equipment",
+      "name": "condenser"
+    },
+    {
+      "label": "Equipment",
+      "name": "controller"
+    },
+    {
+      "label": "Equipment",
+      "name": "cylinder"
+    },
+    {
+      "label": "Equipment",
+      "name": "engine"
+    },
+    {
+      "label": "Equipment",
+      "name": "furnace"
+    },
+    {
+      "label": "Equipment",
+      "name": "gear"
+    },
+    {
+      "label": "Equipment",
+      "name": "gears"
+    },
+    {
+      "label": "Equipment",
+      "name": "generator"
+    },
+    {
+      "label": "Equipment",
+      "name": "inverters"
+    },
+    {
+      "label": "Equipment",
+      "name": "motor"
+    },
+    {
+      "label": "Equipment",
+      "name": "pipe"
+    },
+    {
+      "label": "Equipment",
+      "name": "pump"
+    },
+    {
+      "label": "Equipment",
+      "name": "shaft"
+    },
+    {
+      "label": "Equipment",
+      "name": "spur gears"
+    },
+    {
+      "label": "Equipment",
+      "name": "tank"
+    },
+    {
+      "label": "Equipment",
+      "name": "transformer"
+    },
+    {
+      "label": "Equipment",
+      "name": "turbine"
+    },
+    {
+      "label": "Equipment",
+      "name": "valve"
+    },
+    {
+      "label": "Material",
+      "name": "Aluminium"
+    },
+    {
+      "label": "Material",
+      "name": "Aluminum"
+    },
+    {
+      "label": "Material",
+      "name": "Carbon"
+    },
+    {
+      "label": "Material",
+      "name": "Chromium"
+    },
+    {
+      "label": "Material",
+      "name": "Copper"
+    },
+    {
+      "label": "Material",
+      "name": "Gold"
+    },
+    {
+      "label": "Material",
+      "name": "Hydrogen"
+    },
+    {
+      "label": "Material",
+      "name": "Iron"
+    },
+    {
+      "label": "Material",
+      "name": "Lead"
+    },
+    {
+      "label": "Material",
+      "name": "Magnesium"
+    },
+    {
+      "label": "Material",
+      "name": "Molybdenum"
+    },
+    {
+      "label": "Material",
+      "name": "Nickel"
+    },
+    {
+      "label": "Material",
+      "name": "Nitrogen"
+    },
+    {
+      "label": "Material",
+      "name": "Oxygen"
+    },
+    {
+      "label": "Material",
+      "name": "Platinum"
+    },
+    {
+      "label": "Material",
+      "name": "Silicon"
+    },
+    {
+      "label": "Material",
+      "name": "Silver"
+    },
+    {
+      "label": "Material",
+      "name": "Tin"
+    },
+    {
+      "label": "Material",
+      "name": "Titanium"
+    },
+    {
+      "label": "Material",
+      "name": "Tungsten"
+    },
+    {
+      "label": "Material",
+      "name": "Zinc"
+    },
+    {
+      "label": "Material",
+      "name": "air"
+    },
+    {
+      "label": "Material",
+      "name": "ceramic"
+    },
+    {
+      "label": "Material",
+      "name": "ceramics"
+    },
+    {
+      "label": "Material",
+      "name": "coal"
+    },
+    {
+      "label": "Material",
+      "name": "concrete"
+    },
+    {
+      "label": "Material",
+      "name": "glass"
+    },
+    {
+      "label": "Material",
+      "name": "inductor"
+    },
+    {
+      "label": "Material",
+      "name": "metal"
+    },
+    {
+      "label": "Material",
+      "name": "metals"
+    },
+    {
+      "label": "Material",
+      "name": "oil"
+    },
+    {
+      "label": "Material",
+      "name": "plastic"
+    },
+    {
+      "label": "Material",
+      "name": "plastics"
+    },
+    {
+      "label": "Material",
+      "name": "polymers"
+    },
+    {
+      "label": "Material",
+      "name": "resistor"
+    },
+    {
+      "label": "Material",
+      "name": "rubber"
+    },
+    {
+      "label": "Material",
+      "name": "steam"
+    },
+    {
+      "label": "Material",
+      "name": "steel"
+    },
+    {
+      "label": "Material",
+      "name": "water"
+    },
+    {
+      "label": "Material",
+      "name": "wood"
+    },
+    {
+      "label": "Process",
+      "name": "Annealing"
+    },
+    {
+      "label": "Process",
+      "name": "Austenitize"
+    },
+    {
+      "label": "Process",
+      "name": "Normalize"
+    },
+    {
+      "label": "Process",
+      "name": "aging"
+    },
+    {
+      "label": "Process",
+      "name": "annealed"
+    },
+    {
+      "label": "Process",
+      "name": "bending"
+    },
+    {
+      "label": "Process",
+      "name": "casting"
+    },
+    {
+      "label": "Process",
+      "name": "cutting"
+    },
+    {
+      "label": "Process",
+      "name": "drawing"
+    },
+    {
+      "label": "Process",
+      "name": "drilling"
+    },
+    {
+      "label": "Process",
+      "name": "forming"
+    },
+    {
+      "label": "Process",
+      "name": "grinding"
+    },
+    {
+      "label": "Process",
+      "name": "hardening"
+    },
+    {
+      "label": "Process",
+      "name": "heat treating"
+    },
+    {
+      "label": "Process",
+      "name": "machining"
+    },
+    {
+      "label": "Process",
+      "name": "milling"
+    },
+    {
+      "label": "Process",
+      "name": "normalizing"
+    },
+    {
+      "label": "Process",
+      "name": "painting"
+    },
+    {
+      "label": "Process",
+      "name": "plating"
+    },
+    {
+      "label": "Process",
+      "name": "polishing"
+    },
+    {
+      "label": "Process",
+      "name": "quenching"
+    },
+    {
+      "label": "Process",
+      "name": "rolling"
+    },
+    {
+      "label": "Process",
+      "name": "tempering"
+    },
+    {
+      "label": "Process",
+      "name": "turning"
+    },
+    {
+      "label": "Process",
+      "name": "welding"
+    }
+  ]
+}

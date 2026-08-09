@@ -88,6 +88,7 @@ class EntityMatcher:
             """
             MATCH (e)
             WHERE any(l IN labels(e) WHERE l IN ['Material', 'Process', 'Standard', 'Equipment'])
+              AND coalesce(e.noise_tier, '') <> 'stop'
             WITH e,
                  CASE
                    WHEN 'Material' IN labels(e) THEN 'Material'

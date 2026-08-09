@@ -602,6 +602,44 @@ async def run_verification(neo4j, settings) -> dict:
         "re-embed" if dim_problems else None,
     ))
 
+    # ----------------------------------------------------------- noise tier
+    # The N1 stop-tier ledger lives in two places: the graph (noise_tier =
+    # 'stop' on entity nodes, consumed by the matcher and graph strategies)
+    # and the banked blocklist file (consumed by the future N2 extraction
+    # valve). They must agree exactly, both directions — a mark without a
+    # ledger entry is an unaudited write; a ledger entry without a mark
+    # means the exclusion silently isn't happening.
+    blocklist_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "resources", "noise_blocklist.json",
+    )
+    try:
+        import json as _json
+        with open(blocklist_path) as f:
+            banked = {
+                (e["label"], e["name"])
+                for e in _json.load(f)["stop_tier"]
+            }
+    except FileNotFoundError:
+        banked = set()
+    rows = await q("""
+        MATCH (e) WHERE e.noise_tier = 'stop'
+        RETURN [l IN labels(e) WHERE l IN
+                ['Material','Process','Standard','Equipment']][0] AS label,
+               coalesce(e.name, e.code) AS name
+    """)
+    marked = {(r["label"], r["name"]) for r in rows}
+    tier_problems = (
+        [{"missing_mark": f"{l}|{n}"} for l, n in sorted(banked - marked)]
+        + [{"unaudited_mark": f"{l}|{n}"} for l, n in sorted(marked - banked)]
+    )
+    checks.append(_check(
+        "noise_stop_tier_matches_ledger",
+        "Entities marked noise_tier='stop' agree exactly with the banked "
+        "blocklist (resources/noise_blocklist.json), both directions",
+        len(tier_problems), total=len(banked), samples=tier_problems[:SAMPLE],
+    ))
+
     # ------------------------------------------------------------- summary
     failed = [c for c in checks if c["status"] == "fail"]
     warned = [c for c in checks if c["status"] == "warn"]
