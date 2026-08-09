@@ -315,6 +315,17 @@ LM Studio provides the OpenAI-compatible LLM endpoint that ForgeRAG uses for ent
 3. Download the model `Qwen/Qwen3.6-35B-A3B` (or search for `qwen3.6-35b-a3b`)
 4. In LM Studio, go to the Local Server tab and start the server on port 1234 (the default)
 5. Make sure "Thinking" is toggled OFF in model settings — ForgeRAG disables thinking via `chat_template_kwargs` in the API request
+6. **Strongly recommended: enable parallel processing.** In the model-load
+   settings, raise **Max Concurrent Predictions** (LM Studio 2.27+,
+   llama.cpp continuous batching) from the default 4 to **8**, then set
+   `max_concurrent_requests = 6` in `config/forgerag.toml` `[llm]`.
+   Measured effect on an 8-slot server: 6 concurrent answer-mode requests
+   complete at **5.7× effective throughput** for ~2.2× per-request latency
+   — an ingestion campaign that would take 100 days of GPU nights
+   single-stream finishes in roughly 3 weeks. Keep ForgeRAG's cap a slot
+   or two below LM Studio's so interactive queries (Chooms, the web UI)
+   never wait behind a batch job; requests beyond the server's slot count
+   queue server-side where the wait burns against `timeout_seconds`.
 
 Verify the model is loaded:
 
@@ -786,7 +797,7 @@ See `config/forgerag.toml.example` for all settings. Key sections:
 | `[server]` | port (8200), data_dir |
 | `[neo4j]` | uri, database (neo4j), password_env |
 | `[models]` | `visual_model_name`, `visual_model_type` (nemotron/colpali), `visual_embed_dim` (128), `colpali_pool_factor_storage` (3, shared by both visual models), `text_embedding_model` (`BAAI/bge-m3` default), `text_embedding_dim` (1024), `reranker_model` (`BAAI/bge-reranker-v2-m3`) |
-| `[llm]` | endpoint (LM Studio), model (qwen3.6-35b-a3b), use_json_schema, max_tokens (4096; entity extraction internally bumps to 8192 for standards-heavy pages), disable_thinking (True) |
+| `[llm]` | endpoint (LM Studio), model (qwen3.6-35b-a3b), use_json_schema, max_tokens (4096; entity extraction internally bumps to 8192 for standards-heavy pages), disable_thinking (True), max_concurrent_requests (6 — match to the server's Max Concurrent Predictions minus a slot or two; default 2 if unset) |
 | `[ingestion]` | pdf_dpi (300), batch sizes, scanned text threshold |
 | `[gpu]` | device, model_idle_unload_seconds (300) |
 | `[backup]` | destination, include_images, include_pdfs, gdrive_enabled, gdrive_dump |
@@ -919,7 +930,7 @@ of GPU/LLM work; run it inside your processing window (e.g. nightly).
 - Requires `use_json_schema = true` in config
 - Thinking is disabled via `chat_template_kwargs.enable_thinking = False` in the API request payload (not the old `/no_think` prompt directive — Qwen 3.6 dropped support for the soft `/think` and `/nothink` switches). The `disable_thinking = true` config flag controls this
 - Without thinking disabled, the model deliberates for hundreds of tokens before emitting JSON, regressing per-page latency from ~8 s to 30+ s
-- Runs on RTX 6000 via LM Studio at ~135 tok/s, ~8-10 s per page
+- Runs on RTX 6000 via LM Studio at ~135 tok/s, ~8-10 s per page single-stream; with continuous batching enabled (Max Concurrent Predictions 8, `max_concurrent_requests = 6`) effective throughput is ~5.7× that — see the LM Studio setup section
 - LM Studio "Thinking" toggle should be OFF (the API-level `chat_template_kwargs` is the authoritative control)
 - The `reasoning_content` fallback in `llm_service.py` handles the case where Qwen 3.6 routes output through the reasoning channel even with thinking disabled — no action needed
 
