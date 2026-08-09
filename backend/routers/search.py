@@ -140,7 +140,17 @@ async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeR
     if body.fuzzy:
         fuzzy_tokens = _apply_lucene_fuzzy(escaped_tokens)
         or_clause = " OR ".join(fuzzy_tokens)
-        phrase_query = f"({or_clause})" if fuzzy_tokens else f'"{escaped}"'
+        if len(fuzzy_tokens) >= 2:
+            # Boost pages matching ALL terms — plain OR let pages dense in
+            # one common term win (audit: "weldlng electrode" ranked
+            # fuel-cell electrode pages above welding-electrode pages
+            # because fuzzy mode dropped the phrase boost entirely).
+            and_clause = " AND ".join(fuzzy_tokens)
+            phrase_query = f"({and_clause})^3 OR ({or_clause})"
+        elif fuzzy_tokens:
+            phrase_query = f"({or_clause})"
+        else:
+            phrase_query = f'"{escaped}"'
     else:
         # Phrase match ^4 (higher weight) OR any-of-terms
         if escaped_tokens:
@@ -478,7 +488,35 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         )
         return True
 
-    for p in pages[: body.limit]:
+    # Source diversity: retrieval often returns a RUN of pages from one
+    # handbook (chunk hits cluster), and adjacent-page inclusion then
+    # triples that book's footprint in the VLM context — cross-book
+    # questions ended up answered from whichever single book dominated
+    # (audit finding: a 5-doc answer whose top-6 sources were all
+    # Shigley). Cap pages per document so the limit budget forces a
+    # second book into context whenever retrieval found one.
+    _PER_DOC_CAP = max(2, (body.limit + 1) // 2)
+    _per_doc: dict[str, int] = {}
+    _selected = []
+    for p in pages:
+        if len(_selected) >= body.limit:
+            break
+        doc_key = str(p.get("doc_id") or p.get("document_title") or p.get("page_id"))
+        if _per_doc.get(doc_key, 0) >= _PER_DOC_CAP:
+            continue
+        _per_doc[doc_key] = _per_doc.get(doc_key, 0) + 1
+        _selected.append(p)
+    if len(_selected) < body.limit:
+        # Backfill from the skipped overflow so we never send FEWER pages
+        # than the old behavior when only one book matched at all.
+        seen_ids = {id(x) for x in _selected}
+        for p in pages:
+            if len(_selected) >= body.limit:
+                break
+            if id(p) not in seen_ids:
+                _selected.append(p)
+
+    for p in _selected:
         page_rows = await neo4j.run_query(
             """
             MATCH (d:Document)-[:HAS_PAGE]->(pg:Page {page_id: $pid})
@@ -1315,9 +1353,17 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
         # fuzzy matcher carry the same specials.
         escaped_terms = [_lucene_escape(t) for t in query_terms if t.strip()]
         if not escaped_terms:
-            # All-stopword query with no entity-matcher expansion: an
-            # empty Lucene string is a parse error, not an empty result.
-            return ForgeResult(success=True, data=[])
+            # All-stopword query with no entity-matcher expansion: no
+            # entities to search on. Degrade to rrf instead of returning
+            # nothing — vague questions carry no entity names and were
+            # this strategy's blind spot (audit: projectile-stability and
+            # lathe-speed questions missed entirely).
+            logger.info(
+                "graph_first: no usable entity terms in %r — falling back "
+                "to rrf", body.query,
+            )
+            body.strategy = "rrf"
+            return await _hybrid_search_impl(body, request)
         lucene_query = " OR ".join(escaped_terms)
 
         cypher = f"""
@@ -1382,6 +1428,15 @@ async def _hybrid_search_impl(body: HybridSearchRequest, request: Request) -> Fo
             })
         hits.sort(key=lambda h: h["score"], reverse=True)
         hits = hits[: body.limit]
+        if not hits:
+            # Entity terms existed but matched nothing in the graph —
+            # same blind spot as above; give the caller real results.
+            logger.info(
+                "graph_first: entity search returned nothing for %r — "
+                "falling back to rrf", body.query,
+            )
+            body.strategy = "rrf"
+            return await _hybrid_search_impl(body, request)
         if fuzzy_matched:
             for h in hits:
                 h["fuzzy_matched"] = fuzzy_matched
