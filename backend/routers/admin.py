@@ -849,7 +849,7 @@ async def backup_manifest(request: Request) -> ForgeResult:
         WITH d, count(p) AS page_count
         OPTIONAL MATCH (d)-[:IN_CATEGORY]->(cat:Category)
         WITH d, page_count, collect(DISTINCT cat.name) AS categories
-        OPTIONAL MATCH (d)-[:HAS_TAG]->(tag:Tag)
+        OPTIONAL MATCH (d)-[:TAGGED_WITH]->(tag:Tag)
         RETURN d.doc_id       AS doc_id,
                d.file_hash    AS file_hash,
                d.title        AS title,
@@ -974,7 +974,7 @@ async def backup_graph(request: Request) -> ForgeResult:
 
     tags = await neo4j.run_query(
         """
-        MATCH (d:Document)-[:HAS_TAG]->(t:Tag)
+        MATCH (d:Document)-[:TAGGED_WITH]->(t:Tag)
         RETURN d.doc_id AS doc_id, t.name AS tag
         """
     )
@@ -983,8 +983,9 @@ async def backup_graph(request: Request) -> ForgeResult:
     # Collections
     collections = await neo4j.run_query(
         """
-        MATCH (d:Document)-[:IN_COLLECTION]->(col:Collection)
-        RETURN d.doc_id AS doc_id, col.name AS collection
+        MATCH (d:Document)
+        WHERE d.collection IS NOT NULL
+        RETURN d.doc_id AS doc_id, d.collection AS collection
         """
     )
     export["document_collections"] = collections
@@ -1543,11 +1544,11 @@ async def _run_full_backup(
         )
         export["document_categories"] = cats
         tags = await neo4j.run_query(
-            "MATCH (d:Document)-[:HAS_TAG]->(t:Tag) RETURN d.doc_id AS doc_id, t.name AS tag"
+            "MATCH (d:Document)-[:TAGGED_WITH]->(t:Tag) RETURN d.doc_id AS doc_id, t.name AS tag"
         )
         export["document_tags"] = tags
         collections = await neo4j.run_query(
-            "MATCH (d:Document)-[:IN_COLLECTION]->(col:Collection) RETURN d.doc_id AS doc_id, col.name AS collection"
+            "MATCH (d:Document) WHERE d.collection IS NOT NULL RETURN d.doc_id AS doc_id, d.collection AS collection"
         )
         export["document_collections"] = collections
         export["counts"] = {
