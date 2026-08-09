@@ -23,9 +23,14 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
+
+# Leading section number in a heading: "9.2.3 Feature-based Odometry",
+# "3.1: Drive systems", "12) Bearings".
+_NUM_RE = re.compile(r"^(\d+(?:\.\d+)*)[\s.:)–-]+\S")
 
 # Chunks whose section_path is empty get grouped into windows of this many
 # pages so structureless (scanned) books still produce a usable tree.
@@ -66,6 +71,54 @@ def summary_id(doc_id: str, path: tuple[str, ...]) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:32]
 
 
+def _synthesize_numbered_hierarchy(chunks: list[dict]) -> dict[str, tuple[str, ...]]:
+    """For books whose Docling headings are FLAT (every section_path is a
+    single heading like "9.2.3 Feature-based Odometry"), rebuild the
+    chapter/section hierarchy from the numbering pattern: 9.2.3 nests
+    under 9.2 nests under 9. Returns a mapping from the flat heading to
+    its synthesized ancestor path (ancestors only, not the heading
+    itself), using the real heading text for an ancestor when the book
+    has one ("9 Radar Sensing") and "§<number>" otherwise. Returns an
+    empty dict when the book isn't flat-numbered, so Docling's own
+    hierarchy is used untouched.
+    """
+    flat_headings: list[str] = []
+    for c in chunks:
+        path = c.get("section_path") or []
+        if len(path) == 1 and str(path[0]).strip():
+            flat_headings.append(str(path[0]).strip())
+    if not flat_headings:
+        return {}
+    numbered = [h for h in set(flat_headings) if _NUM_RE.match(h)]
+    structured_chunks = sum(1 for c in chunks if c.get("section_path"))
+    flat_ratio = len(flat_headings) / max(1, structured_chunks)
+    if flat_ratio < 0.7 or len(numbered) < max(4, len(set(flat_headings)) * 0.3):
+        return {}
+
+    # Best-known title per section number ("9" -> "9 Radar Sensing").
+    by_number: dict[str, str] = {}
+    for h in numbered:
+        m = _NUM_RE.match(h)
+        if m:
+            by_number.setdefault(m.group(1), h)
+
+    mapping: dict[str, tuple[str, ...]] = {}
+    for h in set(flat_headings):
+        m = _NUM_RE.match(h)
+        if not m:
+            continue  # unnumbered headings (front matter) stay top-level
+        parts = m.group(1).split(".")
+        ancestors = []
+        # Ancestors only down to depth 2 — with the heading itself the
+        # total path respects the depth-3 cap.
+        for i in range(1, min(len(parts), 3)):
+            prefix = ".".join(parts[:i])
+            ancestors.append(by_number.get(prefix, f"§{prefix}"))
+        if ancestors:
+            mapping[h] = tuple(ancestors)
+    return mapping
+
+
 def build_section_tree(
     doc_title: str, chunks: list[dict]
 ) -> SectionNode:
@@ -78,6 +131,7 @@ def build_section_tree(
 
     structured = sum(1 for c in chunks if c.get("section_path"))
     use_fallback = structured < max(1, len(chunks)) * 0.4
+    numbered_ancestry = {} if use_fallback else _synthesize_numbered_hierarchy(chunks)
 
     for c in chunks:
         raw_path = c.get("section_path") or []
@@ -89,9 +143,18 @@ def build_section_tree(
                 lo = ((int(page) - 1) // FALLBACK_WINDOW_PAGES) * FALLBACK_WINDOW_PAGES + 1
                 path = (f"Pages {lo}–{lo + FALLBACK_WINDOW_PAGES - 1}",)
         else:
+            parts = [str(p).strip() for p in raw_path if str(p).strip()]
+            # Flat numbered books: prepend the synthesized chapter/section
+            # ancestry so "9.2.3 Feature-based Odometry" nests under
+            # "9 ..." and "9.2 ..." instead of sitting beside 400 siblings.
+            if len(parts) == 1 and parts[0] in numbered_ancestry:
+                ancestors = numbered_ancestry[parts[0]]
+                # Avoid a self-nested duplicate when the heading IS its
+                # own best-known ancestor title.
+                parts = [a for a in ancestors if a != parts[0]] + parts
             # Cap depth: very deep heading stacks add tree levels without
             # adding retrieval value.
-            path = tuple(str(p).strip() for p in raw_path if str(p).strip())[:3]
+            path = tuple(parts)[:3]
             if not path:
                 path = ("Front matter",)
 

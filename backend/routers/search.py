@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import asyncio
 import logging
 
@@ -754,11 +755,30 @@ async def summary_search(body: SemanticSearchRequest, request: Request) -> Forge
                d.filename AS filename, d.file_hash AS file_hash,
                score
         ORDER BY score DESC
-        LIMIT $limit
         """,
-        {"topk": max(body.limit * 3, 15), "vec": query_vec.tolist(),
-         "limit": body.limit},
+        {"topk": max(body.limit * 4, 20), "vec": query_vec.tolist()},
     )
+    # Structural re-rank before trimming to the limit: a small boost for
+    # whole-document roots (staged validation: "what does this book cover"
+    # ranked Contents/Preface above the root by a hair) and a matching
+    # demotion for front-matter boilerplate that describes coverage
+    # without BEING coverage. Margins are ~0.02 at the top, so these
+    # nudges flip near-ties without overriding a decisive section match.
+    _FRONT_MATTER = re.compile(
+        r"^(contents|table of contents|preface|foreword|index|"
+        r"acknowledg\w*|list of (figures|tables|contributors)|"
+        r"edited by|authored by|about the (author|book)s?)\b", re.I,
+    )
+    for r in rows:
+        adj = 0.0
+        if r["level"] == 0:
+            adj += 0.03
+        title = (r["title"] or "").strip()
+        if title and _FRONT_MATTER.match(title):
+            adj -= 0.03
+        r["score"] = float(r["score"]) + adj
+    rows.sort(key=lambda r: r["score"], reverse=True)
+    rows = rows[: body.limit]
     hits = []
     for r in rows:
         pn = r["page_start"] or 1

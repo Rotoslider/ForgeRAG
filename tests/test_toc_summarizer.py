@@ -120,3 +120,48 @@ async def test_summarize_tree_feeds_children_into_parents():
     # The parent call's prompt contains its children's summaries.
     parent_prompt = llm.calls[-1]
     assert "SUMMARY(" in parent_prompt
+
+
+def test_flat_numbered_headings_gain_synthesized_hierarchy():
+    # The SLAM Handbook case: Docling emits every heading at depth 1, so
+    # "9.2.3 X" sat beside 400+ siblings. Numbering must rebuild nesting.
+    chunks = [
+        _chunk(["9 Radar Sensing"], 260),
+        _chunk(["9.2 Radar Odometry"], 272),
+        _chunk(["9.2.1 Doppler Odometry"], 273),
+        _chunk(["9.2.3 Feature-based Odometry"], 276),
+        _chunk(["10 Conclusions"], 300),
+        _chunk(["Preface"], 5),
+    ]
+    root = build_section_tree("Handbook", chunks)
+    ch9 = root.children["9 Radar Sensing"]
+    sec92 = ch9.children["9.2 Radar Odometry"]
+    assert set(sec92.children) == {
+        "9.2.1 Doppler Odometry", "9.2.3 Feature-based Odometry",
+    }
+    # Unnumbered front matter stays a top-level leaf.
+    assert "Preface" in root.children
+    assert root.children["10 Conclusions"].level == 1
+
+
+def test_synthesized_ancestor_placeholder_when_parent_unnamed():
+    # No "9" heading exists — ancestry synthesizes a §9 placeholder.
+    chunks = [
+        _chunk(["9.1 Alpha"], 1), _chunk(["9.2 Beta"], 2),
+        _chunk(["9.3 Gamma"], 3), _chunk(["9.4 Delta"], 4),
+    ]
+    root = build_section_tree("Book", chunks)
+    assert "§9" in root.children
+    assert set(root.children["§9"].children) == {
+        "9.1 Alpha", "9.2 Beta", "9.3 Gamma", "9.4 Delta",
+    }
+
+
+def test_docling_hierarchy_left_untouched_when_not_flat():
+    chunks = [
+        _chunk(["Ch 1", "1.1 Bolts"], 1),
+        _chunk(["Ch 1", "1.2 Welds"], 2),
+        _chunk(["Ch 2", "2.1 Gears"], 3),
+    ]
+    root = build_section_tree("Book", chunks)
+    assert set(root.children) == {"Ch 1", "Ch 2"}
