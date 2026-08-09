@@ -175,8 +175,21 @@ async def build_missing_summaries(
     if not docs:
         return ForgeResult(success=True, data={"queued": 0,
                                                "reason": "nothing missing"})
+    # Skip docs that already have an active build-summaries job — the
+    # builder rebuilds unconditionally, so a double-queued doc would spend
+    # its LLM time twice (live: a second drain call while 481 jobs were
+    # held under pause-all queued 481 duplicates).
+    active = await jobs.list_recent(status="active", limit=5000)
+    already = {
+        j.doc_id for j in active
+        if j.job_type == "build-summaries" and j.doc_id
+    }
     queued = []
+    skipped = 0
     for r in docs:
+        if r["doc_id"] in already:
+            skipped += 1
+            continue
         job = await jobs.create(
             source_path=f"(build-summaries of {r['doc_id']})",
             filename=r["filename"], categories=[], tags=[],
@@ -186,8 +199,11 @@ async def build_missing_summaries(
             job.job_id, r["doc_id"],
         ))
         queued.append({"doc_id": r["doc_id"], "job_id": job.job_id})
-    logger.info("Queued summary builder: %d docs", len(queued))
-    return ForgeResult(success=True, data={"queued": len(queued), "jobs": queued})
+    logger.info("Queued summary builder: %d docs (%d already queued)",
+                len(queued), skipped)
+    return ForgeResult(success=True, data={
+        "queued": len(queued), "already_queued": skipped, "jobs": queued,
+    })
 
 
 @router.post("/reextract-suspicious-empties")
