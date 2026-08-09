@@ -41,13 +41,22 @@ def test_blocklist_is_banked_and_well_formed():
     path = REPO / "backend" / "resources" / "noise_blocklist.json"
     data = json.loads(path.read_text())
     entries = data["stop_tier"]
-    assert len(entries) == 92
+    # 92 marked in the initial pass, minus the three lexical variants
+    # merged into canonicals 2026-08-09 (owner-approved), plus
+    # austenitizing which inherited its variant's ruling post-merge.
+    assert len(entries) == 90
     keys = {(e["label"], e["name"]) for e in entries}
     assert len(keys) == len(entries), "duplicate blocklist entries"
     valid_labels = {"Material", "Process", "Standard", "Equipment"}
     assert {e["label"] for e in entries} <= valid_labels
     # The vetoed DELETEs must be present as stop-tier (the veto decision:
-    # nothing was deleted; everything was downgraded to reversible marks).
+    # nothing was deleted; everything was downgraded to reversible marks
+    # or lossless merges).
     for pair in [("Material", "water"), ("Material", "resistor"),
-                 ("Process", "annealed")]:
+                 ("Process", "austenitizing")]:
         assert pair in keys, f"vetoed-DELETE entry missing: {pair}"
+    # The merged-away variants must NOT linger in the ledger — check #30
+    # would report them as missing marks forever.
+    for pair in [("Process", "annealed"), ("Process", "Normalize"),
+                 ("Process", "Austenitize")]:
+        assert pair not in keys, f"merged variant still in ledger: {pair}"

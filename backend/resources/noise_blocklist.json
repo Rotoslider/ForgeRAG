@@ -276,19 +276,11 @@
     },
     {
       "label": "Process",
-      "name": "Austenitize"
-    },
-    {
-      "label": "Process",
-      "name": "Normalize"
-    },
-    {
-      "label": "Process",
       "name": "aging"
     },
     {
       "label": "Process",
-      "name": "annealed"
+      "name": "austenitizing"
     },
     {
       "label": "Process",
@@ -370,5 +362,6 @@
       "label": "Process",
       "name": "welding"
     }
-  ]
+  ],
+  "note": "2026-08-09 merge addendum: annealed/Normalize/Austenitize merged into Annealing/normalizing/austenitizing (owner-approved); austenitizing inherits its variant's stop ruling."
 }

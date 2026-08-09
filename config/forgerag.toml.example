@@ -47,6 +47,13 @@ max_tokens = 4096
 temperature = 0.1
 timeout_seconds = 180
 use_json_schema = true
+# In-flight request cap. Match your server's concurrency: LM Studio
+# "Max Concurrent Predictions" (continuous batching, 2.27+) or
+# llama-server --parallel. Leave a slot or two free for interactive
+# queries during ingestion campaigns. Measured on an 8-slot LM Studio:
+# 6 concurrent answer-mode requests → 5.7x effective throughput, ~2.2x
+# per-request latency. Default 2 if unset (safe for single-stream).
+max_concurrent_requests = 6
 
 [ingestion]
 pdf_dpi = 300

@@ -52,6 +52,15 @@ retrieval exclusion:
 The held merges are pure cleanup, not retrieval-critical: both endpoints
 of each pair are stop-tiered, so retrieval behavior is already final.
 
+**Merge addendum (2026-08-09, owner-approved):** all three merges
+executed via `merge_entity` under `GRAPH_MERGE_LOCK` with pre/post degree
+accounting — annealed(167)→Annealing (2,336→2,472), Normalize(232)→
+normalizing (743→948), Austenitize(162)→austenitizing (377→539); losers
+deleted, names preserved as `common_names` aliases. `austenitizing` was
+never itself a review candidate, but the merge moved excluded mentions
+under it, so it inherits its variant's stop ruling. Ledger total:
+**90 stop-tier entities** (92 − 3 merged variants + austenitizing).
+
 ## What was written (2026-08-09)
 
 - `SET e.noise_tier = 'stop'` on exactly **92** entities — dry-run first
