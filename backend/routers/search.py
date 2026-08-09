@@ -415,7 +415,21 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
         except Exception as exc:
             logger.warning("Graph exploration failed (continuing without): %s", exc)
 
-    pages = pages[: body.limit]
+    # Graph-discovered pages are APPENDED after retrieval pages, so a plain
+    # [:limit] truncation always sliced them off (retrieval already fills
+    # the limit) — pages_from_graph was 0 on every answer ever produced
+    # (caught by a Choom running the search audit). Reserve up to two slots
+    # so graph discoveries actually reach the VLM when they exist.
+    graph_pages = [
+        p for p in pages
+        if str(p.get("text_snippet", "")).startswith("[Graph:")
+    ]
+    if graph_pages:
+        keep_graph = graph_pages[:2]
+        others = [p for p in pages if p not in keep_graph]
+        pages = others[: max(1, body.limit - len(keep_graph))] + keep_graph
+    else:
+        pages = pages[: body.limit]
 
     if not pages:
         return ForgeResult(
