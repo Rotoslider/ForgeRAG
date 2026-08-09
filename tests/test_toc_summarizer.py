@@ -165,3 +165,27 @@ def test_docling_hierarchy_left_untouched_when_not_flat():
     ]
     root = build_section_tree("Book", chunks)
     assert set(root.children) == {"Ch 1", "Ch 2"}
+
+
+def test_every_pipeline_step_name_is_a_valid_jobstep():
+    # Job.current_step is a Literal; a step name used by any pipeline job
+    # that is missing from it makes every READ of that job row fail
+    # validation (live: 46 job rows rendered as validation errors after
+    # build-summaries shipped with four unregistered step names).
+    import re as _re
+    from pathlib import Path
+    from typing import get_args
+
+    from backend.models.ingestion import JobStep
+
+    valid = set(get_args(JobStep))
+    src = Path("backend/ingestion/pipeline.py").read_text()
+    used = set()
+    for m in _re.finditer(r"update_step\(\s*job_id,\s*\"([a-z_]+)\"", src):
+        used.add(m.group(1))
+    for m in _re.finditer(r"current_step=\"([a-z_]+)\"", src):
+        used.add(m.group(1))
+    for m in _re.finditer(r"set_steps\(job_id,\s*\[([^\]]+)\]", src):
+        used.update(_re.findall(r"\"([a-z_]+)\"", m.group(1)))
+    unknown = used - valid
+    assert not unknown, f"step names missing from JobStep Literal: {unknown}"

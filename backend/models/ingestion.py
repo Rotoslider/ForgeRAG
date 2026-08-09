@@ -31,6 +31,11 @@ JobStep = Literal[
     "writing_chunks",    # MERGE Chunk nodes + HAS_CHUNK edges
     "resummarizing",     # regenerate preview-fallback chunk summaries
     "dedup_entities",    # post-ingestion near-duplicate entity merge
+    # RAPTOR-by-TOC summary tree (build-summaries jobs)
+    "loading_chunks",
+    "summarizing_sections",
+    "embedding_summaries",
+    "writing_summaries",
     "done",
     "error",
 ]
