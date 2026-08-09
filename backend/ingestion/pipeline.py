@@ -407,6 +407,20 @@ class IngestionPipeline:
         Stamps d.summaries_built_at only when every summary landed
         (count-verified) so the audit never treats a partial tree as done.
         """
+        current_job_id.set(job_id)
+        try:
+            # Queue behind the shared ingest semaphore — a bulk drain
+            # spawns hundreds of these, and without the gate they would
+            # ALL run concurrently (the LLM client's own semaphore
+            # throttles model calls, but chunk loads and checkpoint
+            # traffic would hammer Neo4j and make every doc crawl).
+            async with self._ingest_semaphore:
+                await self._run_build_summaries_inner(job_id, doc_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Build-summaries job %s failed", job_id)
+            await self.jobs.fail(job_id, str(exc))
+
+    async def _run_build_summaries_inner(self, job_id: str, doc_id: str) -> None:
         from backend.ingestion.toc_summarizer import (
             TocSummarizer,
             build_section_tree,
@@ -414,7 +428,6 @@ class IngestionPipeline:
             summary_id,
         )
 
-        current_job_id.set(job_id)
         step = None
         try:
             await self.jobs.checkpoint(job_id)
