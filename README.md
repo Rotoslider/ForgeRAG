@@ -63,7 +63,7 @@ All phases complete.
 Recent additions since the Phase 9 baseline:
 
 - **Search error boundary** — no more blank pages when switching between search modes. The React search view catches rendering errors and recovers gracefully.
-- **Fuzzy entity matching** — EntityMatcher service loads entity names from Neo4j into memory and matches query text with difflib SequenceMatcher. Handles OCR-style typos, missing special characters, case mismatches, and spacing differences. Noise-word filtering, a 25-window cap, and a 5-second time budget prevent long natural-language queries from hanging (previously ~200s on 180K+ entities).
+- **Fuzzy entity matching** — EntityMatcher loads every entity name-form from Neo4j and matches query text through an exact normalized-name table plus a character-trigram inverted index that generates candidates for edit-distance scoring. Handles OCR-style typos, missing special characters, case mismatches, and spacing differences with full coverage of 276K+ name-forms in 31–48 ms per query (the earlier linear SequenceMatcher scan covered ~0.007% of the population inside its time budget).
 - **OCR typo tolerance** — keyword search now uses Lucene `~1` fuzzy operator so queries like "alumnum" still match "aluminum" in extracted text.
 - **Community search weighted by member count** — community results are ranked by the number of entity members, surfacing the most connected communities first.
 - **LLM circuit breaker** — 5 consecutive LLM failures trip the breaker open; all requests fail fast for 60 seconds, then a single probe request is allowed through. Prevents cascading timeouts during LM Studio restarts.
