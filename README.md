@@ -4,6 +4,9 @@ Local engineering knowledge graph for processing and querying large corpora of e
 
 Designed for personal/research use. Runs entirely on local hardware — no cloud APIs.
 
+**Paper:** the design, its lineage, and an audited evaluation are written up in
+[*ForgeRAG: A Verifiable, Local-First, Multi-Plane Retrieval System for Engineering Reference Libraries*](docs/paper/forgerag-paper.pdf) (PDF, 7 pages).
+
 ## Screenshots
 
 ![Search — Answer mode with VLM-generated response and page citations](docs/ForgeRAG-search.png)
