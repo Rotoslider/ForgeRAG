@@ -4,6 +4,8 @@ Local engineering knowledge graph for processing and querying large corpora of e
 
 Designed for personal/research use. Runs entirely on local hardware — no cloud APIs.
 
+**Roadmap:** the trigger-based plan for the 100k→1M page scale-up is in [docs/ROADMAP.md](docs/ROADMAP.md).
+
 **Paper:** the design, its lineage, and an audited evaluation are written up in
 [*ForgeRAG: A Verifiable, Local-First, Multi-Plane Retrieval System for Engineering Reference Libraries*](docs/paper/forgerag-paper.pdf) (PDF, 7 pages).
 
