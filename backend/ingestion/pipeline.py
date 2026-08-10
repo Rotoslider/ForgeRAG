@@ -749,16 +749,28 @@ class IngestionPipeline:
                 detail=f"{len(clusters)} cluster summaries via LLM",
             )
             summarizer = TocSummarizer(self.llm)
-            for i, cl in enumerate(clusters):
-                await self.jobs.checkpoint(job_id)
-                cl["summary"] = await summarizer.summarize_items(
-                    doc_title, cl["title"], cl.pop("kid_summaries"),
-                )
-                if (i + 1) % 5 == 0 or i + 1 == len(clusters):
-                    await self.jobs.update(
-                        job_id, pages_processed=i + 1,
-                        progress_pct=5.0 + 70.0 * (i + 1) / len(clusters),
+            # Clusters are independent — run them concurrently and let the
+            # LLM client's own semaphore (max_concurrent_requests) do the
+            # throttling. Sequential-per-job left LM Studio at 3 in-flight
+            # (one per ingest-semaphore slot) with the other slots idle.
+            done_count = 0
+            gate = asyncio.Semaphore(8)  # bound task pile-up, not the LLM
+
+            async def _one_cluster(cl: dict) -> None:
+                nonlocal done_count
+                async with gate:
+                    await self.jobs.checkpoint(job_id)
+                    cl["summary"] = await summarizer.summarize_items(
+                        doc_title, cl["title"], cl.pop("kid_summaries"),
                     )
+                    done_count += 1
+                    if done_count % 5 == 0 or done_count == len(clusters):
+                        await self.jobs.update(
+                            job_id, pages_processed=done_count,
+                            progress_pct=5.0 + 70.0 * done_count / len(clusters),
+                        )
+
+            await asyncio.gather(*(_one_cluster(cl) for cl in clusters))
             empty = [c for c in clusters if not (c.get("summary") or "").strip()]
             if empty:
                 raise RuntimeError(
