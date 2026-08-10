@@ -33,6 +33,9 @@ class ServerSettings(BaseModel):
     port: int = 8200
     data_dir: Path = PROJECT_ROOT / "data"
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    # Bearer token required for non-localhost API requests (empty = auth
+    # disabled, with a loud startup warning). FORGERAG_API_TOKEN env wins.
+    api_token: str = ""
 
 
 class Neo4jSettings(BaseModel):

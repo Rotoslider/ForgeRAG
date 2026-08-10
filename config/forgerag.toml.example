@@ -2,6 +2,12 @@
 # Copy to forgerag.toml and adjust as needed.
 
 [server]
+# Bearer token required for non-localhost API requests. Localhost clients,
+# /health, and the static UI shell are exempt; everything else 401s without
+# `Authorization: Bearer <token>`. OFF while empty/commented (loud startup
+# warning). Enable: paste the output of `openssl rand -hex 24` and restart.
+# The FORGERAG_API_TOKEN env var overrides this field.
+# api_token = ""
 host = "0.0.0.0"
 port = 8200
 data_dir = "/home/nuc1/projects/ForgeRAG/data"

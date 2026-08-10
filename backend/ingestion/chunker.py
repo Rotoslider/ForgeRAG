@@ -48,6 +48,11 @@ class StructuralChunk:
     bbox: tuple[float, float, float, float] | None = None
     # Reserved for Phase 3: topic tags, formula references, table captions.
     meta: dict = field(default_factory=dict)
+    # Which Docling produced this chunk (ROADMAP N4): version bumps apply
+    # to NEW ingests only, old and new chunks coexist, and the stamp is
+    # what makes the mix auditable. Empty on chunks written before the
+    # stamp existed.
+    docling_version: str = ""
 
 
 # Docling item labels we care about and how we map them onto chunk_type.
@@ -86,6 +91,7 @@ class StructuralChunker:
         self.min_text_chars = min_text_chars
         self._converter = None
         self._chunker = None
+        self._docling_version = ""
 
     def _ensure_loaded(self) -> None:
         if self._converter is not None:
@@ -99,6 +105,11 @@ class StructuralChunker:
         logger.info("Initializing Docling converter + HybridChunker")
         self._converter = DocumentConverter()
         self._chunker = HybridChunker(max_tokens=self.max_tokens)
+        try:
+            from importlib.metadata import version
+            self._docling_version = version("docling")
+        except Exception:  # noqa: BLE001 — stamp is best-effort metadata
+            self._docling_version = "unknown"
 
     def chunk_pdf(self, pdf_path: str | Path, doc_hash: str) -> list[StructuralChunk]:
         """Parse a PDF into structural chunks. doc_hash is used in the
@@ -157,6 +168,7 @@ class StructuralChunker:
                     text=text,
                     section_path=section_path,
                     bbox=bbox,
+                    docling_version=self._docling_version,
                 )
             )
 

@@ -32,6 +32,7 @@ from backend.ingestion.chunker import StructuralChunker, StructuralChunk
 from backend.ingestion.community_detector import CommunityDetector
 from backend.ingestion.entity_extractor import EntityExtractor
 from backend.ingestion.graph_builder import GraphBuilder
+from backend.ingestion.noise_valve import apply_noise_valve
 from backend.ingestion.job_logs import current_job_id
 from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pdf_processor import PDFProcessor
@@ -1197,6 +1198,7 @@ class IngestionPipeline:
                                 "section_path": ch.section_path,
                                 "embedding": vec.tolist(),
                                 "bbox": list(ch.bbox) if ch.bbox is not None else None,
+                                "docling_version": ch.docling_version,
                             })
                         await self.neo4j.run_write(
                             """
@@ -1212,6 +1214,7 @@ class IngestionPipeline:
                                           c.section_path = row.section_path,
                                           c.embedding = row.embedding,
                                           c.bbox = row.bbox,
+                                          c.docling_version = row.docling_version,
                                           c.doc_id = $doc_id
                             ON MATCH SET  c.text = row.text,
                                           c.summary = row.summary,
@@ -1315,6 +1318,9 @@ class IngestionPipeline:
                                 document_title=title,
                                 page_number=p["page_number"],
                                 page_text=p["text"],
+                            )
+                            extraction, _valve = apply_noise_valve(
+                                extraction, page_id=p["page_id"],
                             )
                             page_counts = await self.graph_builder.write_page(
                                 page_id=p["page_id"], extraction=extraction,
@@ -2387,6 +2393,9 @@ class IngestionPipeline:
                     page_number=page["page_number"],
                     page_text=page["text"],
                 )
+                extraction, _valve = apply_noise_valve(
+                    extraction, page_id=page["page_id"],
+                )
                 counts = await self.graph_builder.write_page(
                     page_id=page["page_id"], extraction=extraction
                 )
@@ -2602,6 +2611,7 @@ class IngestionPipeline:
                     "section_path": ch.section_path,
                     "embedding": vec.tolist(),
                     "bbox": list(ch.bbox) if ch.bbox is not None else None,
+                    "docling_version": ch.docling_version,
                 })
             await self.neo4j.run_write(
                 """
@@ -2617,6 +2627,7 @@ class IngestionPipeline:
                               c.section_path = row.section_path,
                               c.embedding = row.embedding,
                               c.bbox = row.bbox,
+                              c.docling_version = row.docling_version,
                               c.doc_id = $doc_id
                 ON MATCH SET  c.text = row.text,
                               c.summary = row.summary,

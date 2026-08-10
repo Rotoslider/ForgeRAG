@@ -22,6 +22,7 @@ from backend.ingestion.job_logs import install_job_log_handler
 from backend.ingestion.job_manager import JobManager
 from backend.ingestion.pipeline import IngestionPipeline
 from backend.routers import admin, documents, graph, health, images, ingestion, schedule, search, skills, system
+from backend.services.api_auth import install_auth
 from backend.services.colpali_service import create_colpali_service
 from backend.services.nemotron_service import create_nemotron_service
 from backend.services.entity_matcher import EntityMatcher
@@ -241,6 +242,11 @@ def create_app() -> FastAPI:
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+    )
+
+    install_auth(
+        app,
+        os.environ.get("FORGERAG_API_TOKEN", "") or settings.server.api_token,
     )
 
     # Routers

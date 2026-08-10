@@ -60,29 +60,44 @@ weld-fitting query.
   trail: `docs/noise-review-2026-08.md`. Remaining: the relations tier-1
   edge pass (support_count = 1, endpoints never co-occur) — unstarted.
 
-### N2. Extraction-time noise valve — future ingests
-- Validator rejects standalone generic-noun entities (blocklist from N1 +
-  designation-pattern heuristic); reroute generic concepts to topic_tags,
-  which is where they belong.
-- Drop model-declared relations whose subject/object was not extracted as an
-  entity on the same page (currently dropped silently by MATCH; make it a
-  logged validator decision).
+### N2. Extraction-time noise valve — future ingests — DONE (2026-08-09)
+Shipped as `backend/ingestion/noise_valve.py`, applied by both pipeline
+extraction lanes after every extract_page: blocklist matches reroute to
+page topic_tags (no entity node, no mention edge); relationships whose
+endpoints aren't among the page's own extracted identifiers (names,
+aliases, UNS/process/standard numbers, formula/table names) drop as
+logged validator decisions — this deliberately tightens the old
+graph-wide MATCH, which would let a hallucinated link to an off-page
+entity succeed; single generic-looking words are LOGGED as candidates
+for the next N1 round but never dropped on wordform alone (degree, not
+wordform, proves noise — "martensite" is one word and a great
+discriminator). Battery after shipping: byte-identical to the post-N1
+reference, as expected for a future-ingest-only change.
 
-### N3. Bearer-token auth
-It is already a REST API; it lacks authentication, not REST. One static
-token: FastAPI middleware + `Authorization` header in the Choom client
-(~50 lines total). Bind stays LAN so the Chooms keep working. Remote access,
-if ever wanted, is Tailscale — not an auth framework. Fifty-engineer
-deployment machinery (users, roles, OAuth) is explicitly out of scope for a
-one-human instrument.
+### N3. Bearer-token auth — DONE (2026-08-09)
+Shipped as `backend/services/api_auth.py` + `[server] api_token` in the
+toml (FORGERAG_API_TOKEN env wins). Localhost clients, /health, and the
+static UI shell are exempt — the Chooms and on-box use need zero changes;
+non-localhost API requests 401 without the bearer header. OFF while no
+token is configured (loud startup warning) — the owner enables it by
+pasting `openssl rand -hex 24` output into the toml and restarting. The
+Choom client sends the header automatically when FORGERAG_API_TOKEN is
+set. As designed: one static token, no users/roles/OAuth; remote access
+is Tailscale's job.
 
-### N4. Docling version bump — new ingests only
-- Branch, bump, regression-diff three golden books (chunk counts, section
-  paths, table extraction — the CSC and SLAM summary trees are ready
-  fixtures).
-- Stamp `docling_version` on chunks. Adopt for new ingests; **never**
-  retroactively re-chunk (it cascades into re-summarize + re-embed for
-  marginal gain). Old and new chunks coexist; rebuilds upgrade
+### N4. Docling version bump — new ingests only — IN EVALUATION (2026-08-09)
+- `docling_version` stamp on new chunks: SHIPPED (chunker captures the
+  installed version; both pipeline chunk writes persist it; pre-stamp
+  chunks read as empty — the mix is auditable).
+- Regression harness: SHIPPED as `scripts/docling_regression.py` —
+  docling-only imports so it runs in a throwaway candidate venv; golden
+  books = EGR_450 (81pp), SLAM Handbook (660pp, numbered hierarchy),
+  Atlas of Stress-Strain Curves (808pp, figure-dense). 2.90.0 baseline
+  reproduces the graph's historical chunk counts (±1), validating the
+  harness. Candidate 2.118.1 diff pending; adopt only if chunk counts,
+  section-path population, and table extraction hold. **Never**
+  retroactively re-chunk (cascades into re-summarize + re-embed for
+  marginal gain); old and new chunks coexist, rebuilds upgrade
   opportunistically.
 
 ---

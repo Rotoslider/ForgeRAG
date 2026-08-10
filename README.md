@@ -424,6 +424,23 @@ curl -s http://localhost:8200/health | python3 -m json.tool
 
 Open the web GUI at `http://localhost:8200/app/` — you should see the Search page with an empty library.
 
+### 14. API Auth (optional, recommended on a shared LAN)
+
+The server binds `0.0.0.0`, so anything on your LAN can reach the API.
+One static bearer token closes that: uncomment `api_token` under
+`[server]` in `config/forgerag.toml`, paste the output of
+`openssl rand -hex 24`, and restart. From then on, non-localhost requests
+without `Authorization: Bearer <token>` get a 401. **Localhost clients
+are exempt** — an on-box agent platform (Chooms), scripts, and the UI
+opened on the machine itself all keep working with zero changes; `/health`
+stays open for monitoring probes. Off-box clients (curl from a laptop,
+a remote agent) add the header; the Choom client picks the token up from
+a `FORGERAG_API_TOKEN` env var automatically. With no token configured,
+auth is off and the startup log says so loudly. This is deliberately a
+single-token scheme — users, roles, and OAuth are out of scope for a
+single-operator instrument; if you ever need remote access, tunnel with
+Tailscale rather than exposing the port.
+
 ## Adding Documents
 
 ### GUI Method
