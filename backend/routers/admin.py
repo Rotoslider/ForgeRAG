@@ -206,6 +206,70 @@ async def build_missing_summaries(
     })
 
 
+@router.post("/build-intermediate-levels")
+async def build_intermediate_levels(
+    request: Request, payload: dict | None = None
+) -> ForgeResult:
+    """Queue the intermediate-level retrofit for wide-flat summary trees
+    (one root over >150 leaf sections — the unnumbered-heading reference
+    volumes). Reuses existing leaf summaries; pays only ~n/30 cluster
+    summaries per doc. Idempotent: a retrofitted doc no longer matches
+    the wide-flat predicate. Body (optional): {"doc_ids": [...]}."""
+    neo4j = request.app.state.neo4j
+    jobs = request.app.state.job_manager
+    pipeline = request.app.state.pipeline
+
+    doc_filter = ""
+    params: dict = {}
+    wanted = (payload or {}).get("doc_ids") if isinstance(payload, dict) else None
+    if wanted:
+        doc_filter = "AND root.doc_id IN $ids "
+        params["ids"] = [str(x) for x in wanted]
+
+    docs = await neo4j.run_query(
+        f"""
+        MATCH (root:SectionSummary {{level: 0}})
+        WITH root, root.doc_id AS doc_id,
+             COUNT {{ (root)-[:PARENT_OF]->() }} AS kids,
+             COUNT {{ (x:SectionSummary {{doc_id: root.doc_id}})
+                      WHERE x.level >= 2 }} AS deep
+        WHERE kids > 150 AND deep = 0 {doc_filter}
+        MATCH (d:Document {{doc_id: doc_id}})
+        RETURN d.doc_id AS doc_id, d.filename AS filename
+        ORDER BY kids DESC
+        """,
+        params, timeout=600.0,
+    )
+    if not docs:
+        return ForgeResult(success=True, data={"queued": 0,
+                                               "reason": "no wide-flat trees"})
+    active = await jobs.list_recent(status="active", limit=5000)
+    already = {
+        j.doc_id for j in active
+        if j.job_type == "build-intermediates" and j.doc_id
+    }
+    queued = []
+    skipped = 0
+    for r in docs:
+        if r["doc_id"] in already:
+            skipped += 1
+            continue
+        job = await jobs.create(
+            source_path=f"(build-intermediates of {r['doc_id']})",
+            filename=r["filename"], categories=[], tags=[],
+            job_type="build-intermediates", doc_id=r["doc_id"], params={},
+        )
+        jobs.spawn(job.job_id, pipeline.run_build_intermediates(
+            job.job_id, r["doc_id"],
+        ))
+        queued.append({"doc_id": r["doc_id"], "job_id": job.job_id})
+    logger.info("Queued intermediate-level retrofit: %d docs (%d already "
+                "queued)", len(queued), skipped)
+    return ForgeResult(success=True, data={
+        "queued": len(queued), "already_queued": skipped, "jobs": queued,
+    })
+
+
 @router.post("/reextract-suspicious-empties")
 async def reextract_suspicious_empties(request: Request) -> ForgeResult:
     """Re-check dense pages stamped extracted-with-nothing.

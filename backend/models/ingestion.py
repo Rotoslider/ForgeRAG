@@ -36,6 +36,9 @@ JobStep = Literal[
     "summarizing_sections",
     "embedding_summaries",
     "writing_summaries",
+    # Intermediate-level retrofit for wide-flat trees (build-intermediates)
+    "clustering_sections",
+    "summarizing_intermediates",
     "done",
     "error",
 ]

@@ -184,6 +184,73 @@ def iter_nodes_bottom_up(root: SectionNode):
     yield root
 
 
+# Reference volumes with unnumbered prose headings (ASM handbooks,
+# Machinery's) produce 1 root over 1,000+ level-1 sections: fine for
+# vector retrieval, useless for tree navigation, and the root summary is
+# a merge over thousands of items. Above this many direct children, an
+# intermediate level is synthesized by page-order clustering.
+WIDE_FLAT_THRESHOLD = 150
+CLUSTER_TARGET = 30  # sections per intermediate; <= MAX_ITEMS_PER_CALL
+
+
+def cluster_label(first: "str | SectionNode", last: "str | SectionNode",
+                  page_start: int | None, page_end: int | None) -> str:
+    """Human-scannable intermediate title: page range + span of section
+    titles ("pp 120–184: Circuit Analysis … Active Filters")."""
+    f = (first.title if isinstance(first, SectionNode) else str(first)).strip()
+    l = (last.title if isinstance(last, SectionNode) else str(last)).strip()
+    span = f if f == l else f"{f[:60]} … {l[:60]}"
+    pages = ""
+    if page_start is not None:
+        pages = f"pp {page_start}–{page_end}: " if page_end not in (None, page_start) \
+            else f"p {page_start}: "
+    return f"{pages}{span}"
+
+
+def chunk_evenly(n_items: int, target: int = CLUSTER_TARGET) -> list[tuple[int, int]]:
+    """Split n_items into contiguous (start, end) slices of near-equal
+    size close to `target` — avoids a runt final cluster (2,933 items
+    become 98 clusters of 29-30, not 97x30 + 1x23)."""
+    n_clusters = max(1, round(n_items / target))
+    base, extra = divmod(n_items, n_clusters)
+    bounds, start = [], 0
+    for i in range(n_clusters):
+        size = base + (1 if i < extra else 0)
+        bounds.append((start, start + size))
+        start += size
+    return bounds
+
+
+def regroup_wide_flat(root: SectionNode) -> int:
+    """Build-time widening pass (future ingests): if the tree is one root
+    over > WIDE_FLAT_THRESHOLD leaf children, insert an intermediate
+    level by page-order clustering. Children are re-pathed under their
+    cluster (safe pre-write: summary_id derives from path at write time).
+    Returns the number of intermediates created (0 = tree untouched)."""
+    kids = list(root.children.values())
+    if len(kids) <= WIDE_FLAT_THRESHOLD or any(k.children for k in kids):
+        return 0
+    kids.sort(key=lambda k: (k.page_start if k.page_start is not None else 10**9,
+                             k.title))
+    root.children = {}
+    made = 0
+    for start, end in chunk_evenly(len(kids)):
+        group = kids[start:end]
+        p_lo = min((g.page_start for g in group if g.page_start is not None),
+                   default=None)
+        p_hi = max((g.page_end for g in group if g.page_end is not None),
+                   default=None)
+        label = cluster_label(group[0], group[-1], p_lo, p_hi)
+        mid = SectionNode(path=(label,), title=label,
+                          page_start=p_lo, page_end=p_hi)
+        for g in group:
+            g.path = mid.path + (g.title,)
+            mid.children[g.title] = g
+        root.children[label] = mid
+        made += 1
+    return made
+
+
 class TocSummarizer:
     """LLM summarization over a section tree, bottom-up."""
 

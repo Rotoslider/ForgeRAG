@@ -426,6 +426,7 @@ class IngestionPipeline:
             TocSummarizer,
             build_section_tree,
             iter_nodes_bottom_up,
+            regroup_wide_flat,
             summary_id,
         )
 
@@ -475,9 +476,14 @@ class IngestionPipeline:
                     "(summaries are rolled up from chunk summaries)"
                 )
             root = build_section_tree(title, chunks)
+            # Wide-flat books (unnumbered prose headings) get an
+            # intermediate level synthesized at build time — retrofitted
+            # for the pre-existing library by run_build_intermediates.
+            n_mid = regroup_wide_flat(root)
             await self.jobs.update_step(
                 job_id, "loading_chunks", "done",
-                detail=f"{len(chunks)} chunks into section tree",
+                detail=f"{len(chunks)} chunks into section tree"
+                + (f" (+{n_mid} synthesized intermediates)" if n_mid else ""),
             )
 
             step = "summarizing_sections"
@@ -629,6 +635,227 @@ class IngestionPipeline:
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("Build-summaries job %s failed", job_id)
+            if step is not None:
+                await self.jobs.update_step(job_id, step, "error", detail=str(exc))
+            await self.jobs.fail(job_id, str(exc))
+
+    async def run_build_intermediates(self, job_id: str, doc_id: str) -> None:
+        """Retrofit an intermediate summary level into ONE wide-flat tree.
+
+        The 2026-08 full-library build gave unnumbered-heading reference
+        volumes trees of one root over 1,000+ leaf sections. New ingests
+        get intermediates at build time (regroup_wide_flat); this pass
+        retrofits an existing tree WITHOUT re-summarizing its leaves —
+        existing child nodes keep their ids, summaries, and embeddings,
+        and only the ~n/30 cluster summaries are paid for. Whole-tree
+        rebuild via build-summaries would re-pay every leaf.
+        """
+        current_job_id.set(job_id)
+        try:
+            async with self._ingest_semaphore:
+                await self._run_build_intermediates_inner(job_id, doc_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Build-intermediates job %s failed", job_id)
+            await self.jobs.fail(job_id, str(exc))
+
+    async def _run_build_intermediates_inner(
+        self, job_id: str, doc_id: str
+    ) -> None:
+        from backend.ingestion.toc_summarizer import (
+            WIDE_FLAT_THRESHOLD,
+            TocSummarizer,
+            chunk_evenly,
+            cluster_label,
+            summary_id,
+        )
+
+        step = None
+        try:
+            await self.jobs.checkpoint(job_id)
+            await self.jobs.set_steps(job_id, [
+                "clustering_sections", "summarizing_intermediates",
+                "embedding_summaries", "writing_summaries",
+            ])
+            if self.llm is None or self.text_embedding is None:
+                raise ValueError(
+                    "LLM and text-embedding services are required"
+                )
+
+            step = "clustering_sections"
+            await self.jobs.update(
+                job_id, status="processing",
+                current_step="clustering_sections", progress_pct=2.0,
+            )
+            await self.jobs.update_step(job_id, "clustering_sections", "running")
+            trows = await self.neo4j.run_query(
+                "MATCH (d:Document {doc_id: $d}) RETURN d.title AS t",
+                {"d": doc_id},
+            )
+            doc_title = (trows[0]["t"] if trows else None) or doc_id
+            kids = await self.neo4j.run_query(
+                """
+                MATCH (root:SectionSummary {doc_id: $d, level: 0})
+                      -[:PARENT_OF]->(k:SectionSummary)
+                WHERE NOT (k)-[:PARENT_OF]->()
+                RETURN root.summary_id AS root_id, k.summary_id AS kid_id,
+                       k.title AS title, k.summary AS summary,
+                       k.page_start AS page_start, k.page_end AS page_end
+                ORDER BY coalesce(k.page_start, 999999), k.title
+                """,
+                {"d": doc_id},
+            )
+            if len(kids) <= WIDE_FLAT_THRESHOLD:
+                # Not wide-flat (or already retrofitted — children now sit
+                # under intermediates). Converged: nothing to do.
+                await self.jobs.update_step(
+                    job_id, "clustering_sections", "done",
+                    detail=f"{len(kids)} direct leaf children — no "
+                    "intermediate level needed",
+                )
+                await self.jobs.complete(job_id)
+                return
+            root_id = kids[0]["root_id"]
+            bounds = chunk_evenly(len(kids))
+            clusters = []
+            for ci, (lo, hi) in enumerate(bounds):
+                group = kids[lo:hi]
+                p_lo = min((g["page_start"] for g in group
+                            if g["page_start"] is not None), default=None)
+                p_hi = max((g["page_end"] for g in group
+                            if g["page_end"] is not None), default=None)
+                label = cluster_label(group[0]["title"], group[-1]["title"],
+                                      p_lo, p_hi)
+                clusters.append({
+                    "summary_id": summary_id(
+                        doc_id, ("~intermediate", f"{ci:04d}", label)
+                    ),
+                    "title": label, "page_start": p_lo, "page_end": p_hi,
+                    "kid_ids": [g["kid_id"] for g in group],
+                    "kid_summaries": [g["summary"] or g["title"]
+                                      for g in group],
+                })
+            await self.jobs.update_step(
+                job_id, "clustering_sections", "done",
+                detail=f"{len(kids)} sections into {len(clusters)} clusters",
+            )
+
+            step = "summarizing_intermediates"
+            await self.jobs.update(
+                job_id, current_step="summarizing_intermediates",
+                progress_pct=5.0, pages_total=len(clusters), pages_processed=0,
+            )
+            await self.jobs.update_step(
+                job_id, "summarizing_intermediates", "running",
+                detail=f"{len(clusters)} cluster summaries via LLM",
+            )
+            summarizer = TocSummarizer(self.llm)
+            for i, cl in enumerate(clusters):
+                await self.jobs.checkpoint(job_id)
+                cl["summary"] = await summarizer.summarize_items(
+                    doc_title, cl["title"], cl.pop("kid_summaries"),
+                )
+                if (i + 1) % 5 == 0 or i + 1 == len(clusters):
+                    await self.jobs.update(
+                        job_id, pages_processed=i + 1,
+                        progress_pct=5.0 + 70.0 * (i + 1) / len(clusters),
+                    )
+            empty = [c for c in clusters if not (c.get("summary") or "").strip()]
+            if empty:
+                raise RuntimeError(
+                    f"{len(empty)} of {len(clusters)} cluster summaries came "
+                    "back empty — tree left untouched"
+                )
+            await self.jobs.update_step(
+                job_id, "summarizing_intermediates", "done",
+                detail=f"{len(clusters)} cluster summaries",
+            )
+
+            step = "embedding_summaries"
+            await self.jobs.update(
+                job_id, current_step="embedding_summaries", progress_pct=80.0,
+            )
+            await self.jobs.update_step(job_id, "embedding_summaries", "running")
+            assert self.gpu is not None
+            async with self.gpu.load_scope("text_embedding"):
+                vectors = await asyncio.to_thread(
+                    self.text_embedding.embed_documents,
+                    [c["summary"] for c in clusters],
+                    batch_size=self.settings.ingestion.text_embedding_batch_size,
+                )
+            for cl, vec in zip(clusters, vectors):
+                cl["embedding"] = vec.tolist()
+            await self.jobs.update_step(
+                job_id, "embedding_summaries", "done",
+                detail=f"{len(vectors)} vectors",
+            )
+
+            step = "writing_summaries"
+            await self.jobs.update(
+                job_id, current_step="writing_summaries", progress_pct=92.0,
+            )
+            await self.jobs.update_step(job_id, "writing_summaries", "running")
+            # One statement: create intermediates, rewire root->mid->kid,
+            # drop the old root->kid edges, demote kids to level 2 — so a
+            # kill can't leave the tree half-rewired.
+            await self.neo4j.run_write(
+                """
+                MATCH (root:SectionSummary {summary_id: $root_id})
+                MATCH (d:Document {doc_id: $d})
+                UNWIND $clusters AS cl
+                MERGE (m:SectionSummary {summary_id: cl.summary_id})
+                SET m.doc_id = $d, m.title = cl.title, m.level = 1,
+                    m.path = [cl.title], m.summary = cl.summary,
+                    m.page_start = cl.page_start, m.page_end = cl.page_end,
+                    m.embedding = cl.embedding, m.synthesized = true
+                MERGE (d)-[:HAS_SUMMARY]->(m)
+                MERGE (root)-[:PARENT_OF]->(m)
+                WITH root, m, cl
+                UNWIND cl.kid_ids AS kid_id
+                MATCH (k:SectionSummary {summary_id: kid_id})
+                MERGE (m)-[:PARENT_OF]->(k)
+                SET k.level = 2
+                WITH root, k
+                MATCH (root)-[old:PARENT_OF]->(k)
+                DELETE old
+                """,
+                {"root_id": root_id, "d": doc_id, "clusters": clusters},
+                timeout=600.0,
+            )
+            # Count-verify the rewire: root's children == clusters, every
+            # former kid has exactly one intermediate parent.
+            check = await self.neo4j.run_query(
+                """
+                MATCH (root:SectionSummary {summary_id: $root_id})
+                RETURN COUNT { (root)-[:PARENT_OF]->() } AS root_kids,
+                       COUNT { (root)-[:PARENT_OF]->(m {level: 1})
+                               -[:PARENT_OF]->(k) } AS wired_kids
+                """,
+                {"root_id": root_id},
+            )
+            rk, wk = check[0]["root_kids"], check[0]["wired_kids"]
+            if rk != len(clusters) or wk != len(kids):
+                raise RuntimeError(
+                    f"rewire mismatch: root has {rk} children (expected "
+                    f"{len(clusters)}), {wk} grandchildren (expected "
+                    f"{len(kids)}) — intermediates_built_at NOT stamped"
+                )
+            await self.neo4j.run_write(
+                "MATCH (d:Document {doc_id: $d}) "
+                "SET d.intermediates_built_at = datetime()",
+                {"d": doc_id},
+            )
+            await self.jobs.update_step(
+                job_id, "writing_summaries", "done",
+                detail=f"{len(clusters)} intermediates wired over {len(kids)} "
+                "sections",
+            )
+            await self.jobs.complete(job_id)
+            logger.info(
+                "Intermediate level built for doc %s: %d clusters over %d "
+                "sections", doc_id, len(clusters), len(kids),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Build-intermediates job %s failed", job_id)
             if step is not None:
                 await self.jobs.update_step(job_id, step, "error", detail=str(exc))
             await self.jobs.fail(job_id, str(exc))

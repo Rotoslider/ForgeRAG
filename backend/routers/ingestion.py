@@ -225,7 +225,7 @@ async def cancel_job(job_id: str, request: Request) -> ForgeResult:
 RESTARTABLE_JOB_TYPES = {
     "ingest", "fill-missing", "extract-entities", "rebuild-chunks",
     "re-embed", "text-reembed", "resummarize", "autotag",
-    "build-communities", "build-summaries",
+    "build-communities", "build-summaries", "build-intermediates",
 }
 
 
@@ -268,6 +268,8 @@ def _build_restart_coro(pipeline, new_job_id: str, job):
         return pipeline.run_communities_only(new_job_id)
     if jt == "build-summaries" and doc_id:
         return pipeline.run_build_summaries(new_job_id, doc_id)
+    if jt == "build-intermediates" and doc_id:
+        return pipeline.run_build_intermediates(new_job_id, doc_id)
     return None
 
 
