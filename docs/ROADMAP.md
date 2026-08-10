@@ -85,20 +85,21 @@ Choom client sends the header automatically when FORGERAG_API_TOKEN is
 set. As designed: one static token, no users/roles/OAuth; remote access
 is Tailscale's job.
 
-### N4. Docling version bump — new ingests only — IN EVALUATION (2026-08-09)
-- `docling_version` stamp on new chunks: SHIPPED (chunker captures the
-  installed version; both pipeline chunk writes persist it; pre-stamp
-  chunks read as empty — the mix is auditable).
-- Regression harness: SHIPPED as `scripts/docling_regression.py` —
-  docling-only imports so it runs in a throwaway candidate venv; golden
-  books = EGR_450 (81pp), SLAM Handbook (660pp, numbered hierarchy),
-  Atlas of Stress-Strain Curves (808pp, figure-dense). 2.90.0 baseline
-  reproduces the graph's historical chunk counts (±1), validating the
-  harness. Candidate 2.118.1 diff pending; adopt only if chunk counts,
-  section-path population, and table extraction hold. **Never**
-  retroactively re-chunk (cascades into re-summarize + re-embed for
-  marginal gain); old and new chunks coexist, rebuilds upgrade
-  opportunistically.
+### N4. Docling version bump — new ingests only — DONE (2026-08-09)
+Adopted **2.118.1** (from 2.90.0) after the golden-book regression came
+back clean: EGR_450 and SLAM Handbook structurally IDENTICAL (chunks,
+section paths, tables, pictures; text within ±15 chars of whitespace);
+Atlas of Stress-Strain Curves −1.5% chunks / −3% OCR text on pure-figure
+plates (bundled RapidOCR 2.x→3.9 reads slightly less curve-label text;
+structure held — acceptable for a book whose retrieval value is the
+pixel plane). Dependency check: docling-family only, no torch/
+transformers/pydantic-core churn. Caution for next time: an in-place
+`pip install` left a broken namespace package (docling/docling-slim
+split) — uninstall the family first, then install clean. Golden diffs
+preserved at `scripts/eval/results/2026-08-09-docling-*.json`;
+`docling_version` stamp ships on every new chunk; harness at
+`scripts/docling_regression.py`. **Never** retroactively re-chunk; old
+and new chunks coexist, rebuilds upgrade opportunistically.
 
 ---
 

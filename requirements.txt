@@ -47,3 +47,4 @@ python-igraph>=0.11
 # Visualization (pulled by colpali-engine interpretability)
 matplotlib>=3.8
 seaborn>=0.13
+docling==2.118.1

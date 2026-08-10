@@ -1,0 +1,38 @@
+{
+  "docling_version": "2.90.0",
+  "books": [
+    {
+      "file": "33d7d984b7b74a14866bc934c1b6d407_EGR_450_Manufacturing_Controls.pdf",
+      "pages": 81,
+      "chunks": 142,
+      "text_chars": 95395,
+      "chunks_with_section_path": 142,
+      "distinct_section_paths": 70,
+      "tables": 7,
+      "pictures": 54,
+      "convert_secs": 14.6
+    },
+    {
+      "file": "2ad626c2709d445389cf8ee52f2fe52c_SLAM Handbook.pdf",
+      "pages": 660,
+      "chunks": 1127,
+      "text_chars": 1642506,
+      "chunks_with_section_path": 1127,
+      "distinct_section_paths": 471,
+      "tables": 18,
+      "pictures": 217,
+      "convert_secs": 206.7
+    },
+    {
+      "file": "010ee24c12a445b1a9491c523630c69c_Y. Tamarin - Atlas of Stress-Strain Curves-ASM International (2002).pdf",
+      "pages": 808,
+      "chunks": 1416,
+      "text_chars": 794264,
+      "chunks_with_section_path": 1415,
+      "distinct_section_paths": 1302,
+      "tables": 10,
+      "pictures": 1414,
+      "convert_secs": 683.5
+    }
+  ]
+}
