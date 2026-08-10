@@ -73,6 +73,11 @@ def main() -> None:
         port=settings.server.port,
         log_level="info",
         reload=False,
+        # Uvicorn's default 5s idle keep-alive loses a race against browser
+        # connection pools (Firefox reuses idle connections for ~115s): a
+        # fetch fired into a socket the server just closed surfaces as
+        # "NetworkError" even on localhost. Outlive the browser pools.
+        timeout_keep_alive=120,
     )
 
 

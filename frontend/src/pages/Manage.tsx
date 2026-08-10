@@ -5,8 +5,10 @@ import {
   addDocumentTag,
   applyTags,
   auditCompleteness,
+  autotagMissing,
   backfillBlankFlags,
   buildCommunities,
+  buildMissingSummaries,
   deepVerify,
   deleteDocument,
   extractMissingEntitiesAll,
@@ -21,7 +23,9 @@ import {
   getStepIssues,
   moveDocument,
   normalizeEntities,
+  purgeOrphanSummaries,
   removeDocumentTag,
+  resummarizeFallbacks,
   extractEntities,
   browseDirectories,
   fetchHealth,
@@ -981,18 +985,42 @@ const VERIFY_FIXES: Record<string, {
     note: "Dense pages that extracted to nothing before the anti-bail retry existed. Re-runs them through the LLM; pages that are genuinely empty get a confirmed-empty marker and stop being counted, so this converges. Background LLM work — slow for a big backlog.",
     run: () => reextractSuspiciousEmpties(),
   },
+  chunk_summaries_genuine: {
+    label: (v) => `Regenerate fallback summaries now (${v.toLocaleString()} chunks)`,
+    note: "Re-summarizes and re-embeds chunks whose summary fell back to a raw text preview after an LLM failure. One background job; chunks that fail again stay marked for the next run.",
+    run: () => resummarizeFallbacks(),
+  },
+  documents_organized: {
+    label: (v) => `Auto-tag unorganized docs now (${v.toLocaleString()} docs)`,
+    note: "Runs auto-tagging for documents left with the default collection and no categories or tags. One background job — quick LLM work per doc.",
+    run: () => autotagMissing(),
+  },
+  docs_have_summaries: {
+    label: (v) => `Build missing summary trees now (${v.toLocaleString()} docs)`,
+    note: "Queues the RAPTOR-by-TOC summary builder, one job per document. Long-running background LLM work — docs already queued are skipped, so this is safe to press again.",
+    run: () => buildMissingSummaries(),
+  },
+  no_orphan_section_summaries: {
+    label: (v) => `Purge orphaned summaries now (${v.toLocaleString()} nodes)`,
+    note: "Deletes section summaries whose document was deleted — their embeddings could otherwise keep surfacing in zoom-out retrieval. Runs synchronously, fast.",
+    run: () => purgeOrphanSummaries(),
+  },
 };
 
 // Loose response shape shared by the verify-fix drains — queued is a count
-// for the job-per-doc endpoints and a boolean for the blank-flag backfill.
+// for the job-per-doc endpoints, a boolean for the blank-flag backfill, and
+// the single-global-job drains (resummarize, autotag) return job_id instead.
 interface ForgeResultShape {
   success: boolean;
   reason?: string | null;
   data?: {
     queued?: number | boolean;
+    already_queued?: number;
+    job_id?: string;
     pages?: number;
     merged?: number;
     temp_rels_recovered?: number;
+    deleted?: number;
   };
 }
 
@@ -1032,9 +1060,12 @@ function VerificationCard() {
     onSuccess: (res, checkName) => {
       const d = (res.data ?? {}) as {
         queued?: number | boolean;
+        already_queued?: number;
+        job_id?: string;
         pages?: number;
         merged?: number;
         temp_rels_recovered?: number;
+        deleted?: number;
       };
       // Three genuinely different outcomes deserve three different
       // messages: a synchronous fix already FINISHED (normalize), a drain
@@ -1047,14 +1078,27 @@ function VerificationCard() {
           `Done — merged ${d.merged.toLocaleString()} duplicate(s)` +
           `${d.temp_rels_recovered ? `, recovered ${d.temp_rels_recovered} temp rels` : ""}` +
           ` (ran synchronously, already finished). Re-run verification to confirm.`;
+      } else if (typeof d.deleted === "number" && d.deleted > 0) {
+        msg =
+          `Done — purged ${d.deleted.toLocaleString()} orphaned node(s) ` +
+          `(ran synchronously, already finished). Re-run verification to confirm.`;
+      } else if (typeof d.job_id === "string") {
+        msg =
+          "Queued one background job. Watch progress on the Ingest page, " +
+          "then re-run verification once it finishes.";
       } else if (
         (typeof d.queued === "number" && d.queued > 0) ||
         d.queued === true
       ) {
         msg =
-          `Queued ${typeof d.queued === "number" ? `${d.queued} job(s), ` : ""}` +
-          `${(d.pages ?? 0).toLocaleString()} pages. Watch progress on the Ingest ` +
-          `page, then re-run verification once the queue drains.`;
+          `Queued ${typeof d.queued === "number" ? `${d.queued} job(s)` : "jobs"}` +
+          `${typeof d.pages === "number" ? `, ${d.pages.toLocaleString()} pages` : ""}. ` +
+          `Watch progress on the Ingest page, then re-run verification once the queue drains.`;
+      } else if (typeof d.already_queued === "number" && d.already_queued > 0) {
+        msg =
+          `Nothing new to queue — ${d.already_queued.toLocaleString()} doc(s) ` +
+          `already have active build jobs. Watch the Ingest page, then re-run ` +
+          `verification once the queue drains.`;
       } else {
         msg =
           "Nothing left to do — the violation has likely already cleared " +

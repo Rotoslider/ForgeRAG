@@ -127,6 +127,24 @@ async def run_verification(neo4j, settings) -> dict:
         len(rows), samples=rows[:SAMPLE],
     ))
 
+    # Orphaned summaries still carry live embeddings, so a deleted
+    # document's content can keep surfacing in zoom-out retrieval.
+    # (delete_document leaked the whole tree before 2026-08-10.)
+    rows = await q("""
+        MATCH (s:SectionSummary)
+        WHERE NOT EXISTS { MATCH (:Document {doc_id: s.doc_id}) }
+        RETURN s.summary_id AS id, s.doc_id AS doc_id, s.title AS title
+        LIMIT 1000
+    """)
+    checks.append(_check(
+        "no_orphan_section_summaries",
+        "Every section summary belongs to an existing document "
+        "(deleting a doc must take its TOC summary tree with it)",
+        len(rows), samples=rows[:SAMPLE],
+        detail="run POST /admin/purge-orphan-summaries to delete them"
+        if rows else None,
+    ))
+
     # --------------------------------------------------------------- files
     rows = await q("""
         MATCH (:Document)-[:HAS_PAGE]->(p:Page)

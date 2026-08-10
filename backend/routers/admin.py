@@ -581,6 +581,37 @@ async def fill_missing(request: Request, payload: dict | None = None) -> ForgeRe
     )
 
 
+@router.post("/purge-orphan-summaries")
+async def purge_orphan_summaries(request: Request) -> ForgeResult:
+    """Delete :SectionSummary nodes whose document no longer exists.
+
+    The footprint of document deletions before 2026-08-10, when
+    delete_document did not remove the TOC summary tree — the orphans
+    keep live embeddings, so a deleted doc's content could still surface
+    in zoom-out retrieval. Twin of the no_orphan_section_summaries
+    verification check. Synchronous and idempotent."""
+    neo4j = request.app.state.neo4j
+    orphans = await neo4j.run_query(
+        """
+        MATCH (s:SectionSummary)
+        WHERE NOT EXISTS { MATCH (:Document {doc_id: s.doc_id}) }
+        RETURN count(s) AS n
+        """,
+        timeout=600.0,
+    )
+    n = orphans[0]["n"] if orphans else 0
+    if n:
+        await neo4j.run_write(
+            """
+            MATCH (s:SectionSummary)
+            WHERE NOT EXISTS { MATCH (:Document {doc_id: s.doc_id}) }
+            DETACH DELETE s
+            """
+        )
+    logger.info("purge-orphan-summaries: deleted %d orphaned summaries", n)
+    return ForgeResult(success=True, data={"deleted": n})
+
+
 @router.post("/normalize-entities")
 async def normalize_entities(request: Request) -> ForgeResult:
     """Merge duplicate entities that differ only by case or whitespace.

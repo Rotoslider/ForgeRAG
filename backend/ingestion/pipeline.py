@@ -389,6 +389,43 @@ class IngestionPipeline:
                     job_id, "dedup_entities", "error", detail=str(exc)
                 )
 
+            # The TOC summary tree is a separate job type, not an ingest
+            # step — queue it here so a fresh doc doesn't sit in the
+            # docs_have_summaries warning until someone presses the drain
+            # button. Non-fatal: the verification drain stays the backstop.
+            try:
+                from backend.services.work_predicates import SUMMARIES_MISSING
+
+                needs = await self.neo4j.run_query(
+                    f"MATCH (d:Document {{doc_id: $id}}) "
+                    f"WHERE {SUMMARIES_MISSING} RETURN 1 AS yes",
+                    {"id": doc_id},
+                )
+                active = await self.jobs.list_recent(status="active", limit=5000)
+                already = any(
+                    j.job_type == "build-summaries" and j.doc_id == doc_id
+                    for j in active
+                )
+                if needs and not already:
+                    follow = await self.jobs.create(
+                        source_path=f"(build-summaries of {doc_id})",
+                        filename=job.filename, categories=[], tags=[],
+                        job_type="build-summaries", doc_id=doc_id, params={},
+                    )
+                    self.jobs.spawn(
+                        follow.job_id,
+                        self.run_build_summaries(follow.job_id, doc_id),
+                    )
+                    logger.info(
+                        "Queued follow-on build-summaries %s for doc %s",
+                        follow.job_id, doc_id,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not queue follow-on build-summaries for %s: %s",
+                    doc_id, exc,
+                )
+
             await self.jobs.complete(job_id)
             logger.info("Job %s completed successfully", job_id)
 
@@ -448,7 +485,15 @@ class IngestionPipeline:
                 {"d": doc_id},
             )
             if not rows:
-                raise ValueError(f"Document {doc_id} not found")
+                # Deleted between queue time and run time (ingest now
+                # auto-queues this job type, and deletion doesn't cancel a
+                # doc's pending jobs) — nothing to build, not a failure.
+                await self.jobs.update_step(
+                    job_id, "loading_chunks", "done",
+                    detail="document deleted before build — nothing to do",
+                )
+                await self.jobs.complete(job_id)
+                return
             title = rows[0]["title"] or doc_id
 
             step = "loading_chunks"

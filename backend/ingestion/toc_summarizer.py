@@ -21,12 +21,21 @@ page-window sections so every document gets a tree.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
 from dataclasses import dataclass, field
 
+from backend.services.llm_service import LLMTransientError
+
 logger = logging.getLogger(__name__)
+
+# A momentary LM Studio engine crash or timeout must not kill a tree build
+# carrying hours of already-paid summaries — wait out the engine reload
+# before letting the error reach the job. Delays between retries; the
+# attempt after the last delay is the final one.
+TRANSIENT_BACKOFF_S = (2.0, 5.0, 15.0, 40.0)
 
 # Leading section number in a heading: "9.2.3 Feature-based Odometry",
 # "3.1: Drive systems", "12) Bearings".
@@ -258,23 +267,33 @@ class TocSummarizer:
         self.llm = llm
 
     async def _call(self, prompt: str, max_tokens: int) -> tuple[str, str | None]:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You summarize sections of engineering reference "
+                    "books. Write a dense factual summary (120-200 "
+                    "words) of what this section covers: topics, "
+                    "materials, methods, standards, notable tables or "
+                    "figures. No preamble, no meta-commentary — just "
+                    "the summary text."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
+        for delay in TRANSIENT_BACKOFF_S:
+            try:
+                return await self.llm.chat_with_finish_reason(
+                    messages, max_tokens=max_tokens, temperature=0.2
+                )
+            except LLMTransientError as exc:
+                logger.warning(
+                    "Transient LLM failure during summary, retrying in %.0fs: %s",
+                    delay, exc,
+                )
+                await asyncio.sleep(delay)
         return await self.llm.chat_with_finish_reason(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You summarize sections of engineering reference "
-                        "books. Write a dense factual summary (120-200 "
-                        "words) of what this section covers: topics, "
-                        "materials, methods, standards, notable tables or "
-                        "figures. No preamble, no meta-commentary — just "
-                        "the summary text."
-                    ),
-                },
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=max_tokens,
-            temperature=0.2,
+            messages, max_tokens=max_tokens, temperature=0.2
         )
 
     async def summarize_items(

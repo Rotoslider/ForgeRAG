@@ -547,6 +547,21 @@ export const backfillBlankFlags = () =>
     "/admin/backfill-blank-flags",
     { method: "POST" }
   );
+export const purgeOrphanSummaries = () =>
+  request<{ deleted: number }>("/admin/purge-orphan-summaries", {
+    method: "POST",
+  });
+export const resummarizeFallbacks = () =>
+  request<{ job_id: string }>("/admin/resummarize-fallbacks", {
+    method: "POST",
+  });
+export const autotagMissing = () =>
+  request<{ job_id: string }>("/admin/autotag-missing", { method: "POST" });
+export const buildMissingSummaries = () =>
+  request<{ queued: number; already_queued: number }>(
+    "/admin/build-missing-summaries",
+    { method: "POST", timeoutMs: 10 * 60 * 1000 }
+  );
 
 export const fillMissingBulk = (body: {
   doc_ids: string[];

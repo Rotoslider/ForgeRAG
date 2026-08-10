@@ -300,15 +300,19 @@ async def delete_document(doc_id: str, request: Request) -> ForgeResult:
     file_hash = rows[0]["h"]
     filename = rows[0]["f"]
 
-    # Detach-delete the document, its pages, and the chunks attached to those
-    # pages (keeps category/tag nodes). Without deleting chunks here they'd be
-    # left orphaned in the graph.
+    # Detach-delete the document, its pages, the chunks attached to those
+    # pages, and its TOC summary tree (keeps category/tag nodes). Without
+    # deleting them here, chunks and :SectionSummary nodes would be left
+    # orphaned in the graph. Summaries are matched by doc_id property, not
+    # only the HAS_SUMMARY edge, so intermediate/child tree levels that
+    # hang off PARENT_OF chains are covered too.
     await neo4j.run_write(
         """
         MATCH (d:Document {doc_id: $doc_id})
         OPTIONAL MATCH (d)-[:HAS_PAGE]->(p:Page)
         OPTIONAL MATCH (p)-[:HAS_CHUNK]->(c:Chunk)
-        DETACH DELETE d, p, c
+        OPTIONAL MATCH (s:SectionSummary {doc_id: $doc_id})
+        DETACH DELETE d, p, c, s
         """,
         {"doc_id": doc_id},
     )

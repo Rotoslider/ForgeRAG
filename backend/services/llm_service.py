@@ -60,6 +60,18 @@ class LLMTruncationError(LLMFatalError):
     """
 
 
+# LM Studio reports an internal inference-engine crash as HTTP 400 with one
+# of these bodies — a transient server failure wearing a client-error status
+# code (live 2026-08-10: one engine crash burst failed 19 of 27
+# build-summaries jobs, all "Engine protocol predict request failed: fetch
+# failed"). Matched case-insensitively against the response body.
+_ENGINE_CRASH_400_MARKERS = (
+    "engine protocol predict request failed",
+    "fetch failed",
+    "model has crashed",
+)
+
+
 class CircuitBreaker:
     """Circuit breaker for the LLM HTTP endpoint.
 
@@ -283,6 +295,12 @@ class LLMService:
             self.circuit_breaker.record_failure()
             raise LLMTransientError(f"Server {r.status_code}: {r.text[:200]}")
         if r.status_code >= 400:
+            body_lower = (r.text or "").lower()
+            if any(m in body_lower for m in _ENGINE_CRASH_400_MARKERS):
+                self.circuit_breaker.record_failure()
+                raise LLMTransientError(
+                    f"Engine crash (HTTP {r.status_code}): {r.text[:200]}"
+                )
             raise LLMFatalError(f"HTTP {r.status_code}: {r.text[:400]}")
 
         try:
