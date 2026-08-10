@@ -215,11 +215,13 @@ async def explore_from_query(
         MATCH (e)-[r1]->(neighbor)
         WHERE type(r1) IN ['GOVERNED_BY','COMPATIBLE_WITH_PROCESS',
                            'REFERENCES','CONTAINS_CLAUSE','REQUIRES_MATERIAL']
+          AND coalesce(r1.suspect, false) = false
           AND any(l IN labels(neighbor) WHERE l IN
               ['Material','Process','Standard','Clause','Equipment'])
         OPTIONAL MATCH (neighbor)-[r2]->(hop2)
         WHERE type(r2) IN ['GOVERNED_BY','COMPATIBLE_WITH_PROCESS',
                            'REFERENCES','CONTAINS_CLAUSE']
+          AND coalesce(r2.suspect, false) = false
           AND any(l IN labels(hop2) WHERE l IN
               ['Material','Process','Standard','Clause','Equipment'])
         RETURN coalesce(e.name, e.code) AS from_name,

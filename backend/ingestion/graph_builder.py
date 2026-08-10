@@ -559,7 +559,10 @@ class GraphBuilder:
                 MERGE (s)-[r:{rel_name}]->(d)
                 ON CREATE SET r.context = row.context, r.support_count = 1
                 ON MATCH SET  r.context = coalesce(r.context, row.context),
-                              r.support_count = coalesce(r.support_count, 0) + 1
+                              r.support_count = coalesce(r.support_count, 0) + 1,
+                              // Independent re-assertion is the evidence the
+                              // N1 tier-1 flag was waiting for — self-heal.
+                              r.suspect = null
             """
             await self.neo4j.run_write(cypher, {"rows": rows})
             written += len(rows)

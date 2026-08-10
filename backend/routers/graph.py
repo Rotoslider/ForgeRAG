@@ -52,7 +52,8 @@ _QUERY_TEMPLATES: dict[QueryTemplate, tuple[str, list[str]]] = {
            OR $material IN coalesce(m.common_names, [])
         MATCH (m)-[r:GOVERNED_BY]->(s:Standard)
         RETURN m.name AS material, s.code AS standard, s.organization AS org,
-               r.support_count AS support_count, r.context AS context
+               r.support_count AS support_count, r.context AS context,
+               coalesce(r.suspect, false) AS suspect
         ORDER BY r.support_count DESC, s.code
         LIMIT $limit
         """,
@@ -66,7 +67,8 @@ _QUERY_TEMPLATES: dict[QueryTemplate, tuple[str, list[str]]] = {
         MATCH (m:Material)-[r:COMPATIBLE_WITH_PROCESS]->(p)
         RETURN p.name AS process, m.name AS material,
                m.material_type AS material_type,
-               r.support_count AS support_count, r.context AS context
+               r.support_count AS support_count, r.context AS context,
+               coalesce(r.suspect, false) AS suspect
         ORDER BY r.support_count DESC, m.name
         LIMIT $limit
         """,
@@ -80,7 +82,8 @@ _QUERY_TEMPLATES: dict[QueryTemplate, tuple[str, list[str]]] = {
            OR $standard IN coalesce(s1.common_names, [])
         MATCH (s1)-[r:REFERENCES]->(s2:Standard)
         RETURN s1.code AS standard, s2.code AS referenced, s2.organization AS org,
-               r.support_count AS support_count, r.context AS context
+               r.support_count AS support_count, r.context AS context,
+               coalesce(r.suspect, false) AS suspect
         ORDER BY r.support_count DESC, s2.code
         LIMIT $limit
         """,
@@ -106,7 +109,8 @@ _QUERY_TEMPLATES: dict[QueryTemplate, tuple[str, list[str]]] = {
         MATCH (e:Equipment)
         WHERE e.name = $equipment
            OR $equipment IN coalesce(e.common_names, [])
-        OPTIONAL MATCH (e)-[:GOVERNED_BY]->(s:Standard)
+        OPTIONAL MATCH (e)-[gr:GOVERNED_BY]->(s:Standard)
+        WHERE coalesce(gr.suspect, false) = false
         WITH e, collect(DISTINCT s.code) AS standards
         RETURN e.name AS equipment, e.equipment_type AS equipment_type,
                standards

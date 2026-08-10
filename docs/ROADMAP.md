@@ -43,6 +43,13 @@ weld-fitting query.
 - **Cost:** hours of Cypher + one review session. Zero LLM. **Full era
   re-extraction remains the nuclear option and is NOT justified** (the depth
   sample showed parity on real designations).
+- **Relations tier 1: DONE 2026-08-09 (owner call: FLAG, never delete).**
+  31,914 single-assertion edges whose endpoints never co-occur elsewhere
+  marked `r.suspect`; 8,315 support-1 edges spared by the co-occurrence
+  test; reasoning chains exclude, explicit queries surface the flag,
+  write path self-heals on independent re-assertion. Tier 2 (LLM
+  re-adjudication) now almost certainly unnecessary. Details in
+  docs/noise-review-2026-08.md.
 - **Design refinement (2026-08, after extracting 306 candidates):** degree
   alone conflates two populations needing different remedies. "steel"
   (5,556 pages) is a useless retrieval discriminator but so is deleting it
@@ -57,8 +64,8 @@ weld-fitting query.
   stop-tiered with count-verified writes, exclusion wired into the matcher
   + graph_first + graph_boosted (live at next restart), blocklist banked
   for N2, verification check #30 pins graph↔ledger parity. Full audit
-  trail: `docs/noise-review-2026-08.md`. Remaining: the relations tier-1
-  edge pass (support_count = 1, endpoints never co-occur) — unstarted.
+  trail: `docs/noise-review-2026-08.md`. With the tier-1 edge pass above,
+  **N1 is fully closed.**
 
 ### N2. Extraction-time noise valve — future ingests — DONE (2026-08-09)
 Shipped as `backend/ingestion/noise_valve.py`, applied by both pipeline

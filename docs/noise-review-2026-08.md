@@ -94,6 +94,29 @@ Guards are pinned by `tests/test_noise_tier.py`; verification check #30
 (`noise_stop_tier_matches_ledger`) proves graph marks and banked
 blocklist agree exactly, both directions, forever.
 
+## Relations tier-1 addendum (2026-08-09, owner-approved: FLAG, not delete)
+
+Entity-entity edges (COMPATIBLE_WITH_PROCESS / GOVERNED_BY / REFERENCES)
+with `support_count <= 1` whose endpoints co-occur on **at most one page**
+in the whole library were marked `r.suspect = true`:
+
+- **31,914 flagged** of 45,579 entity-entity edges (70% — the
+  hallucination tail of single-page assertions).
+- **8,315 support-1 edges KEPT**: their endpoints co-occur on other
+  pages — evidence exists, so the co-occurrence test spared exactly the
+  rare-but-plausible facts deletion would have destroyed.
+- By type: COMPATIBLE_WITH_PROCESS 16,621 · GOVERNED_BY 14,439 ·
+  REFERENCES 854.
+
+Consumption: reasoning chains (answer-mode graph context) exclude
+suspect edges; explicit graph queries (material_standards etc.) return
+the flag per-row so agents see the caveat instead of losing the data;
+bare name-list enrichments filter them. **Self-healing:** when a future
+page independently re-asserts a flagged edge, the write path increments
+support and clears the flag — independent re-assertion is precisely the
+evidence the flag was waiting for. Reversal of everything:
+`MATCH ()-[r]->() WHERE r.suspect = true REMOVE r.suspect`.
+
 ## Genesis's torn calls (recorded for posterity)
 
 - Heat-treating verbs (Annealing 1,822 pages, tempering, quenching,
