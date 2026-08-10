@@ -819,7 +819,6 @@ class IngestionPipeline:
                 DELETE old
                 """,
                 {"root_id": root_id, "d": doc_id, "clusters": clusters},
-                timeout=600.0,
             )
             # Count-verify the rewire: root's children == clusters, every
             # former kid has exactly one intermediate parent.
