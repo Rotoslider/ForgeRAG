@@ -163,14 +163,32 @@ async def graph_query(body: GraphQueryRequest, request: Request) -> ForgeResult:
         raise HTTPException(status_code=400, detail=f"Unknown query_type: {body.query_type}")
     cypher, required = tpl
 
+    # Accept the obvious synonyms agents actually send — every eval run
+    # hit "entity_pages needs parameters.entity_name" before retrying
+    # with the exact key. The intent is unambiguous; take it.
+    _ALIASES = {
+        "entity_name": ("name", "entity"),
+        "material": ("name",),
+        "process": ("name",),
+        "standard": ("code", "name"),
+        "equipment": ("name",),
+    }
+    body_params = dict(body.parameters)
     for p in required:
-        if p not in body.parameters:
+        if p not in body_params:
+            for alt in _ALIASES.get(p, ()):
+                if alt in body_params:
+                    body_params[p] = body_params.pop(alt)
+                    break
+
+    for p in required:
+        if p not in body_params:
             raise HTTPException(
                 status_code=400,
                 detail=f"Missing required parameter '{p}' for query_type '{body.query_type}'",
             )
 
-    params = dict(body.parameters)
+    params = dict(body_params)
     params["limit"] = body.limit
     rows = await neo4j.run_query(cypher, params)
     return ForgeResult(success=True, data=rows)
