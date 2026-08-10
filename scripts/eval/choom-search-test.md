@@ -81,7 +81,7 @@ use), not the numbers printed in the books.
 
 | ID | Expected source (top-3 should include) | Expected fact |
 |----|----------------------------------------|---------------|
-| K1 | ASM Handbook Vol 2, p763 / p772 | C26000 = cartridge brass, 70% — 70.0 Cu / 30.0 Zn; excellent cold workability. (Schuler Metal Forming p472 also cross-references it — bonus hit) |
+| K1 | ASM Handbook Vol 2 — p1027/p1028 (property pages) or p1337 (alloy table) under the post-polish ranking | C26000 = cartridge brass, 70% — 70.0 Cu / 30.0 Zn; excellent cold workability. The composition/workability TABLE rows live at p763/p772 — surface them with `prefer:"table"` on keyword search (p772 enters a limit-10 preferred set). (Schuler Metal Forming p472 cross-references it — bonus hit) |
 | K2 | ASM Handbook Vol 6, p154 / p156 | E7018 = low-hydrogen iron-powder SMAW electrode (coating constituents table) |
 | K3 | NFPA 70 NEC, p75 | Section 210.8, GFCI protection for personnel, 210.8(A)–(D) |
 | K4 | Structural Steel Designers Handbook, p20–21 | A36: min yield 36 ksi, tensile 58–80 ksi |
@@ -112,5 +112,61 @@ relevant non-empty results without errors.
 
 ---
 # VISION ADDENDUM (Choom paste + key)
-See conversation message of 2026-08-09 for the paste block and answer key —
-same content as delivered inline.
+*(Materialized 2026-08-09, updated for the post-polish ranking and the
+`prefer:"table"` keyword hint — the 08-09 Genesis run honestly reported
+that top-1 text hits often lack the asked-for table; the hint closes
+that gap.)*
+
+## VISION TEST — PASTE EVERYTHING BETWEEN THE LINES INTO THE CHOOM'S CHAT
+
+---
+
+Follow-up test: this time you'll use your **vision capability** on ForgeRAG
+page images. For each task: run the search named, pick the named book's top
+result, fetch its page image (get_page_image), and analyze the **image
+itself** with your vision model — answer from what you *see*, not from
+extracted text or your own knowledge. When a task says to read a TABLE, add
+`prefer: "table"` to the keyword search (limit 10) and pick the named
+book's hit marked `preferred_match` — the best text match is often prose
+about the table, not the table itself.
+
+- **VZ1.** Keyword-search `C26000` with `prefer: "table"`, open the ASM
+  Handbook Vol 2 table-page result. From the **table row for C26000**:
+  what are the copper and zinc percentages, and what common name does the
+  table give this alloy?
+- **VZ2.** Keyword-search `A36 yield point` with `prefer: "table"`, open
+  the Structural Steel Designers Handbook table page. From the table:
+  what is the specified minimum **yield stress** for A36 in the thinner
+  thickness range, and what **tensile strength range** is listed?
+- **VZ3.** Visual-search `555 timer circuit schematic`, open the Practical
+  Electronics for Inventors schematic page. Describe the circuit you see:
+  which components set the timing, and what operating mode is shown?
+- **VZ4.** Visual-search `geneva wheel mechanism drawing`, open the top
+  mechanism-drawing result. Describe from the drawing how this mechanism
+  converts continuous rotation into its output motion.
+- **VZ5.** Visual-search `stress strain curve diagram`, open the Atlas of
+  Stress-Strain Curves result. What is plotted on each axis, and what
+  happens to the curve shape at higher values — describe what the diagram
+  actually shows.
+
+End with a short table: task | page opened (doc + page) | what you saw |
+confidence.
+
+---
+## END OF VISION PASTE
+
+## VISION ANSWER KEY
+
+| ID | Expected page | Expected reading |
+|----|--------------|------------------|
+| VZ1 | ASM Vol 2, p772 or p763 (the table pages `prefer:"table"` surfaces) | **70.0 Cu / 30.0 Zn**, common name "**cartridge brass, 70%**" (tensile range 303–896 MPa by temper on the same row — bonus if read) |
+| VZ2 | Structural Steel Designers Hbk, p21 or p20 table pages via `prefer:"table"` (plain top-1 is p26, an identification-color table — a valid honest read but not the target) | Yield **36 ksi** (32 ksi over 8-in thickness), tensile **58–80 ksi** |
+| VZ3 | Practical Electronics for Inventors, p721 (715–721 region) | 555 in **astable** mode; timing set by **two resistors (Rₐ, R_b) and a capacitor** on the threshold/trigger pins |
+| VZ4 | Sclater Mechanisms Sourcebook p190–199 (p19 has a valid Geneva figure too) *or* Machine Design Databook p1043–1045 | **Geneva mechanism**: a driver pin engages slots in the wheel producing **intermittent indexed rotation**, with a locking surface holding the wheel between indexes |
+| VZ5 | Atlas of Stress-Strain Curves (Tamarin), ~p56 (p19 cyclic-loop figure also a valid read) | **Stress vs. strain** axes; curve rises linearly (elastic), then yields and curves over (plastic), ending at fracture — alloy labels off the curves are bonus credit |
+
+**Grading note:** VZ1–VZ2 are strict (numbers must match — this proves the
+vision model reads *tables*). VZ3–VZ5 are descriptive (proves it reads
+*schematics and diagrams*). If the Choom opens a different-but-topical
+page, grade what it actually read against that page rather than failing
+it — the retrieval half is graded in the main test.

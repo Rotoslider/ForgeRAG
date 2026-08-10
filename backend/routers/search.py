@@ -110,6 +110,15 @@ class KeywordSearchRequest(BaseModel):
         "errors (e.g. 'weldlng' matches 'welding'). Default off to preserve "
         "exact matching for code lookups like 'QW-451'.",
     )
+    prefer: str | None = Field(
+        default=None,
+        description="'table' or 'figure': bias results toward pages that "
+        "structurally CONTAIN one (detected from Docling chunk types). Use "
+        "when the goal is to open and read a table/figure page — a query's "
+        "best text match is often the prose ABOUT a table, not the table "
+        "itself (live case: 'C26000' ranked property-curve pages above the "
+        "composition table). Text relevance still orders within each group.",
+    )
 
 
 @router.post("/keyword")
@@ -159,6 +168,11 @@ async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeR
             phrase_query = f'"{escaped}"^4 OR ({or_clause})'
         else:
             phrase_query = f'"{escaped}"'
+    # prefer='table'/'figure' re-ranks by structural page content, so it
+    # needs a deeper candidate pool to promote from — the table page for a
+    # designation is often ranked 20-30 by pure text relevance.
+    prefer = body.prefer if body.prefer in ("table", "figure") else None
+    fetch_limit = min(body.limit * 4, 80) if prefer else body.limit
     try:
         rows = await neo4j.run_query(
             """
@@ -173,12 +187,16 @@ async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeR
                    d.filename AS filename,
                    d.file_hash AS file_hash,
                    ft_score,
+                   EXISTS { (p)-[:HAS_CHUNK]->(:Chunk {chunk_type: 'table'}) }
+                       AS has_table,
+                   EXISTS { (p)-[:HAS_CHUNK]->(:Chunk {chunk_type: 'figure'}) }
+                       AS has_figure,
                    [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
                    [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
             ORDER BY ft_score DESC
             LIMIT $limit
             """,
-            {"q": phrase_query, "limit": body.limit},
+            {"q": phrase_query, "limit": fetch_limit},
         )
     except Exception:
         # Fallback: CONTAINS scan (works without the index, slower at scale)
@@ -194,13 +212,23 @@ async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeR
                    d.filename AS filename,
                    d.file_hash AS file_hash,
                    1.0 AS ft_score,
+                   EXISTS { (p)-[:HAS_CHUNK]->(:Chunk {chunk_type: 'table'}) }
+                       AS has_table,
+                   EXISTS { (p)-[:HAS_CHUNK]->(:Chunk {chunk_type: 'figure'}) }
+                       AS has_figure,
                    [(d)-[:IN_CATEGORY]->(c) | c.name] AS categories,
                    [(d)-[:TAGGED_WITH]->(t) | t.name] AS tags
             ORDER BY d.title, p.page_number
             LIMIT $limit
             """,
-            {"q": body.query, "limit": body.limit},
+            {"q": body.query, "limit": fetch_limit},
         )
+    if prefer:
+        # Stable partition: pages structurally containing the preferred
+        # element first, text-relevance order preserved within each group.
+        key = "has_table" if prefer == "table" else "has_figure"
+        rows = ([r for r in rows if r.get(key)]
+                + [r for r in rows if not r.get(key)])[: body.limit]
     hits = []
     for r in rows:
         # Extract a context snippet around the match
@@ -221,6 +249,11 @@ async def keyword_search(body: KeywordSearchRequest, request: Request) -> ForgeR
             "page_number": r["page_number"],
             "score": 1.0,  # exact match, all equally relevant
             "text_snippet": snippet,
+            "has_table": bool(r.get("has_table")),
+            "has_figure": bool(r.get("has_figure")),
+            **({"preferred_match": bool(r.get(
+                "has_table" if prefer == "table" else "has_figure"))}
+               if prefer else {}),
             "image_url": f"/images/{r['file_hash']}/{r['page_number']}",
             "reduced_image_url": f"/images/{r['file_hash']}/{r['page_number']}/reduced",
             "categories": r["categories"],

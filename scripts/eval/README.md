@@ -17,6 +17,13 @@ the machining-data cluster). Known cosmetic wobble: the "3/16 weld
 fitting spec" probe gained ASME B31.1 (the actual governing spec) in its
 top-3 but also admitted one off-topic page at #2 — graded criteria still
 pass; watch it in future runs.
+
+2026-08-09 addendum: keyword search now takes `prefer: "table" |
+"figure"` (stable re-rank toward pages structurally containing one) —
+built after the Genesis vision run showed top-1 text hits often lack the
+asked-for table. The answer key's K1/VZ1/VZ2 rows are refreshed to the
+post-polish ranking and the prefer route; the old p763-top expectations
+predated the ranking change the battery blessed.
   `venv/bin/python scripts/eval/search_battery.py` (edit OUT path inside).
 - `choom-search-test.md` — the same question set as agent-pasteable
   instructions (Section A) with the page-grounded answer key (Section B),
