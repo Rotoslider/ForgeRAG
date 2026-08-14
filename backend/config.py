@@ -36,6 +36,12 @@ class ServerSettings(BaseModel):
     # Bearer token required for non-localhost API requests (empty = auth
     # disabled, with a loud startup warning). FORGERAG_API_TOKEN env wins.
     api_token: str = ""
+    # Optional second token with read-only scope: lets remote agents (e.g. a
+    # learning harness on another machine) search, read documents/pages, and
+    # explore the graph, but NOT mutate state (no ingest/delete/rebuild/admin).
+    # Empty = disabled (read-only access then requires the full api_token).
+    # FORGERAG_API_TOKEN_READONLY env wins.
+    api_token_readonly: str = ""
 
 
 class Neo4jSettings(BaseModel):

@@ -8,6 +8,11 @@
 # warning). Enable: paste the output of `openssl rand -hex 24` and restart.
 # The FORGERAG_API_TOKEN env var overrides this field.
 # api_token = ""
+# Optional read-only token for remote agents (e.g. a learning harness on
+# another device): lets them search, read documents/pages, and explore the
+# graph, but NOT modify anything (no ingest/delete/rebuild/admin). Empty
+# while disabled. Env override: FORGERAG_API_TOKEN_READONLY.
+# api_token_readonly = ""
 host = "0.0.0.0"
 port = 8200
 data_dir = "/home/nuc1/projects/ForgeRAG/data"

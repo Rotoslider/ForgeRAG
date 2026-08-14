@@ -427,19 +427,28 @@ Open the web GUI at `http://localhost:8200/app/` — you should see the Search p
 ### 14. API Auth (optional, recommended on a shared LAN)
 
 The server binds `0.0.0.0`, so anything on your LAN can reach the API.
-One static bearer token closes that: uncomment `api_token` under
-`[server]` in `config/forgerag.toml`, paste the output of
-`openssl rand -hex 24`, and restart. From then on, non-localhost requests
-without `Authorization: Bearer <token>` get a 401. **Localhost clients
-are exempt** — an on-box agent platform (Chooms), scripts, and the UI
-opened on the machine itself all keep working with zero changes; `/health`
-stays open for monitoring probes. Off-box clients (curl from a laptop,
-a remote agent) add the header; the Choom client picks the token up from
-a `FORGERAG_API_TOKEN` env var automatically. With no token configured,
-auth is off and the startup log says so loudly. This is deliberately a
-single-token scheme — users, roles, and OAuth are out of scope for a
-single-operator instrument; if you ever need remote access, tunnel with
-Tailscale rather than exposing the port.
+Static bearer tokens close that. There are two, with different scopes —
+see [docs/API.md](docs/API.md) for the full API guide and both token models:
+
+- **Admin token** (`[server] api_token`, or `FORGERAG_API_TOKEN`):
+  every operation — ingest, search, delete, rebuild, backup/restore, admin.
+- **Read-only token** (`[server] api_token_readonly`, or
+  `FORGERAG_API_TOKEN_READONLY`, optional): lets a remote agent **learn from
+  the library** — all search modes, documents/pages, graph exploration —
+  but cannot modify anything. This is the right token to give an external
+  harness or a junior agent.
+
+Generate tokens with `openssl rand -hex 24`, paste into `config/forgerag.toml`,
+and restart. From then on, non-localhost requests without
+`Authorization: Bearer <token>` get a 401; a read-only token used on a
+write endpoint get a 403. **Localhost clients are exempt** — an on-box
+agent platform (Chooms), scripts, and the UI opened on the machine itself
+all keep working with zero changes; `/health` stays open for monitoring
+probes. With no token configured, auth is off and the startup log says so
+loudly. This is deliberately a static-token scheme — users, roles, and
+OAuth are out of scope for a single-operator instrument; if you ever need
+remote access beyond the LAN, tunnel with Tailscale rather than exposing
+the port.
 
 ## Adding Documents
 
@@ -666,6 +675,25 @@ When ForgeRAG starts with an empty database (0 documents, 0 pages), the GUI show
 
 ## API Endpoints
 
+ForgeRAG exposes its full capabilities over HTTP. **Every button in the
+web GUI is an API call**, so anything scripts or agent harnesses can do
+in the UI they can do over the network. This section is a curated summary;
+**[docs/API.md](docs/API.md) is the complete reference** — auth, request
+bodies, response shapes, curl/Python/Node examples, a headless-device
+cookbook, and how to verify the API.
+
+Quick notes for API clients:
+
+- **Auth**: remote clients send `Authorization: Bearer <token>`. Use the
+  admin token to control everything, or the read-only token to search and
+  read without modification power (see section 14 above).
+- **Envelope**: `{success, reason, data}`. Branch on `success`, read
+  `reason` for errors.
+- **Discovery**: `GET /openapi.json` (OpenAPI 3.1) and `GET /skills/manifest`
+  (capability advert + live stats) always reflect the running code.
+- **Image URLs are relative**: prefix `/images/…` from search hits with your
+  base URL.
+
 ### Core
 | Method | Path | Description |
 |--------|------|-------------|
@@ -680,6 +708,8 @@ When ForgeRAG starts with an empty database (0 documents, 0 pages), the GUI show
 | POST | `/search/visual` | ColPali/Nemotron two-stage visual retrieval |
 | POST | `/search/semantic` | Text embedding vector search |
 | POST | `/search/hybrid` | Vector + graph-boosted / graph-first / community |
+| POST | `/search/chunks` | Chunk-level retrieval (BM25 + dense + reranker, with section paths and summaries) |
+| POST | `/search/summaries` | RAPTOR-by-TOC summary search at section/chapter/document level |
 
 ### Documents
 | Method | Path | Description |
@@ -704,6 +734,7 @@ When ForgeRAG starts with an empty database (0 documents, 0 pages), the GUI show
 | Method | Path | Description |
 |--------|------|-------------|
 | POST | `/ingest` | Upload PDF (multipart: file, collection, categories, tags) |
+| POST | `/ingest/check-duplicates` | Look up which SHA-256 hashes are already ingested (read-only) |
 | GET | `/ingest/jobs/{id}` | Poll job progress (includes the per-step status ledger and the live `current_item` label) |
 | GET | `/ingest/jobs/{id}/logs` | Captured log lines for a job (live-tails running jobs) |
 | GET | `/ingest/jobs` | List jobs. `status` accepts a concrete status, `active` (queued/processing/paused, running first), or `terminal` (completed/failed/cancelled) |

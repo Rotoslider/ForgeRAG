@@ -247,6 +247,8 @@ def create_app() -> FastAPI:
     install_auth(
         app,
         os.environ.get("FORGERAG_API_TOKEN", "") or settings.server.api_token,
+        os.environ.get("FORGERAG_API_TOKEN_READONLY", "")
+        or settings.server.api_token_readonly,
     )
 
     # Routers
