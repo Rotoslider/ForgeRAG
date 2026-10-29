@@ -60,6 +60,24 @@ class LLMTruncationError(LLMFatalError):
     """
 
 
+class LLMUnreachableError(LLMTransientError):
+    """Server refused the connection, or its circuit breaker is open."""
+
+
+class LLMModelUnavailableError(LLMFatalError):
+    """Server is up but the configured model isn't loaded there."""
+
+
+# LM Studio (JIT loading off) answers HTTP 400 "No models loaded. Please
+# load a model in the developer page or use the 'lms load' command." when
+# its GPU holds no model (live 2026-10-29). Matched case-insensitively.
+_MODEL_UNAVAILABLE_MARKERS = (
+    "no models loaded",
+    "model not found",
+    "invalid model identifier",
+)
+
+
 # LM Studio reports an internal inference-engine crash as HTTP 400 with one
 # of these bodies — a transient server failure wearing a client-error status
 # code (live 2026-08-10: one engine crash burst failed 19 of 27
@@ -190,17 +208,31 @@ class LLMService:
         self._request_slots = asyncio.Semaphore(
             max(1, getattr(settings, "max_concurrent_requests", 2))
         )
+        # Fallback server (interactive answers only, see LLMSettings). Two
+        # slots: it serves people chatting, not campaigns.
+        self._fallback_client: httpx.AsyncClient | None = None
+        self._fallback_slots = asyncio.Semaphore(2)
 
     async def start(self) -> None:
         self._client = httpx.AsyncClient(
             base_url=self.settings.endpoint.rstrip("/"),
             timeout=httpx.Timeout(self.settings.timeout_seconds),
         )
+        fallback = getattr(self.settings, "fallback_endpoint", "")
+        if fallback:
+            self._fallback_client = httpx.AsyncClient(
+                base_url=fallback.rstrip("/"),
+                timeout=httpx.Timeout(self.settings.timeout_seconds),
+            )
+            logger.info("LLM fallback for interactive answers: %s", fallback)
 
     async def stop(self) -> None:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        if self._fallback_client is not None:
+            await self._fallback_client.aclose()
+            self._fallback_client = None
 
     def is_configured(self) -> bool:
         return bool(self.settings.endpoint)
@@ -223,6 +255,7 @@ class LLMService:
         max_tokens: int | None = None,
         temperature: float | None = None,
         response_format: dict[str, Any] | None = None,
+        allow_fallback: bool = False,
     ) -> str:
         """Low-level chat completion. Returns the content string of the first choice."""
         content, _ = await self.chat_with_finish_reason(
@@ -230,6 +263,7 @@ class LLMService:
             max_tokens=max_tokens,
             temperature=temperature,
             response_format=response_format,
+            allow_fallback=allow_fallback,
         )
         return content
 
@@ -240,6 +274,7 @@ class LLMService:
         max_tokens: int | None = None,
         temperature: float | None = None,
         response_format: dict[str, Any] | None = None,
+        allow_fallback: bool = False,
     ) -> tuple[str, str | None]:
         """Chat completion returning (content, finish_reason).
 
@@ -247,6 +282,10 @@ class LLMService:
         from one the server cut off at max_tokens ("length") — a truncated
         JSON payload is unparseable for a reason no re-prompt can fix, only
         a higher token budget can.
+
+        allow_fallback: when the main server has no model loaded or can't be
+        reached, send the same request to [llm] fallback_endpoint instead.
+        Only for interactive callers (answer mode), never ingestion.
         """
         if self._client is None:
             raise LLMFatalError("LLMService not started")
@@ -268,12 +307,22 @@ class LLMService:
         if getattr(self.settings, "disable_thinking", False):
             payload["chat_template_kwargs"] = {"enable_thinking": False}
 
+        try:
+            return await self._post_primary(payload)
+        except (LLMUnreachableError, LLMModelUnavailableError) as exc:
+            if not allow_fallback or self._fallback_client is None:
+                raise
+            return await self._post_fallback(payload, exc)
+
+    async def _post_primary(
+        self, payload: dict[str, Any]
+    ) -> tuple[str, str | None]:
         async with self._request_slots:
             # Circuit breaker: fail fast if LM Studio is down. Checked after
             # acquiring a slot so callers that waited in line still fail fast
             # when the breaker opened while they were waiting.
             if not self.circuit_breaker.allow_request():
-                raise LLMTransientError(
+                raise LLMUnreachableError(
                     f"LLM service circuit breaker open — "
                     f"{self.circuit_breaker.consecutive_failures} consecutive failures"
                 )
@@ -282,9 +331,16 @@ class LLMService:
                 r = await self._client.post("/chat/completions", json=payload)
             except httpx.RequestError as exc:
                 self.circuit_breaker.record_failure()
+                # Nothing listening (LM Studio closed) is unreachable, so a
+                # fallback may answer; a read timeout is not (it was busy).
+                error_cls = (
+                    LLMUnreachableError
+                    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout))
+                    else LLMTransientError
+                )
                 # str() of httpx timeout exceptions is often empty — always
                 # include the exception type so the log says WHAT failed.
-                raise LLMTransientError(
+                raise error_cls(
                     f"Request failed: {type(exc).__name__}: {exc}"
                     if str(exc) else f"Request failed: {type(exc).__name__} "
                     f"(no detail — likely timeout after "
@@ -301,25 +357,50 @@ class LLMService:
                 raise LLMTransientError(
                     f"Engine crash (HTTP {r.status_code}): {r.text[:200]}"
                 )
+            if any(m in body_lower for m in _MODEL_UNAVAILABLE_MARKERS):
+                raise LLMModelUnavailableError(
+                    f"HTTP {r.status_code}: {r.text[:400]}"
+                )
             raise LLMFatalError(f"HTTP {r.status_code}: {r.text[:400]}")
 
-        try:
-            body = r.json()
-            choice = body["choices"][0]
-            message = choice["message"]
-            content = message.get("content") or ""
-            # Reasoning models (GLM-4.7-Flash, DeepSeek-R1, etc.) sometimes
-            # route their entire output — including structured JSON — into
-            # reasoning_content and leave content empty. Fall back to that
-            # when content is blank so we don't lose the actual response.
-            if not content.strip():
-                reasoning = message.get("reasoning_content") or ""
-                if reasoning.strip():
-                    content = reasoning
-            self.circuit_breaker.record_success()
-            return content, choice.get("finish_reason")
-        except (KeyError, ValueError, TypeError) as exc:
-            raise LLMFatalError(f"Malformed response: {r.text[:400]}") from exc
+        content, finish_reason = _parse_choice(r)
+        self.circuit_breaker.record_success()
+        return content, finish_reason
+
+    async def _post_fallback(
+        self, payload: dict[str, Any], cause: LLMError
+    ) -> tuple[str, str | None]:
+        """Send a request the main server couldn't take to fallback_endpoint.
+
+        The main server's breaker is left alone: the fallback's health says
+        nothing about it.
+        """
+        fallback = self.settings.fallback_endpoint
+        payload = {
+            **payload,
+            "model": self.settings.fallback_model or payload["model"],
+        }
+        logger.warning(
+            "LLM %s unavailable (%s); answering via fallback %s",
+            self.settings.endpoint, cause, fallback,
+        )
+        async with self._fallback_slots:
+            try:
+                r = await self._fallback_client.post(
+                    "/chat/completions", json=payload
+                )
+            except httpx.RequestError as exc:
+                raise LLMTransientError(
+                    f"Fallback {fallback} failed: {type(exc).__name__}: {exc} "
+                    f"(main LLM: {cause})"
+                ) from exc
+        if r.status_code >= 400:
+            error_cls = LLMTransientError if r.status_code >= 500 else LLMFatalError
+            raise error_cls(
+                f"Fallback HTTP {r.status_code}: {r.text[:300]} "
+                f"(main LLM: {cause})"
+            )
+        return _parse_choice(r)
 
     async def chat_json_structured(
         self,
@@ -497,6 +578,26 @@ class LLMService:
         raise LLMFatalError(
             f"Structured JSON call failed after retries: {last_err}"
         )
+
+
+def _parse_choice(r: httpx.Response) -> tuple[str, str | None]:
+    """(content, finish_reason) of a chat completion's first choice."""
+    try:
+        body = r.json()
+        choice = body["choices"][0]
+        message = choice["message"]
+        content = message.get("content") or ""
+        # Reasoning models (GLM-4.7-Flash, DeepSeek-R1, etc.) sometimes
+        # route their entire output — including structured JSON — into
+        # reasoning_content and leave content empty. Fall back to that
+        # when content is blank so we don't lose the actual response.
+        if not content.strip():
+            reasoning = message.get("reasoning_content") or ""
+            if reasoning.strip():
+                content = reasoning
+        return content, choice.get("finish_reason")
+    except (KeyError, ValueError, TypeError) as exc:
+        raise LLMFatalError(f"Malformed response: {r.text[:400]}") from exc
 
 
 def _extract_first_json_object(text: str) -> str | None:

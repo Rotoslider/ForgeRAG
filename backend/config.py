@@ -106,6 +106,14 @@ class LLMSettings(BaseModel):
     # that don't recognize it (DeepSeek, GLM, Llama, Gemma) ignore it
     # silently, so leaving it on is safe across the board.
     disable_thinking: bool = True
+    # Second OpenAI-compatible server for interactive answers (answer-mode
+    # search) when the main one has no model loaded or can't be reached,
+    # e.g. another machine's LM Studio while this GPU is lent elsewhere.
+    # Ingestion never falls back: a campaign's concurrent requests would
+    # swamp a server that people are chatting with. Empty = no fallback.
+    fallback_endpoint: str = ""
+    # Model id on the fallback server; empty = same as `model`.
+    fallback_model: str = ""
 
 
 class IngestionSettings(BaseModel):

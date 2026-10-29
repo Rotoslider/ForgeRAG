@@ -717,7 +717,9 @@ async def rag_answer(body: AnswerRequest, request: Request) -> ForgeResult:
     ]
 
     try:
-        answer = await llm.chat(messages, max_tokens=2048, temperature=0.1)
+        answer = await llm.chat(
+            messages, max_tokens=2048, temperature=0.1, allow_fallback=True
+        )
     except Exception as exc:
         # Fail honestly — packing the error string into `answer` under
         # success:true rendered "LLM error: ..." to users as if it were the
