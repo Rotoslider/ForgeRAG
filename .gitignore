@@ -10,10 +10,14 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# Environment
+# Environment, and any copy or backup of these (forgerag.toml holds the API
+# tokens); the .example template stays tracked
 .env
 .env.local
+.env.*
 config/forgerag.toml
+config/forgerag.toml.*
+!config/forgerag.toml.example
 
 # Data — all runtime state (page images, uploads, job DB, backups)
 data/
